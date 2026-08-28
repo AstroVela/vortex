@@ -12,7 +12,6 @@ use vortex_array::Canonical;
 use vortex_array::IntoArray;
 use vortex_array::MaskFuture;
 use vortex_array::VortexSessionExecute;
-use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::ListArray;
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
@@ -23,7 +22,6 @@ use vortex_array::expr::BoundExpression;
 use vortex_array::expr::root;
 use vortex_array::scalar_fn::fns::operators::Operator;
 use vortex_array::validity::Validity;
-use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_mask::Mask;
 use vortex_session::VortexSession;
@@ -34,7 +32,6 @@ use crate::LayoutReaderContext;
 use crate::LayoutReaderRef;
 use crate::RowSplits;
 use crate::SplitRange;
-use crate::layouts::flat::Flat;
 use crate::layouts::list::ListLayout;
 use crate::layouts::list::expr::ListChildrenNeeded;
 use crate::layouts::list::expr::get_necessary_bound_list_children;
@@ -48,11 +45,6 @@ type OptionalArrayFuture = BoxFuture<'static, VortexResult<Option<ArrayRef>>>;
 /// and above which we evaluate the expression over all rows and intersect afterward.
 const EXPR_EVAL_THRESHOLD: f64 = 0.2;
 
-/// Above this average element count, selective projections use a bounded elements read. Rebuilding
-/// a complete page is important for preserving nested encodings on ordinary lists, but is wasteful
-/// for columns such as genotypes with thousands of elements per outer row.
-const COMPLETE_PAGE_MAX_AVERAGE_LIST_LENGTH: u64 = 1024;
-
 /// Reader for [`ListLayout`].
 #[derive(Clone)]
 pub struct ListReader {
@@ -62,7 +54,6 @@ pub struct ListReader {
     elements: LayoutReaderRef,
     offsets: LayoutReaderRef,
     validity: Option<LayoutReaderRef>,
-    children_are_flat: bool,
 }
 
 impl ListReader {
@@ -76,11 +67,6 @@ impl ListReader {
         let elements_layout = layout.elements()?;
         let offsets_layout = layout.offsets()?;
         let validity_layout = layout.validity()?;
-        let children_are_flat = elements_layout.is::<Flat>()
-            && offsets_layout.is::<Flat>()
-            && validity_layout
-                .as_ref()
-                .is_none_or(|layout| layout.is::<Flat>());
         let elements = elements_layout.new_reader(
             format!("{name}.elements").into(),
             Arc::clone(&segment_source),
@@ -111,7 +97,6 @@ impl ListReader {
             elements,
             offsets,
             validity,
-            children_are_flat,
         })
     }
 
@@ -156,44 +141,13 @@ impl ListReader {
         .boxed())
     }
 
-    /// Projection for [`ListChildrenNeeded::All`] expressions.
-    ///
-    /// Flat children are fetched in full and then sliced/filtered in outer-row space, matching the
-    /// operation order of a flat list page. Legacy layouts with non-flat children retain their
-    /// bounded child-read path.
+    /// Projection for [`ListChildrenNeeded::All`] expressions. Registers complete child reads
+    /// eagerly and reconstructs the list page before applying the outer-row mask.
     fn project_all(
         &self,
         row_range: &Range<u64>,
         expr: &BoundExpression,
         mask: MaskFuture,
-    ) -> VortexResult<ArrayFuture> {
-        let is_full_range = row_range.start == 0 && row_range.end == self.layout.row_count();
-        let reader = self.clone();
-        let row_range = row_range.clone();
-        let expr = expr.clone();
-        Ok(async move {
-            let mask = mask.await?;
-            if should_read_complete_page(
-                reader.children_are_flat,
-                is_full_range,
-                mask.all_true(),
-                reader.layout.row_count(),
-                reader.elements.row_count(),
-            ) {
-                reader.project_all_complete(&row_range, &expr, mask)?.await
-            } else {
-                reader.project_all_bounded(&row_range, &expr, mask)?.await
-            }
-        }
-        .boxed())
-    }
-
-    /// Fetch the complete `elements`, `offsets`, and `validity` children concurrently.
-    fn project_all_complete(
-        &self,
-        row_range: &Range<u64>,
-        expr: &BoundExpression,
-        mask: Mask,
     ) -> VortexResult<ArrayFuture> {
         let row_count = self.layout.row_count();
         let elements_row_count = self.elements.row_count();
@@ -210,6 +164,11 @@ impl ListReader {
         )?;
 
         Ok(async move {
+            let mask = mask.await?;
+            if mask.all_false() {
+                return Ok(Canonical::empty(expr.dtype()).into_array());
+            }
+
             let (offsets, elements, validity) = try_join!(offsets_fut, elements_fut, validity_fut)?;
             // SAFETY: ListLayout is constructed from a valid ListArray and reading its children
             // without transformation preserves the list invariants.
@@ -225,62 +184,6 @@ impl ListReader {
                 list
             } else {
                 list.filter(mask)?
-            };
-            list.apply_bound(&expr)
-        }
-        .boxed())
-    }
-
-    /// Bounded read for a sub-range or selective mask.
-    ///
-    /// Crops leading and trailing unselected lists, reads their offsets, and translates the first
-    /// and last offset into the element-row range to fetch. Any holes in the selection are filtered
-    /// after reconstructing the list array.
-    fn project_all_bounded(
-        &self,
-        row_range: &Range<u64>,
-        expr: &BoundExpression,
-        mask: Mask,
-    ) -> VortexResult<ArrayFuture> {
-        // Crop to the smallest contiguous row range containing every selected list.
-        let Some(selected_rows) = selected_row_range(&mask) else {
-            let empty = Canonical::empty(expr.dtype()).into_array();
-            return Ok(async move { Ok(empty) }.boxed());
-        };
-
-        let selected_mask = mask.slice(selected_rows.clone());
-        let selected_row_range = (row_range.start + u64::try_from(selected_rows.start)?)
-            ..(row_range.start + u64::try_from(selected_rows.end)?);
-
-        let nullability = self.layout.dtype().nullability();
-        let expr = expr.clone();
-        let reader = self.clone();
-        let offsets_fut = self.fetch_raw_offsets(&selected_row_range)?;
-
-        Ok(async move {
-            let offsets = offsets_fut.await?;
-
-            let elements_range = elements_range_from_offsets(&offsets, &reader.session)?;
-            let elements_fut = reader.fetch_raw_elements(&elements_range)?;
-            let validity_fut = fetch_validity(
-                reader.validity.as_ref(),
-                &selected_row_range,
-                MaskFuture::new_true(selected_mask.len()),
-            )?;
-            let (elements, validity) = try_join!(elements_fut, validity_fut)?;
-
-            let offsets = rebase_offsets(offsets, elements_range.start)?;
-            // SAFETY: the selected offsets remain monotonically increasing, rebasing them against
-            // the selected element range preserves their lengths, and validity covers the same
-            // cropped list rows.
-            let list = unsafe {
-                ListArray::new_unchecked(elements, offsets, create_validity(validity, nullability))
-            }
-            .into_array();
-            let list = if selected_mask.all_true() {
-                list
-            } else {
-                list.filter(selected_mask)?
             };
             list.apply_bound(&expr)
         }
@@ -351,10 +254,6 @@ impl ListReader {
         self.elements
             .projection_evaluation(row_range, &root, MaskFuture::new_true(row_count))
     }
-}
-
-fn selected_row_range(mask: &Mask) -> Option<Range<usize>> {
-    Some(mask.first()?..mask.last()? + 1)
 }
 
 fn create_validity(validity_array: Option<ArrayRef>, nullability: Nullability) -> Validity {
@@ -461,20 +360,6 @@ impl LayoutReader for ListReader {
     }
 }
 
-fn should_read_complete_page(
-    children_are_flat: bool,
-    is_full_range: bool,
-    mask_all_true: bool,
-    row_count: u64,
-    elements_row_count: u64,
-) -> bool {
-    if is_full_range && mask_all_true {
-        return true;
-    }
-    children_are_flat
-        && elements_row_count <= row_count.saturating_mul(COMPLETE_PAGE_MAX_AVERAGE_LIST_LENGTH)
-}
-
 /// Fetch the validity child for `row_range` under `mask`, yielding `None` for a non-nullable list
 /// (which has no validity child).
 fn fetch_validity(
@@ -495,40 +380,6 @@ fn fetch_validity(
         }
     }
     .boxed())
-}
-
-/// Read `offsets[0]` and `offsets[-1]` and return the elements range they bound.
-fn elements_range_from_offsets(
-    offsets: &ArrayRef,
-    session: &VortexSession,
-) -> VortexResult<Range<u64>> {
-    if offsets.is_empty() {
-        return Ok(0..0);
-    }
-    let mut exec_ctx = session.create_execution_ctx();
-    let start = offsets
-        .execute_scalar(0, &mut exec_ctx)?
-        .as_primitive()
-        .as_::<u64>()
-        .vortex_expect("offset value fits in u64");
-    let end = offsets
-        .execute_scalar(offsets.len() - 1, &mut exec_ctx)?
-        .as_primitive()
-        .as_::<u64>()
-        .vortex_expect("offset value fits in u64");
-    Ok(start..end)
-}
-
-/// Subtract `first` from every offset so they index into a sliced `elements[first..]` buffer that
-/// starts at zero.
-fn rebase_offsets(offsets: ArrayRef, first: u64) -> VortexResult<ArrayRef> {
-    if first == 0 {
-        return Ok(offsets);
-    }
-    let constant = ConstantArray::new(first, offsets.len())
-        .into_array()
-        .cast(offsets.dtype().clone())?;
-    offsets.binary(constant, Operator::Sub)
 }
 
 /// Compute `offsets[i + 1] - offsets[i]` as the unmasked list length values.
@@ -596,32 +447,6 @@ mod tests {
     use crate::sequence::SequentialArrayStreamExt;
     use crate::session::LayoutSession;
     use crate::test::SESSION;
-
-    #[rstest]
-    #[case::modest_selective(true, false, false, 100, 102_400, true)]
-    #[case::large_selective(true, false, false, 100, 102_401, false)]
-    #[case::large_partial_all_true(true, false, true, 100, 102_401, false)]
-    #[case::large_complete(true, true, true, 100, 102_401, true)]
-    #[case::legacy_non_flat(false, false, false, 100, 100, false)]
-    fn complete_page_read_selection(
-        #[case] children_are_flat: bool,
-        #[case] is_full_range: bool,
-        #[case] mask_all_true: bool,
-        #[case] row_count: u64,
-        #[case] elements_row_count: u64,
-        #[case] expected: bool,
-    ) {
-        assert_eq!(
-            should_read_complete_page(
-                children_are_flat,
-                is_full_range,
-                mask_all_true,
-                row_count,
-                elements_row_count,
-            ),
-            expected
-        );
-    }
 
     /// Validity-class projections (`is_null` / `is_not_null` of the list) round-trip through the
     /// validity-only read path, for both nullable and non-nullable lists.
