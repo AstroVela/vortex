@@ -450,11 +450,16 @@ impl<T> BufferMut<T> {
             .checked_mul(size_of::<T>())
             .vortex_expect("buffer capacity overflow");
         let physical_alignment = max(self.alignment, self.allocation.buffer_alignment());
+        let padding = *physical_alignment - 1;
         let required_size = required_size
-            .checked_add(*physical_alignment)
+            .checked_add(padding)
             .vortex_expect("buffer capacity overflow");
         let current_size = self.allocation.size() - self.offset;
-        let allocation_size = required_size.max(current_size.saturating_mul(2));
+        let doubled_size = current_size
+            .checked_mul(2)
+            .and_then(|size| size.checked_add(padding))
+            .unwrap_or(usize::MAX);
+        let allocation_size = required_size.max(doubled_size);
         let layout = Layout::from_size_align(allocation_size, 1)
             .unwrap_or_else(|_| vortex_panic!("buffer capacity exceeds maximum allocation size"));
 
