@@ -57,11 +57,12 @@ pub const ALL_SCHEMES: &[&dyn Scheme] = &[
     #[cfg(feature = "unstable_encodings")]
     &string::OnPairScheme,
     &string::NullDominatedSparseScheme,
+    &string::VarBinScheme::UTF8,
     ////////////////////////////////////////////////////////////////////////////////////////////////
     // Binary schemes.
     ////////////////////////////////////////////////////////////////////////////////////////////////
     &binary::BinaryDictScheme,
-    &binary::VarBinScheme,
+    &binary::VarBinScheme::BINARY,
     // Decimal schemes.
     &decimal::DecimalScheme,
     // Temporal schemes.

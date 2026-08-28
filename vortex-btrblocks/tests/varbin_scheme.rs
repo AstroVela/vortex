@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Measures `VarBinScheme` against the same compressor with the scheme excluded.
+//! Measures `VarBinScheme` against the same compressor with the scheme excluded, for both the
+//! binary and the UTF-8 registration of the scheme.
 
 #![allow(clippy::cast_possible_truncation, clippy::tests_outside_test_module)]
 
@@ -50,6 +51,16 @@ fn cases() -> Vec<(&'static str, ArrayRef)> {
     )
     .into_array();
 
+    let mut s3 = 11u64;
+    let strings: Vec<String> = (0..N)
+        .map(|i| format!("row-{i:09}-{:x}", lcg(&mut s3) >> 33))
+        .collect();
+    let nullable_utf8 = VarBinViewArray::from_iter(
+        (0..N).map(|i| (i % 7 != 0).then(|| strings[i].as_str())),
+        DType::Utf8(Nullability::Nullable),
+    )
+    .into_array();
+
     vec![
         ("nulls every 7th", nullable),
         (
@@ -64,14 +75,19 @@ fn cases() -> Vec<(&'static str, ArrayRef)> {
             "random 256B",
             VarBinViewArray::from_iter_bin(wide.iter().map(|v| v.as_slice())).into_array(),
         ),
+        (
+            "utf8 fixed width",
+            VarBinViewArray::from_iter_str(strings.iter().map(String::as_str)).into_array(),
+        ),
+        ("utf8 nulls every 7th", nullable_utf8),
     ]
 }
 
 #[test]
-fn varbin_scheme_shrinks_binary() -> VortexResult<()> {
+fn varbin_scheme_shrinks_output() -> VortexResult<()> {
     let with = BtrBlocksCompressorBuilder::default().build();
     let without = BtrBlocksCompressorBuilder::default()
-        .exclude_schemes([VarBinScheme.id()])
+        .exclude_schemes([VarBinScheme::BINARY.id(), VarBinScheme::UTF8.id()])
         .build();
 
     println!(

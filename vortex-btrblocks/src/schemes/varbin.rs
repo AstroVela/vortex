@@ -1,13 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Offset-based storage for binary arrays.
+//! Offset-based storage for variable-length arrays.
 //!
-//! Canonical binary arrays are [`VarBinViewArray`], which spends a fixed 16 bytes per element on
-//! an opaque views buffer that no scheme can compress. Re-encoding as [`VarBinArray`] replaces
-//! that buffer with an offsets child array, which the cascading compressor can then compress with
-//! the ordinary integer schemes. For fixed-width values the offsets are a constant-stride
-//! sequence and collapse to nothing.
+//! Canonical binary and UTF-8 arrays are [`VarBinViewArray`], which spends a fixed 16 bytes per
+//! element on an opaque views buffer that no scheme can compress. Re-encoding as [`VarBinArray`]
+//! replaces that buffer with an offsets child array, which the cascading compressor can then
+//! compress with the ordinary integer schemes. For fixed-width values the offsets are a
+//! constant-stride sequence and collapse to nothing.
+//!
+//! The logic is identical for both logical types, so a single implementation is registered twice:
+//! once as [`VarBinScheme::BINARY`] and once as [`VarBinScheme::UTF8`].
+//!
+//! [`VarBinViewArray`]: vortex_array::arrays::VarBinViewArray
 
 use vortex_array::ArrayId;
 use vortex_array::ArrayRef;
@@ -30,17 +35,38 @@ use crate::CascadingCompressor;
 use crate::CompressorContext;
 use crate::Scheme;
 
-/// Offset-based (rather than view-based) storage for binary arrays.
+/// Offset-based (rather than view-based) storage for variable-length arrays.
+///
+/// Use the [`BINARY`](Self::BINARY) and [`UTF8`](Self::UTF8) constants; each selects the logical
+/// type the scheme applies to, and both share this implementation.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct VarBinScheme;
+pub struct VarBinScheme {
+    utf8: bool,
+}
+
+impl VarBinScheme {
+    /// The scheme instance for binary arrays.
+    pub const BINARY: Self = Self { utf8: false };
+
+    /// The scheme instance for UTF-8 arrays.
+    pub const UTF8: Self = Self { utf8: true };
+}
 
 impl Scheme for VarBinScheme {
     fn scheme_name(&self) -> &'static str {
-        "vortex.binary.varbin"
+        if self.utf8 {
+            "vortex.string.varbin"
+        } else {
+            "vortex.binary.varbin"
+        }
     }
 
     fn matches(&self, canonical: &Canonical) -> bool {
-        canonical.dtype().is_binary()
+        if self.utf8 {
+            canonical.dtype().is_utf8()
+        } else {
+            canonical.dtype().is_binary()
+        }
     }
 
     fn produced_encodings(&self) -> Vec<ArrayId> {
