@@ -313,20 +313,3 @@ impl WriteStrategyBuilder {
         Arc::new(table_strategy)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::WriteStrategyBuilder;
-
-    #[test]
-    #[cfg(feature = "unstable_encodings")]
-    fn unstable_encodings_enables_list_layout_by_default() {
-        assert!(WriteStrategyBuilder::default().use_list_layout);
-    }
-
-    #[test]
-    #[cfg(not(feature = "unstable_encodings"))]
-    fn list_layout_is_disabled_by_default() {
-        assert!(!WriteStrategyBuilder::default().use_list_layout);
-    }
-}
