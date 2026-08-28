@@ -5,23 +5,21 @@ use vortex_array::ArrayRef;
 use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
+use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::ConstantArray;
+use vortex_array::arrays::PrimitiveArray;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::NativePType;
 use vortex_array::match_each_integer_ptype;
 use vortex_array::scalar::Scalar;
+use vortex_array::scalar_fn::fns::list_contains::IntegerMembership;
 use vortex_array::scalar_fn::fns::list_contains::ListContainsElementKernel;
+use vortex_buffer::BitBuffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 
 use super::compare_fused::stream_compare_fused;
 use crate::BitPacked;
-
-#[derive(Clone, Copy)]
-enum SearchStrategy {
-    Linear,
-    Binary,
-}
 
 impl ListContainsElementKernel for BitPacked {
     fn list_contains(
@@ -29,14 +27,13 @@ impl ListContainsElementKernel for BitPacked {
         element: ArrayView<'_, Self>,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
-        list_contains_with_strategy(list, element, SearchStrategy::Binary, ctx)
+        list_contains_compressed(list, element, ctx)
     }
 }
 
-fn list_contains_with_strategy(
+fn list_contains_compressed(
     list: &ArrayRef,
     element: ArrayView<'_, BitPacked>,
-    strategy: SearchStrategy,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<Option<ArrayRef>> {
     let Some(list_scalar) = list.as_constant() else {
@@ -57,7 +54,7 @@ fn list_contains_with_strategy(
     };
 
     let result = match_each_integer_ptype!(element.dtype().as_ptype(), |T| {
-        let mut members = elements
+        let members = elements
             .iter()
             .map(|value| {
                 value
@@ -70,7 +67,15 @@ fn list_contains_with_strategy(
             .flatten()
             .collect::<Vec<_>>();
 
-        match members.as_slice() {
+        if members.is_empty() && !elements.is_empty() {
+            let validity = element.validity()?.union_nullability(nullability);
+            return Ok(Some(
+                BoolArray::new(BitBuffer::new_unset(element.len()), validity).into_array(),
+            ));
+        }
+        let membership = IntegerMembership::new(members);
+
+        match membership.members() {
             [] => ConstantArray::new(Scalar::bool(false, nullability), element.len()).into_array(),
             [member] => {
                 let member = *member;
@@ -86,62 +91,51 @@ fn list_contains_with_strategy(
                     ctx,
                 )?
             }
-            _ if matches!(strategy, SearchStrategy::Linear) => stream_compare_fused::<T, _>(
-                element,
-                members[0],
-                nullability,
-                |value, _| members.contains(&value),
-                ctx,
-            )?,
-            _ => {
-                members.sort_unstable();
-                members.dedup();
+            [first, second, third] => {
+                let (first, second, third) = (*first, *second, *third);
                 stream_compare_fused::<T, _>(
                     element,
-                    members[0],
+                    first,
                     nullability,
-                    |value, _| members.binary_search(&value).is_ok(),
+                    move |value, _| value.is_eq(first) | value.is_eq(second) | value.is_eq(third),
                     ctx,
                 )?
+            }
+            [first, second, third, fourth] => {
+                let (first, second, third, fourth) = (*first, *second, *third, *fourth);
+                stream_compare_fused::<T, _>(
+                    element,
+                    first,
+                    nullability,
+                    move |value, _| {
+                        value.is_eq(first)
+                            | value.is_eq(second)
+                            | value.is_eq(third)
+                            | value.is_eq(fourth)
+                    },
+                    ctx,
+                )?
+            }
+            _ => {
+                if membership.uses_dense_table() {
+                    stream_compare_fused::<T, _>(
+                        element,
+                        membership.members()[0],
+                        nullability,
+                        |value, _| membership.contains(value),
+                        ctx,
+                    )?
+                } else {
+                    let primitive = element
+                        .into_owned()
+                        .into_array()
+                        .execute::<PrimitiveArray>(ctx)?;
+                    membership.evaluate_primitive(primitive.as_view(), nullability)?
+                }
             }
         }
     });
     Ok(Some(result))
-}
-
-#[cfg(feature = "_test-harness")]
-pub mod test_harness {
-    use vortex_array::ArrayRef;
-    use vortex_array::ArrayView;
-    use vortex_array::ExecutionCtx;
-    use vortex_error::VortexResult;
-
-    use super::SearchStrategy;
-    use super::list_contains_with_strategy;
-    use crate::BitPacked;
-
-    /// Selects the membership lookup strategy for a benchmark invocation.
-    #[derive(Clone, Copy)]
-    pub enum MembershipSearch {
-        /// Scans list members in order.
-        Linear,
-        /// Sorts list members and uses binary search.
-        Binary,
-    }
-
-    /// Executes the BitPacked membership kernel with a fixed lookup strategy.
-    pub fn list_contains(
-        list: &ArrayRef,
-        element: ArrayView<'_, BitPacked>,
-        strategy: MembershipSearch,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Option<ArrayRef>> {
-        let strategy = match strategy {
-            MembershipSearch::Linear => SearchStrategy::Linear,
-            MembershipSearch::Binary => SearchStrategy::Binary,
-        };
-        list_contains_with_strategy(list, element, strategy, ctx)
-    }
 }
 
 #[cfg(test)]

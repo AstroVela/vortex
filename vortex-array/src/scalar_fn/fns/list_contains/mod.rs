@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+mod integer_membership;
 mod kernel;
 
 use std::ops::BitOr;
 
 use arrow_buffer::bit_iterator::BitIndexIterator;
+pub use integer_membership::IntegerMembership;
 pub use kernel::*;
 use num_traits::Zero;
 use vortex_buffer::BitBuffer;
@@ -13,6 +15,7 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
+use vortex_mask::Mask;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 use vortex_utils::iter::ReduceBalancedIterExt;
@@ -24,6 +27,7 @@ use crate::arrays::BoolArray;
 use crate::arrays::Constant;
 use crate::arrays::ConstantArray;
 use crate::arrays::ListViewArray;
+use crate::arrays::Primitive;
 use crate::arrays::PrimitiveArray;
 use crate::arrays::ScalarFnArray;
 use crate::arrays::bool::BoolArrayExt;
@@ -146,8 +150,7 @@ impl ScalarFnVTable for ListContains {
 fn compute_contains_scalar(list: &Scalar, needle: &Scalar) -> VortexResult<Scalar> {
     let nullability = list.dtype().nullability() | needle.dtype().nullability();
 
-    // Handle null list or null needle
-    if list.is_null() || needle.is_null() {
+    if list.is_null() {
         return Ok(Scalar::null(DType::Bool(nullability)));
     }
 
@@ -155,6 +158,12 @@ fn compute_contains_scalar(list: &Scalar, needle: &Scalar) -> VortexResult<Scala
     let elements = list_scalar
         .elements()
         .ok_or_else(|| vortex_err!("Expected non-null list"))?;
+    if elements.is_empty() {
+        return Ok(Scalar::bool(false, nullability));
+    }
+    if needle.is_null() {
+        return Ok(Scalar::null(DType::Bool(nullability)));
+    }
 
     let contains = elements.iter().any(|elem| elem == needle);
     Ok(Scalar::bool(contains, nullability))
@@ -176,7 +185,18 @@ fn compute_list_contains(
         );
     }
 
-    if value.all_invalid(ctx)? || array.all_invalid(ctx)? {
+    if matches!(value.dtype(), DType::Primitive(ptype, _) if ptype.is_int())
+        && array.as_constant().is_some()
+    {
+        let value = value.clone().execute::<PrimitiveArray>(ctx)?;
+        if let Some(result) =
+            <Primitive as ListContainsElementKernel>::list_contains(array, value.as_view(), ctx)?
+        {
+            return Ok(result);
+        }
+    }
+
+    if array.all_invalid(ctx)? {
         return Ok(ConstantArray::new(
             Scalar::null(DType::Bool(Nullability::Nullable)),
             array.len(),
@@ -206,6 +226,10 @@ fn constant_list_scalar_contains(
     let len = values.len();
     let false_scalar = Scalar::bool(false, nullability);
 
+    if elements.is_empty() {
+        return Ok(ConstantArray::new(false_scalar, len).into_array());
+    }
+
     let result = elements
         .iter()
         .map(|element| {
@@ -221,7 +245,9 @@ fn constant_list_scalar_contains(
         .into_iter()
         .try_reduce_balanced(|acc, res| acc.binary(res, Operator::Or))?;
 
-    Ok(result.unwrap_or_else(|| ConstantArray::new(false_scalar, len).into_array()))
+    result
+        .unwrap_or_else(|| ConstantArray::new(false_scalar, len).into_array())
+        .mask(values.validity()?.to_array(len))
 }
 
 /// Returns a [`BoolArray`] where each bit represents if a list contains the scalar.
@@ -243,6 +269,9 @@ fn list_contains_scalar(
     if elems.is_empty() {
         // Must return false when a list is empty (but valid), or null when the list itself is null.
         return list_false_or_null(&list_array, nullability);
+    }
+    if value.is_null() {
+        return list_false_if_empty_else_null(&list_array, nullability, ctx);
     }
 
     let rhs = ConstantArray::new(value.clone(), elems.len());
@@ -301,6 +330,25 @@ fn list_contains_scalar(
     Ok(BoolArray::new(
         list_matches,
         list_array.validity()?.union_nullability(nullability),
+    )
+    .into_array())
+}
+
+/// Returns false for valid empty lists and null for all other lists.
+fn list_false_if_empty_else_null(
+    list_array: &ListViewArray,
+    nullability: Nullability,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrayRef> {
+    let sizes = list_array.sizes().clone().execute::<PrimitiveArray>(ctx)?;
+    let empty = match_each_integer_ptype!(sizes.ptype(), |S| {
+        Mask::from_iter(sizes.as_slice::<S>().iter().map(|size| size.is_zero()))
+    });
+    let valid = list_array.validity()?.execute_mask(list_array.len(), ctx)? & &empty;
+
+    Ok(BoolArray::new(
+        BitBuffer::new_unset(list_array.len()),
+        Validity::from_mask(valid, nullability),
     )
     .into_array())
 }
@@ -749,7 +797,7 @@ mod tests {
     #[case(
         null_strings(vec![vec![], vec![None, None], vec![None, None, None]]),
         None,
-        bool_array(vec![false, true, true], Validity::AllInvalid)
+        BoolArray::from_iter([Some(false), None, None])
     )]
     #[case(
         null_strings(vec![vec![], vec![None, None], vec![None, None, None]]),
@@ -794,6 +842,45 @@ mod tests {
         let contains = list_array.apply(&expr).unwrap();
         let expected = BoolArray::from_iter([true, true]);
         assert_arrays_eq!(contains, expected, &mut ctx);
+    }
+
+    #[rstest]
+    #[case::empty(
+        Vec::<Option<i32>>::new(),
+        [Some(false), Some(false), Some(false)]
+    )]
+    #[case::nonempty(
+        vec![Some(1), Some(3)],
+        [Some(true), None, Some(false)]
+    )]
+    #[case::all_null(
+        vec![None, None],
+        [Some(false), None, Some(false)]
+    )]
+    fn test_constant_list_nullable_needles(
+        #[case] members: Vec<Option<i32>>,
+        #[case] expected: [Option<bool>; 3],
+    ) {
+        let mut ctx = array_session().create_execution_ctx();
+        let member_dtype = DType::Primitive(I32, Nullability::Nullable);
+        let list = Scalar::list(
+            Arc::new(member_dtype.clone()),
+            members
+                .into_iter()
+                .map(|member| {
+                    member
+                        .map(|value| Scalar::primitive(value, Nullability::Nullable))
+                        .unwrap_or_else(|| Scalar::null(member_dtype.clone()))
+                })
+                .collect(),
+            Nullability::NonNullable,
+        );
+        let needles = PrimitiveArray::from_option_iter([Some(1), None, Some(2)]).into_array();
+
+        let result = needles.apply(&list_contains(lit(list), root())).unwrap();
+        let expected = BoolArray::from_iter(expected);
+
+        assert_arrays_eq!(result, expected, &mut ctx);
     }
 
     #[test]

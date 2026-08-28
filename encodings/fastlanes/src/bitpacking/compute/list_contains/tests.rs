@@ -16,14 +16,20 @@ use vortex_array::assert_arrays_eq;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::NativePType;
 use vortex_array::dtype::Nullability;
+#[cfg(not(codspeed))]
 use vortex_array::expr::list_contains;
+#[cfg(not(codspeed))]
 use vortex_array::expr::lit;
+#[cfg(not(codspeed))]
 use vortex_array::expr::root;
 use vortex_array::scalar::PValue;
 use vortex_array::scalar::Scalar;
 use vortex_array::scalar_fn::fns::list_contains::ListContainsElementKernel;
+#[cfg(not(codspeed))]
 use vortex_array::test_harness::trace::TraceOptions;
+#[cfg(not(codspeed))]
 use vortex_array::test_harness::trace::TraceResolution;
+#[cfg(not(codspeed))]
 use vortex_array::test_harness::trace::trace_op_with;
 use vortex_array::validity::Validity;
 use vortex_error::VortexResult;
@@ -113,10 +119,9 @@ integer_type_test!(test_integer_type_i64, i64, 6);
 #[case::one(vec![3])]
 #[case::two(vec![3, 7])]
 #[case::three(vec![3, 7, 11])]
-#[case::seven((0..7).map(|value| value * 2 + 1).collect())]
-#[case::eight((0..8).map(|value| value * 2 + 1).collect())]
-#[case::nine((0..9).map(|value| value * 2 + 1).collect())]
+#[case::four(vec![3, 7, 11, 15])]
 #[case::larger((0..32).map(|value| value * 3).collect())]
+#[case::sparse((0..32).map(|value| value * 10_000).collect())]
 #[case::duplicates(vec![3, 3, 7, 7, 11, 11, 15, 15, 15])]
 fn test_member_cardinalities(#[case] members: Vec<i32>) -> VortexResult<()> {
     let mut ctx = SESSION.create_execution_ctx();
@@ -242,6 +247,31 @@ fn test_nullable_members_are_ignored() -> VortexResult<()> {
 }
 
 #[test]
+fn test_empty_and_all_null_members_with_null_needles() -> VortexResult<()> {
+    let mut ctx = SESSION.create_execution_ctx();
+    let values = [Some(1i32), None, Some(2)];
+    let primitive = PrimitiveArray::from_option_iter(values);
+    let packed = BitPackedData::encode(&primitive.into_array(), 2, &mut ctx)?;
+
+    let empty_list = list_array(
+        member_list(std::iter::empty::<Option<i32>>(), Nullability::Nullable),
+        packed.len(),
+    );
+    let actual = execute_direct(&empty_list, &packed, &mut ctx)?;
+    let expected = BoolArray::from_iter([Some(false), Some(false), Some(false)]);
+    assert_arrays_eq!(actual, expected, &mut ctx);
+
+    let all_null_list = list_array(
+        member_list([None::<i32>], Nullability::Nullable),
+        packed.len(),
+    );
+    let actual = execute_direct(&all_null_list, &packed, &mut ctx)?;
+    let expected = BoolArray::from_iter([Some(false), None, Some(false)]);
+    assert_arrays_eq!(actual, expected, &mut ctx);
+    Ok(())
+}
+
+#[test]
 fn test_wrong_integer_type_declines_without_panic() -> VortexResult<()> {
     let mut ctx = SESSION.create_execution_ctx();
     let primitive = PrimitiveArray::from_iter([1i32, 2, 3]);
@@ -278,6 +308,7 @@ fn test_noninteger_list_declines_without_panic() -> VortexResult<()> {
 }
 
 #[test]
+#[cfg(not(codspeed))]
 fn test_registered_kernel_executes_through_expression() -> VortexResult<()> {
     let mut ctx = SESSION.create_execution_ctx();
     let values = (0..2_048).map(|value| value % 128).collect::<Vec<i32>>();
