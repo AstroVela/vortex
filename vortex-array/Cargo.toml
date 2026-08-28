@@ -97,6 +97,7 @@ vortex-array = { path = ".", features = [
     "table-display",
     "unstable_row_fns",
 ] }
+vortex-bench-support = { workspace = true }
 
 [[bench]]
 name = "aggregate_max"
@@ -132,6 +133,10 @@ harness = false
 
 [[bench]]
 name = "binary_ops"
+harness = false
+
+[[bench]]
+name = "row_fn_output"
 harness = false
 
 [[bench]]

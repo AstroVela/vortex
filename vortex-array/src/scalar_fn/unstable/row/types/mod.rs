@@ -14,13 +14,16 @@ pub use element::IndexedElementTuple;
 pub use element::InputElement;
 pub use element::OutputElement;
 pub(super) use element::batch_const;
+pub(in crate::scalar_fn::unstable::row) use element::decoded_source;
 
 mod result;
 pub use result::FailureEvidence;
 pub use result::SinkResult;
 
 mod sink;
+pub use sink::FixedSizeListSink;
 pub use sink::InitializedElement;
+pub use sink::InitializedRow;
 pub use sink::OutputSink;
 pub use sink::UninitElementSink;
 
