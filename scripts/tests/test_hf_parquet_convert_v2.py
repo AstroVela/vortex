@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 
 
-SCRIPT = Path(__file__).parents[1] / "huggingface-convert.py"
+SCRIPT = Path(__file__).parents[1] / "huggingface-convert-v2.py"
 SPEC = importlib.util.spec_from_file_location("hf_parquet_convert", SCRIPT)
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)

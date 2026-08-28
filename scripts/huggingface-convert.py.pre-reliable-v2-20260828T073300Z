@@ -31,7 +31,6 @@ DEFAULT_DATA_DIR = Path(__file__).resolve().parents[1] / "data" / "huggingface-c
 DEFAULT_XET_CACHE = DEFAULT_DATA_DIR / "xet-cache"
 DEFAULT_DOWNLOAD_BUFFER_BYTES = 64_000_000_000
 DEFAULT_UPLOAD_BUFFER_BYTES = 128_000_000_000
-DEFAULT_STATUS_INTERVAL = 5.0
 PARQUET_BATCH_ROWS = 65_536
 LOG_LOCK = threading.Lock()
 OPERATIONAL_CONFIG_KEYS = {"xet_cache", "xet_high_performance", "xet_range_gets"}
@@ -55,52 +54,24 @@ def safe_print(*values, file=None, **kwargs):
             replacement.close()
 
 
-def retryable_hub_error(error):
-    """Recognize transport failures, including transient errors wrapped by Xet."""
-    current = error
-    messages = []
-    seen = set()
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        messages.append(str(current).lower())
-        try:
-            import httpx
-            if isinstance(current, httpx.TransportError):
-                return True
-        except ImportError:
-            pass
-        if isinstance(current, (ConnectionError, TimeoutError)):
-            return True
-        response = getattr(current, "response", None)
-        status = getattr(response, "status_code", None)
-        if status in (408, 425, 429) or (status is not None and status >= 500):
-            return True
-        current = current.__cause__ or current.__context__
-    message = " ".join(messages)
-    return any(fragment in message for fragment in (
-        "timed out", "timeout", "request body", "connection reset",
-        "connection aborted", "connection closed", "broken pipe",
-        "temporarily unavailable", "internal error",
-    ))
-
-
-def retry_call(operation, attempts, base_delay=1.0, max_delay=60.0):
-    """Retry transient Hub/Xet operations with bounded jittered exponential backoff."""
+def retry_call(operation, attempts, base_delay=1.0):
+    """Retry a Hub operation with bounded exponential backoff."""
     for attempt in range(1, attempts + 1):
         try:
             return operation()
         except Exception as error:
-            if attempt == attempts or not retryable_hub_error(error):
+            try:
+                import httpx
+                transport_error = isinstance(error, httpx.TransportError)
+            except ImportError:
+                transport_error = False
+            response = getattr(error, "response", None)
+            status = getattr(response, "status_code", None)
+            retryable = (isinstance(error, (ConnectionError, TimeoutError)) or transport_error
+                         or status in (408, 429) or (status is not None and status >= 500))
+            if attempt == attempts or not retryable:
                 raise
-            delay = min(max_delay, base_delay * 2 ** (attempt - 1))
-            delay += random.uniform(0, delay * 0.25)
-            safe_print(
-                f"transient Hub error (attempt {attempt}/{attempts}): {error}; "
-                f"retrying in {delay:.1f}s",
-                file=sys.stderr,
-                flush=True,
-            )
-            time.sleep(delay)
+            time.sleep(base_delay * 2 ** (attempt - 1))
 
 
 def parse_size(value):
@@ -485,17 +456,6 @@ def fits_download_buffer(inflight_bytes, next_bytes, limit_bytes):
     return inflight_bytes == 0 or inflight_bytes + next_bytes <= limit_bytes
 
 
-def completed_futures(futures):
-    """Yield (key, future) in completion order, removing each from the input mapping."""
-    while futures:
-        done, _ = concurrent.futures.wait(futures.values(),
-                                          return_when=concurrent.futures.FIRST_COMPLETED)
-        for completed in done:
-            key = next(key for key, future in futures.items() if future is completed)
-            futures.pop(key)
-            yield key, completed
-
-
 def needs_source_download(file_state, outputs):
     """Return whether any output lacks both a remote commit and reusable local encoding."""
     for fmt, local_path in outputs.items():
@@ -521,36 +481,6 @@ def atomic_json(path, value):
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
     temporary.replace(path)
-
-
-class LiveStatus:
-    """Periodically publish an atomic, machine-readable scheduler snapshot."""
-
-    def __init__(self, path, interval, snapshot):
-        self.path = path
-        self.interval = interval
-        self.snapshot = snapshot
-        self.started = time.monotonic()
-        self.stop_event = threading.Event()
-        self.thread = threading.Thread(target=self._run, name="status-writer", daemon=True)
-
-    def start(self):
-        self.thread.start()
-
-    def write(self, final=False):
-        value = self.snapshot()
-        value.update(schema_version=1, elapsed_seconds=time.monotonic() - self.started,
-                     updated_at_unix=time.time(), final=final)
-        atomic_json(self.path, value)
-
-    def _run(self):
-        while not self.stop_event.wait(self.interval):
-            self.write()
-
-    def close(self):
-        self.stop_event.set()
-        self.thread.join()
-        self.write(final=True)
 
 
 def load_checkpoint(path):
@@ -647,7 +577,7 @@ def add_selection_arguments(parser):
                         help="maximum actions in each planned Hugging Face commit")
     parser.add_argument("--upload-batch-size", type=parse_size, default=100_000_000_000,
                         help="maximum planned source bytes represented by one target commit")
-    parser.add_argument("--hub-attempts", type=int, default=8)
+    parser.add_argument("--hub-attempts", type=int, default=5)
     parser.add_argument("--hub-timeout", type=int, default=30)
 
 
@@ -658,29 +588,24 @@ def add_operational_arguments(parser):
     parser.add_argument("--transcode-workers", type=int, default=max(1, os.cpu_count() or 1),
                         help="maximum single-core transcodes active across downloaded shards")
     parser.add_argument("--shard-workers", type=int, default=2,
-                        help="initial downloads (deprecated alias)")
-    parser.add_argument("--download-initial-concurrency", type=int)
-    parser.add_argument("--download-max-concurrency", type=int, default=8)
+                        help="initial adaptive concurrent shard downloads")
     parser.add_argument("--download-buffer-files", type=int, default=100)
     parser.add_argument("--download-buffer-size", type=parse_size,
                         default=DEFAULT_DOWNLOAD_BUFFER_BYTES)
     parser.add_argument("--upload-workers", type=int, default=2)
-    parser.add_argument("--upload-max-concurrency", type=int, default=8)
     parser.add_argument("--upload-local-dir", type=Path,
                         help="copy outputs to a local sink instead of Hugging Face")
     parser.add_argument("--upload-buffer-files", type=int, default=100)
     parser.add_argument("--upload-batch-files", type=int, default=100)
     parser.add_argument("--upload-buffer-size", type=parse_size,
                         default=DEFAULT_UPLOAD_BUFFER_BYTES)
-    parser.add_argument("--hub-attempts", type=int, default=8)
+    parser.add_argument("--hub-attempts", type=int, default=5)
     parser.add_argument("--hub-timeout", type=int, default=30)
     parser.add_argument("--xet-range-gets", type=int, default=4)
     parser.add_argument("--xet-cache", type=Path, default=DEFAULT_XET_CACHE)
     parser.add_argument("--xet-high-performance", action="store_true")
     parser.add_argument("--keep-downloads", action="store_true")
     parser.add_argument("--delete-after-upload", action="store_true")
-    parser.add_argument("--status-interval", type=float, default=DEFAULT_STATUS_INTERVAL)
-    parser.add_argument("--detached", action="store_true")
 
 
 def parse_args():
@@ -896,20 +821,12 @@ def main():
         raise RuntimeError("--transcode-workers must be positive")
     if args.shard_workers < 1:
         raise RuntimeError("--shard-workers must be positive")
-    if args.download_initial_concurrency is None:
-        args.download_initial_concurrency = args.shard_workers
-    if not 1 <= args.download_initial_concurrency <= args.download_max_concurrency:
-        raise RuntimeError("download concurrency must satisfy 1 <= initial <= max")
     if args.download_buffer_size < 1:
         raise RuntimeError("--download-buffer-size must be positive")
     if args.download_buffer_files < 1:
         raise RuntimeError("--download-buffer-files must be positive")
     if args.upload_workers < 1:
         raise RuntimeError("--upload-workers must be positive")
-    if not args.upload_workers <= args.upload_max_concurrency:
-        raise RuntimeError("upload concurrency must satisfy 1 <= initial <= max")
-    if args.status_interval <= 0:
-        raise RuntimeError("--status-interval must be positive")
     if args.upload_buffer_files < 1:
         raise RuntimeError("--upload-buffer-files must be positive")
     if args.upload_batch_files < 1 or args.upload_batch_files > 100:
@@ -925,8 +842,6 @@ def main():
     formats = parse_formats(args.formats)
     args.prefix = args.prefix.strip("/")
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    if args.detached or not sys.stdout.isatty():
-        os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
     if os.environ.get("HF_HUB_DISABLE_XET", "").upper() in {"1", "ON", "YES", "TRUE"}:
         raise RuntimeError("HF_HUB_DISABLE_XET is set; this converter requires Xet")
     args.xet_cache = args.xet_cache.expanduser().resolve()
@@ -958,10 +873,8 @@ def main():
         flush=True,
     )
     safe_print(
-        f"Transfer buffers: downloads={args.download_initial_concurrency}-"
-        f"{args.download_max_concurrency} workers/"
-        f"{args.download_buffer_size / 1e9:.1f} GB, uploads={args.upload_workers}-"
-        f"{args.upload_max_concurrency} workers/"
+        f"Transfer buffers: downloads={args.shard_workers} workers/"
+        f"{args.download_buffer_size / 1e9:.1f} GB, uploads={args.upload_workers} workers/"
         f"{args.upload_buffer_size / 1e9:.1f} GB",
         flush=True,
     )
@@ -1056,8 +969,8 @@ def main():
 
     missing_shards = [shard for shard in selection if shard_needs_download(shard)]
     download_executor = concurrent.futures.ThreadPoolExecutor(
-        max_workers=min(args.download_max_concurrency, max(1, len(missing_shards))))
-    upload_executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.upload_max_concurrency)
+        max_workers=min(args.download_buffer_files, max(1, len(missing_shards))))
+    upload_executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.upload_buffer_files)
     pending_uploads = []
     upload_control = threading.Condition()
     upload_active = 0
@@ -1066,13 +979,8 @@ def main():
     download_futures = {}
     download_sizes = {}
     missing_index = 0
-    download_concurrency = args.download_initial_concurrency
+    download_concurrency = args.shard_workers
     recent_download_rates = deque(maxlen=4)
-    pipeline_started = time.monotonic()
-    transfer_totals = {"download_bytes": 0, "download_seconds": 0.0,
-                       "upload_bytes": 0, "upload_seconds": 0.0,
-                       "download_failures": 0, "upload_failures": 0}
-    transfer_totals_lock = threading.Lock()
 
     def run_adaptive_upload(operation, size_bytes):
         nonlocal upload_active, upload_concurrency
@@ -1086,15 +994,12 @@ def main():
         finally:
             elapsed = max(time.monotonic() - started, 0.001)
             rate = size_bytes / elapsed
-            with transfer_totals_lock:
-                transfer_totals["upload_bytes"] += size_bytes
-                transfer_totals["upload_seconds"] += elapsed
             with upload_control:
                 previous = (sum(recent_upload_rates) / len(recent_upload_rates)
                             if recent_upload_rates else 0)
                 recent_upload_rates.append(rate)
                 if not previous or rate >= previous * 0.95:
-                    upload_concurrency = min(args.upload_max_concurrency, upload_concurrency + 1)
+                    upload_concurrency = min(args.upload_buffer_files, upload_concurrency + 1)
                 elif len(recent_upload_rates) == recent_upload_rates.maxlen and rate < previous * 0.75:
                     upload_concurrency = max(1, upload_concurrency // 2)
                 upload_active -= 1
@@ -1108,8 +1013,7 @@ def main():
 
     def fill_download_window(active_bytes=0):
         nonlocal missing_index
-        while len(download_futures) < min(download_concurrency, args.download_max_concurrency,
-                                          args.download_buffer_files):
+        while len(download_futures) < min(download_concurrency, args.download_buffer_files):
             if missing_index >= len(missing_shards):
                 break
             next_shard = missing_shards[missing_index]
@@ -1200,8 +1104,6 @@ def main():
                     atomic_json(checkpoint_path, checkpoint)
 
                 def record_upload_failure(error):
-                    with transfer_totals_lock:
-                        transfer_totals["upload_failures"] += 1
                     with checkpoint_lock:
                         output_state["upload"] = {"status": "failed", "hub_path": sink_path,
                                                   "error": str(error)}
@@ -1265,18 +1167,6 @@ def main():
     conversion_executor = concurrent.futures.ThreadPoolExecutor(max_workers=transcode_slots)
     conversion_futures = []
 
-    def submit_conversion(position, shard, raw, outputs, state):
-        source_name = shard["path"]
-        state["status"] = "converting"
-        state.pop("error", None)
-        save_checkpoint()
-        conversion_futures.append(conversion_executor.submit(
-            process_downloaded_shard, position, shard, source_name, raw, outputs, state))
-
-    # Admit resumable local sources immediately. Network downloads below are admitted in
-    # completion order, so one slow low-ordinal shard cannot strand ready CPU work.
-    positions = {shard["path"]: position for position, shard in enumerate(selection, 1)}
-    shards_by_name = {shard["path"]: shard for shard in selection}
     for position, shard in enumerate(selection, 1):
         source_name = shard["path"]
         raw, outputs = shard_paths(shard)
@@ -1302,97 +1192,45 @@ def main():
                 flush=True,
             )
             continue
-        if source_name not in download_futures and not shard_needs_download(shard):
-            submit_conversion(position, shard, raw, outputs, state)
-
-    def status_snapshot():
-        with checkpoint_lock:
-            files = list(checkpoint["files"].values())
-            outputs = [output for state in files for output in state.get("outputs", {}).values()]
-        source_done = sum(state.get("status") == "complete" for state in files)
-        converted = sum(output.get("status") == "complete" for output in outputs)
-        uploaded = sum(output.get("upload", {}).get("status") == "complete"
-                       for output in outputs)
-        preuploaded = sum(output.get("upload", {}).get("status") == "preuploaded"
-                          for output in outputs)
-        with transfer_totals_lock:
-            totals = dict(transfer_totals)
-        elapsed = max(time.monotonic() - pipeline_started, 0.001)
-        conversion_source_bytes = sum(
-            state["size"] for state in files for output in state.get("outputs", {}).values()
-            if output.get("status") == "complete" and output.get("metrics", {}).get("seconds"))
-        return {
-            "queues": {
-                "download": {"waiting_items": len(missing_shards) - missing_index,
-                             "active_items": len(download_futures),
-                             "reserved_bytes": sum(download_sizes.values())},
-                "transcode": {"waiting_items": sum(not future.running() and not future.done()
-                                                          for future in conversion_futures),
-                              "active_items": sum(future.running() for future in conversion_futures),
-                              "succeeded_items": sum(future.done() and future.exception() is None
-                                                     for future in conversion_futures),
-                              "active_cpu_slots": args.transcode_workers - VX_CPU_SLOTS.qsize()},
-                "upload": {"waiting_items": sum(not future.running() and not future.done()
-                                                       for future in pending_uploads),
-                           "active_items": upload_active,
-                           "succeeded_items": sum(future.done() and future.exception() is None
-                                                  for future in pending_uploads),
-                           "concurrency": upload_concurrency},
-            },
-            "progress": {"source_complete": source_done, "source_total": len(selection),
-                         "outputs_converted": converted,
-                         "outputs_uploaded": uploaded, "outputs_preuploaded": preuploaded},
-            "limits": {"download_files": args.download_buffer_files,
-                       "download_bytes": args.download_buffer_size,
-                       "upload_files": args.upload_buffer_files,
-                       "upload_bytes": args.upload_buffer_size},
-            "throughput": {
-                "download_effective_bytes_per_second": totals["download_bytes"] / elapsed,
-                "download_worker_bytes_per_second": totals["download_bytes"]
-                    / max(totals["download_seconds"], 0.001),
-                "conversion_source_bytes_per_second": conversion_source_bytes / elapsed,
-                "upload_effective_bytes_per_second": totals["upload_bytes"] / elapsed,
-                "upload_worker_bytes_per_second": totals["upload_bytes"]
-                    / max(totals["upload_seconds"], 0.001),
-            },
-            "failures": {"download": totals["download_failures"],
-                         "upload": totals["upload_failures"]},
-        }
-
-    status = LiveStatus(args.output_dir / "status.json", args.status_interval, status_snapshot)
-    status.start()
-    try:
-        for source_name, completed in completed_futures(download_futures):
+        if source_name in download_futures:
+            state["status"] = "downloading"
+            save_checkpoint()
+            try:
+                downloaded_path, download_seconds = download_futures.pop(source_name).result()
                 download_sizes.pop(source_name)
-                shard = shards_by_name[source_name]
-                raw, outputs = shard_paths(shard)
-                state = checkpoint["files"][source_name]
-                try:
-                    downloaded_path, download_seconds = completed.result()
-                    if downloaded_path.resolve() != raw.resolve():
-                        raise RuntimeError(f"Hub download returned unexpected path: {downloaded_path}")
-                    state["download"] = {"status": "complete", "path": str(raw),
-                                         "size_bytes": shard["size"], "seconds": download_seconds}
-                    rate = shard["size"] / max(download_seconds, 0.001)
-                    recent_download_rates.append(rate)
-                    with transfer_totals_lock:
-                        transfer_totals["download_bytes"] += shard["size"]
-                        transfer_totals["download_seconds"] += download_seconds
-                    submit_conversion(positions[source_name], shard, raw, outputs, state)
-                    safe_print(f"[{positions[source_name]}/{len(selection)}] downloaded "
-                               f"{source_name} in {download_seconds:.1f}s", flush=True)
-                except Exception as error:
-                    with transfer_totals_lock:
-                        transfer_totals["download_failures"] += 1
-                    state["status"] = "failed"
-                    state["error"] = f"download: {error}"
-                    save_checkpoint()
-                    raise
-                fill_download_window()
-                while len(pending_uploads) >= args.upload_buffer_files:
-                    pending_uploads.pop(0).result()
-    finally:
-        status.write()
+                if downloaded_path.resolve() != raw.resolve():
+                    raise RuntimeError(f"Hub download returned unexpected path: {downloaded_path}")
+                fill_download_window(active_bytes=shard["size"])
+                state["download"] = {"status": "complete", "path": str(raw),
+                                     "size_bytes": shard["size"], "seconds": download_seconds}
+                state["status"] = "converting"
+                state.pop("error", None)
+                save_checkpoint()
+                safe_print(
+                    f"  downloaded {shard['size'] / 1e9:.2f} GB in {download_seconds:.1f}s",
+                    flush=True,
+                )
+                rate = shard["size"] / max(download_seconds, 0.001)
+                previous_rate = sum(recent_download_rates) / len(recent_download_rates) if recent_download_rates else 0
+                recent_download_rates.append(rate)
+                if (not previous_rate or rate >= previous_rate * 0.95):
+                    download_concurrency = min(args.download_buffer_files, download_concurrency + 1)
+                elif len(recent_download_rates) == recent_download_rates.maxlen and rate < previous_rate * 0.75:
+                    download_concurrency = max(1, download_concurrency // 2)
+            except Exception as error:
+                state["status"] = "failed"
+                state["error"] = f"download: {error}"
+                save_checkpoint()
+                raise
+        else:
+            state["status"] = "uploading"
+            save_checkpoint()
+        conversion_futures.append(conversion_executor.submit(
+            process_downloaded_shard, position, shard, source_name, raw, outputs, state))
+        fill_download_window()
+        max_pending_uploads = args.upload_buffer_files
+        while len(pending_uploads) >= max_pending_uploads:
+            pending_uploads.pop(0).result()
     for future in concurrent.futures.as_completed(conversion_futures):
         future.result()
     conversion_executor.shutdown(wait=True, cancel_futures=True)
@@ -1405,7 +1243,6 @@ def main():
             apply_committed_batch(final_batch)
             safe_print(f"    committed final batch: {final_batch['url']}", flush=True)
     write_reports(checkpoint, args.output_dir, selection)
-    status.close()
     return 0
 
 

@@ -3,9 +3,7 @@
 
 import concurrent.futures
 import importlib.util
-import json
 import sys
-import time
 import types
 import tempfile
 import unittest
@@ -19,35 +17,6 @@ SPEC.loader.exec_module(MODULE)
 
 
 class LocalCopyUploaderTest(unittest.TestCase):
-    def test_completed_downloads_do_not_wait_for_slow_first_item(self):
-        def finish(name, delay):
-            time.sleep(delay)
-            return name
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            futures = {
-                "slow-first": executor.submit(finish, "slow-first", 0.15),
-                "fast-second": executor.submit(finish, "fast-second", 0.01),
-            }
-            completion_order = [name for name, _ in MODULE.completed_futures(futures)]
-
-        self.assertEqual(completion_order, ["fast-second", "slow-first"])
-        self.assertEqual(futures, {})
-
-    def test_live_status_is_atomic_and_marks_final_snapshot(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "status.json"
-            reporter = MODULE.LiveStatus(path, 0.01, lambda: {"queues": {"download": 2}})
-            reporter.start()
-            time.sleep(0.03)
-            reporter.close()
-
-            status = json.loads(path.read_text())
-            self.assertEqual(status["schema_version"], 1)
-            self.assertEqual(status["queues"]["download"], 2)
-            self.assertTrue(status["final"])
-            self.assertGreater(status["elapsed_seconds"], 0)
-
     def test_plan_records_create_and_skip_actions_at_immutable_revisions(self):
         class FakeApi:
             def repo_info(self, *args, **kwargs):
@@ -193,21 +162,6 @@ class LocalCopyUploaderTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "permanent"):
             MODULE.retry_call(permanent_operation, 3, base_delay=0)
         self.assertEqual(len(calls), 1)
-
-    def test_retry_call_retries_xet_wrapped_request_body_timeout(self):
-        calls = []
-
-        def xet_operation():
-            calls.append(None)
-            if len(calls) < 3:
-                raise RuntimeError("Internal error: timed out reading request body")
-            return "complete"
-
-        self.assertEqual(
-            MODULE.retry_call(xet_operation, 5, base_delay=0),
-            "complete",
-        )
-        self.assertEqual(len(calls), 3)
 
     def test_missing_destination_prefix_is_an_empty_listing(self):
         import httpx
