@@ -19,6 +19,8 @@ use crate::LayoutId;
 use crate::LayoutParts;
 use crate::LayoutReaderContext;
 use crate::LayoutReaderRef;
+use crate::reader_plan::LayoutPlan;
+use crate::reader_plan::PlanRef as ReaderPlanRef;
 use crate::segments::SegmentId;
 use crate::segments::SegmentSource;
 
@@ -113,6 +115,11 @@ pub trait VTable: 'static + Clone + Send + Sync + Debug {
         session: &VortexSession,
         ctx: &LayoutReaderContext,
     ) -> VortexResult<LayoutReaderRef>;
+
+    /// Construct a layout-v27 reader plan for this layout.
+    fn new_reader_plan(layout: &Layout<Self>) -> VortexResult<ReaderPlanRef> {
+        Ok(Arc::new(LayoutPlan::new(layout.to_layout())))
+    }
 
     /// Returns `true` if this layout is indivisible: its readers never register natural split
     /// boundaries strictly inside their row range (see [`crate::LayoutReader::register_splits`]).

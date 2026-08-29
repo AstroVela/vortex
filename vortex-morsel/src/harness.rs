@@ -26,6 +26,7 @@ use vortex_io::runtime::single::block_on;
 use vortex_io::runtime::tokio::TokioRuntime;
 use vortex_io::session::RuntimeSessionExt;
 use vortex_layout::LayoutRef;
+use vortex_layout::reader_plan::ReaderPlanScan;
 use vortex_layout::scan::scan_builder::ScanBuilder;
 use vortex_layout::segments::SegmentSource;
 use vortex_session::VortexSession;
@@ -190,6 +191,109 @@ pub fn run_v1_tokio_with(
     let wall = start.elapsed();
 
     let rows = batches.iter().map(|b| b.len()).sum();
+    Ok(RunOutcome {
+        batches,
+        rows,
+        wall,
+        time_to_first_batch: first,
+        stats: None,
+        source_io_requests: None,
+        source_io_bytes: None,
+    })
+}
+
+/// Run the layout-v27 rules-based reader on the single-threaded executor.
+pub fn run_layout_v27(
+    session: &VortexSession,
+    layout: &LayoutRef,
+    segments: &Arc<dyn SegmentSource>,
+    query: &Query,
+) -> VortexResult<RunOutcome> {
+    let reader = layout.new_reader(
+        "layout-v27-harness".into(),
+        Arc::clone(segments),
+        session,
+        &Default::default(),
+    )?;
+    let session = session.clone();
+    let layout = Arc::clone(layout);
+    let segments = Arc::clone(segments);
+    let query = query.clone();
+    let start = Instant::now();
+    let (batches, first) = block_on(move |handle| {
+        let session = session.with_handle(handle);
+        async move {
+            let scan = ReaderPlanScan::try_new(
+                session,
+                &layout,
+                reader,
+                segments,
+                &query.projection,
+                query.filter.as_ref(),
+            )?;
+            collect_reader_plan(scan, start).await
+        }
+    })?;
+    outcome_without_stats(batches, first, start.elapsed())
+}
+
+/// Run the layout-v27 rules-based reader on a multi-threaded Tokio runtime.
+pub fn run_layout_v27_tokio(
+    runtime: &tokio::runtime::Runtime,
+    session: &VortexSession,
+    layout: &LayoutRef,
+    segments: &Arc<dyn SegmentSource>,
+    query: &Query,
+) -> VortexResult<RunOutcome> {
+    let reader = layout.new_reader(
+        "layout-v27-harness".into(),
+        Arc::clone(segments),
+        session,
+        &Default::default(),
+    )?;
+    let session = session.clone();
+    let layout = Arc::clone(layout);
+    let segments = Arc::clone(segments);
+    let query = query.clone();
+    let start = Instant::now();
+    let (batches, first) = runtime.block_on(async move {
+        let session = session.with_handle(TokioRuntime::current());
+        let scan = ReaderPlanScan::try_new(
+            session,
+            &layout,
+            reader,
+            segments,
+            &query.projection,
+            query.filter.as_ref(),
+        )?;
+        collect_reader_plan(scan, start).await
+    })?;
+    outcome_without_stats(batches, first, start.elapsed())
+}
+
+async fn collect_reader_plan(
+    scan: ReaderPlanScan,
+    start: Instant,
+) -> VortexResult<(Vec<ArrayRef>, Option<Duration>)> {
+    let stream = scan.into_stream()?;
+    futures::pin_mut!(stream);
+    let mut batches = Vec::new();
+    let mut first = None;
+    while let Some(batch) = stream.try_next().await? {
+        if first.is_none() {
+            first = Some(start.elapsed());
+        }
+        batches.push(batch);
+    }
+    Ok((batches, first))
+}
+
+fn outcome_without_stats(
+    batches: Vec<ArrayRef>,
+    first: Option<Duration>,
+    wall: Duration,
+) -> VortexResult<RunOutcome> {
+    let rows = batches.iter().map(|batch| batch.len()).sum();
     Ok(RunOutcome {
         batches,
         rows,

@@ -125,11 +125,18 @@ fn date32(year: i32, month: u32, day: u32) -> i32 {
 
 /// A `Date32` literal for a calendar date.
 fn date_lit(dtype: &DType, year: i32, month: u32, day: u32) -> VortexResult<Expression> {
-    Ok(lit(Scalar::primitive_value(
+    let storage = Scalar::primitive_value(
         date32(year, month, day).into(),
         PType::I32,
-        dtype.nullability(),
-    )))
+        match dtype {
+            DType::Extension(ext) => ext.storage_dtype().nullability(),
+            _ => dtype.nullability(),
+        },
+    );
+    Ok(lit(match dtype {
+        DType::Extension(ext) => Scalar::extension_ref(ext.clone(), storage),
+        _ => storage,
+    }))
 }
 
 /// The scan portion of the TPC-H queries that push a filter into `lineitem`, plus the two

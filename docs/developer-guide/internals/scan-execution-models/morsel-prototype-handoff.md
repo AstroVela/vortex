@@ -1,11 +1,60 @@
 # Morsel Prototype: Handoff
 
-Everything needed to rerun and interpret the morsel-executor evaluation. The code is on branch
-`claude/morsel-executor-prototype-vvrscx`.
+Everything needed to rerun and interpret the morsel-executor evaluation. The original prototype is
+on branch `claude/morsel-executor-prototype-vvrscx`; the current three-reader comparison and latest
+optimizations are on `ji/morsel-layout27-comparison`.
 
 The latest measurements used a 16-core/32-thread Intel Xeon 6975P. Compute-only results use CPUs
 0–15 (one hardware thread per physical core). File-backed results use all 32 logical CPUs because
 SMT hides file-driver latency on this machine.
+
+## Latest comparison branch and optimizations (2026-08-28)
+
+The comparison harness now runs the V1 `LayoutReader`, layout-v27, and the preferred morsel design
+over the same generated segments and verifies identical dtype, row count, and ordered content before
+reporting timings. Layout-v27 was ported only for study and benchmarking; the morsel implementation
+does not depend on its executor.
+
+The accumulated morsel optimizations on this branch are:
+
+- worker threads and reusable thread-local arenas are created outside timed execution;
+- one affinity-owned morsel remains active per worker, with no migration of partial node state;
+- plan-driven required and speculative reads share one scan-level background I/O service, while
+  exact ticket completion wakes only the suspended execution that needs it;
+- file-backed `execute` methods consume completed requests and perform no file syscalls; immutable
+  in-memory segments retain the zero-wait inline lookup;
+- scan-wide raw cells and lease-counted decoded cells deduplicate reads and decoding across morsels;
+- read-time morsels are 131,072 rows by default without changing the normal 8192-row/1 MiB write
+  pipeline;
+- bounded 64 KiB/4 MiB local-file coalescing avoids both tiny reads and excessive gap amplification;
+- top-level conjuncts referencing the same column now share one column input and one `PredicateExec`
+  plan node. The column is decoded once and its predicates progressively refine one mask;
+- sparse same-column ranges can use a normalized fused expression, while dense ranges retain the
+  original encoding-aware comparisons. This recovers Q6's range win without the decimal `Between`
+  regression observed on Q19;
+- a single-column predicate binds directly to the column array, avoiding a redundant one-field
+  `StructExec` plus `GetItem` evaluation.
+
+The latest SF=1 in-memory run used all 32 logical CPUs, one warm-up, and five grouped samples. These
+numbers are a current-branch smoke comparison, separate from the controlled x16 physical-core table
+below.
+
+| query | V1 Tokio x32 | layout-v27 x32 | morsel x32/128k | morsel vs V1 |
+|---|--:|--:|--:|--:|
+| Q6 | 2.160 ms | 5.294 ms | 1.767 ms | 1.22x |
+| Q1 | 1.801 ms | 3.920 ms | 1.234 ms | 1.46x |
+| Q14 | 1.353 ms | 3.897 ms | 1.013 ms | 1.34x |
+| Q15 | 1.446 ms | 3.673 ms | 1.036 ms | 1.40x |
+| Q12 | 2.734 ms | 6.148 ms | 2.016 ms | 1.36x |
+| Q19 | 6.368 ms | 7.444 ms | 1.621 ms | 3.93x |
+| scan-6col | 1.398 ms | 2.824 ms | 0.730 ms | 1.92x |
+| selective | 1.619 ms | 5.052 ms | 1.208 ms | 1.34x |
+
+For Q6 specifically, grouping reduced logical decode consumers from 322 to 230 while physical work
+remained 161 reads and 34,559,892 segment bytes. Its single-worker median improved from 24.58 ms
+before same-column range fusion to 21.08 ms. Q19 remained on the dense encoding-aware path at
+13.09 ms on one worker and 1.62 ms at x32/128k instead of regressing to roughly 25 ms with
+unconditional decimal range fusion.
 
 ## 1. Run it
 
@@ -50,7 +99,7 @@ not a complete Vortex file with a footer.
 ## 2. Fairness and correctness
 
 Before timing, every configuration is compared with V1 on dtype, row count, and ordered content.
-A mismatch aborts the run. The 27 `vortex-morsel` tests include differential coverage against the
+A mismatch aborts the run. The 29 `vortex-morsel` tests include differential coverage against the
 V1 `LayoutReader` and scheduler/I/O regressions.
 
 The executor rejects unsupported layouts at plan-build time. Timed runs prepare worker threads and
@@ -158,8 +207,8 @@ across four workers when decoded sharing is disabled.
 - Output needs a bounded reorder buffer for real consumer-visible streaming.
 - Completed raw buffers remain in the scan-wide service until scan teardown; add byte-bounded
   retention without breaking exact-ticket wakeups.
-- Q6 is now the smallest in-memory and file-backed win. Profile worker occupancy and predicate
-  decode before changing scheduling.
+- Q12 is now the smallest 128k in-memory win in the latest all-logical-core smoke run. Profile its
+  worker occupancy and mask/predicate work before changing scheduling.
 - The one-turn coalescing delay is intentionally bounded. A production implementation should make
   coalescing/admission policy explicit rather than growing an unbounded timer-based window.
 - Add real zone-map pruning and rerun V1 and morsel with identical statistics.
@@ -172,7 +221,7 @@ across four workers when decoded sharing is disabled.
 | path | responsibility |
 |---|---|
 | `vortex-morsel/src/node.rs` | `ExecNode`, exact wait sets, and retry propagation |
-| `vortex-morsel/src/nodes/` | FLAT, CHUNKED, STRUCT, CONJUNCT, and FILTER nodes |
+| `vortex-morsel/src/nodes/` | FLAT, CHUNKED, STRUCT, PREDICATE, CONJUNCT, and FILTER nodes |
 | `vortex-morsel/src/io.rs` | Scan-wide raw cells and morsel-local ticket views |
 | `vortex-morsel/src/cells.rs` | Lease-counted shared decoded cells |
 | `vortex-morsel/src/build.rs` | Immutable `ExecPlan` and initial I/O lookahead set |

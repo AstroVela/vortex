@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! The E1 evaluation: the morsel executor against the V1 `LayoutReader`.
+//! The E1 evaluation: V1 and layout-v27 readers against the morsel executor.
 //!
 //! The fair contract, in order:
 //!
-//! 1. Build the fixture once. Both executors read the same in-memory segments.
+//! 1. Build the fixture once. All three executors read the same in-memory segments.
 //! 2. Validate every executor's output against V1's — same row count, same ordered content —
 //!    *before* anything is timed. A configuration that disagrees is reported as a failure and
 //!    never appears in the timing table.
@@ -30,6 +30,8 @@ use vortex_morsel::harness::MorselConfig;
 use vortex_morsel::harness::Query;
 use vortex_morsel::harness::RunOutcome;
 use vortex_morsel::harness::assert_same_rows;
+use vortex_morsel::harness::run_layout_v27;
+use vortex_morsel::harness::run_layout_v27_tokio;
 use vortex_morsel::harness::run_morsel;
 use vortex_morsel::harness::run_v1;
 use vortex_morsel::harness::run_v1_tokio;
@@ -47,6 +49,10 @@ enum Row {
     V1Single,
     /// V1 `LayoutReader` on a multi-threaded Tokio runtime, the way DataFusion drives it.
     V1Tokio(usize),
+    /// Layout-v27 on the single-threaded executor.
+    LayoutV27Single,
+    /// Layout-v27 on a multi-threaded Tokio runtime.
+    LayoutV27Tokio(usize),
     /// The morsel executor.
     Morsel(MorselConfig),
 }
@@ -56,6 +62,8 @@ impl Row {
         match self {
             Row::V1Single => "A  V1 (1 thread)".to_string(),
             Row::V1Tokio(threads) => format!("A' V1 (tokio x{threads})"),
+            Row::LayoutV27Single => "B  layout-v27 (1 thread)".to_string(),
+            Row::LayoutV27Tokio(threads) => format!("B' layout-v27 (tokio x{threads})"),
             Row::Morsel(config) => {
                 let mode = match config.mode {
                     ConjunctMode::Cascade => "",
@@ -123,7 +131,7 @@ fn main() -> VortexResult<()> {
         "host: {threads} logical cores; segments in memory; fineweb-shaped={fineweb_rows} rows, \
          clickbench-shaped={clickbench_rows} rows; {iterations} grouped iterations, median reported"
     );
-    println!("both executors use workers prepared outside the timed interval");
+    println!("all executors use workers prepared outside the timed interval");
     println!();
 
     let mut workload_set = Vec::new();
@@ -169,20 +177,31 @@ fn main() -> VortexResult<()> {
 
         for query in &workload.queries {
             let rows_config: Vec<Row> = match &selected_morsel_rows {
-                Some(sizes) => sizes
-                    .iter()
-                    .copied()
-                    .map(|morsel_rows| {
-                        Row::Morsel(MorselConfig {
-                            threads,
-                            morsel_rows,
-                            ..Default::default()
+                Some(sizes) => [
+                    vec![
+                        Row::V1Single,
+                        Row::V1Tokio(threads),
+                        Row::LayoutV27Single,
+                        Row::LayoutV27Tokio(threads),
+                    ],
+                    sizes
+                        .iter()
+                        .copied()
+                        .map(|morsel_rows| {
+                            Row::Morsel(MorselConfig {
+                                threads,
+                                morsel_rows,
+                                ..Default::default()
+                            })
                         })
-                    })
-                    .collect(),
+                        .collect(),
+                ]
+                .concat(),
                 None => vec![
                     Row::V1Single,
                     Row::V1Tokio(threads),
+                    Row::LayoutV27Single,
+                    Row::LayoutV27Tokio(threads),
                     Row::Morsel(MorselConfig {
                         threads: 1,
                         ..Default::default()
@@ -303,6 +322,8 @@ fn run_once(
     match row {
         Row::V1Single => run_v1(session, layout, segments, query),
         Row::V1Tokio(_) => run_v1_tokio(runtime, session, layout, segments, query),
+        Row::LayoutV27Single => run_layout_v27(session, layout, segments, query),
+        Row::LayoutV27Tokio(_) => run_layout_v27_tokio(runtime, session, layout, segments, query),
         Row::Morsel(config) => run_morsel(session, layout, segments, query, config),
     }
 }

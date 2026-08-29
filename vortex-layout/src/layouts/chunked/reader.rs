@@ -103,6 +103,38 @@ impl ChunkedReader {
         }
     }
 
+    pub(crate) fn try_new_with_readers(
+        layout: ChunkedLayout,
+        dtype: DType,
+        name: Arc<str>,
+        children: Vec<LayoutReaderRef>,
+    ) -> VortexResult<Self> {
+        vortex_ensure!(
+            dtype == *layout.dtype(),
+            "Chunked plan dtype {dtype} does not match layout dtype {}",
+            layout.dtype()
+        );
+        vortex_ensure!(
+            children.len() == layout.nchildren(),
+            "Chunked plan supplied {} readers for {} chunks",
+            children.len(),
+            layout.nchildren()
+        );
+        for (index, child) in children.iter().enumerate() {
+            vortex_ensure!(
+                child.dtype() == &dtype,
+                "Chunk {index} reader dtype {} does not match parent dtype {dtype}",
+                child.dtype()
+            );
+        }
+        Ok(Self {
+            layout,
+            name,
+            lazy_children: LazyReaderChildren::from_readers(children),
+            chunk_skips: OnceCell::new(),
+        })
+    }
+
     /// Return the [`LayoutReader`] for the given chunk.
     fn chunk_reader(&self, idx: usize) -> VortexResult<&LayoutReaderRef> {
         self.lazy_children.get(idx)

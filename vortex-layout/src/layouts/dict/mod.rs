@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-mod reader;
+pub(crate) mod reader;
 pub mod writer;
 
 use std::sync::Arc;
@@ -29,6 +29,8 @@ use crate::LayoutReaderRef;
 use crate::LayoutRef;
 use crate::VTable;
 use crate::children::OwnedLayoutChildren;
+use crate::reader_plan::DictPlan;
+use crate::reader_plan::PlanRef as ReaderPlanRef;
 use crate::segments::SegmentSource;
 
 /// Dictionary layout vtable.
@@ -122,6 +124,10 @@ impl VTable for Dict {
             session.clone(),
             ctx.clone(),
         )?))
+    }
+
+    fn new_reader_plan(layout: &Layout<Self>) -> VortexResult<ReaderPlanRef> {
+        Ok(Arc::new(DictPlan::try_new(layout)?))
     }
 }
 

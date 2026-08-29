@@ -22,6 +22,8 @@ use crate::LayoutReaderRef;
 use crate::children::LayoutChildren;
 use crate::display::DisplayLayoutTree;
 use crate::display::display_tree_with_segment_sizes;
+use crate::reader_plan::LayoutPlan;
+use crate::reader_plan::PlanRef as ReaderPlanRef;
 use crate::segments::SegmentId;
 use crate::segments::SegmentSource;
 use crate::vtable::LayoutRef;
@@ -188,6 +190,11 @@ impl<V: VTable> Layout<V> {
     ) -> VortexResult<LayoutReaderRef> {
         V::new_reader(self, name, segment_source, session, ctx)
     }
+
+    /// Construct a layout-v27 reader plan for this layout.
+    pub fn new_reader_plan(&self) -> VortexResult<ReaderPlanRef> {
+        V::new_reader_plan(self)
+    }
 }
 
 impl<V: VTable> Clone for Layout<V> {
@@ -268,6 +275,11 @@ pub trait DynLayout: 'static + Send + Sync + Debug {
         ctx: &LayoutReaderContext,
     ) -> VortexResult<LayoutReaderRef>;
 
+    /// Constructs a layout-v27 reader plan.
+    fn dyn_new_reader_plan(&self) -> VortexResult<ReaderPlanRef> {
+        Ok(Arc::new(LayoutPlan::new(self.dyn_to_layout())))
+    }
+
     /// Returns `true` if this layout is indivisible: its readers never register natural split
     /// boundaries strictly inside their row range (see [`crate::VTable::is_indivisible`]).
     fn dyn_is_indivisible(&self) -> bool {
@@ -328,6 +340,10 @@ impl<V: VTable> DynLayout for Layout<V> {
         ctx: &LayoutReaderContext,
     ) -> VortexResult<LayoutReaderRef> {
         Layout::new_reader(self, name, segment_source, session, ctx)
+    }
+
+    fn dyn_new_reader_plan(&self) -> VortexResult<ReaderPlanRef> {
+        Layout::new_reader_plan(self)
     }
 
     fn dyn_is_indivisible(&self) -> bool {
@@ -428,6 +444,11 @@ impl dyn DynLayout + '_ {
         ctx: &LayoutReaderContext,
     ) -> VortexResult<LayoutReaderRef> {
         self.dyn_new_reader(name, segment_source, session, ctx)
+    }
+
+    /// Constructs a layout-v27 reader plan for this layout.
+    pub fn new_reader_plan(&self) -> VortexResult<ReaderPlanRef> {
+        self.dyn_new_reader_plan()
     }
 
     /// Returns all serialized (present) children, in slot order.

@@ -23,6 +23,11 @@ use vortex_array::dtype::StructFields;
 use vortex_array::expr::BoundExpression;
 use vortex_array::expr::Expression;
 use vortex_array::expr::analysis::referenced_field_paths;
+use vortex_array::expr::and_collect;
+use vortex_array::expr::forms::conjuncts as optimized_conjuncts;
+use vortex_array::expr::get_item;
+use vortex_array::expr::root;
+use vortex_array::expr::transform::replace;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -40,10 +45,11 @@ use crate::node::ExecNode;
 use crate::node::NodeId;
 use crate::nodes::ChunkedExec;
 use crate::nodes::ConjunctExec;
+use crate::nodes::ConjunctGroup;
 use crate::nodes::ConjunctMode;
-use crate::nodes::ConjunctSlot;
 use crate::nodes::FilterExec;
 use crate::nodes::FlatExec;
+use crate::nodes::PredicateExec;
 use crate::nodes::StructExec;
 
 /// The immutable blueprint of one node.
@@ -61,8 +67,13 @@ enum NodeSpec {
         names: FieldNames,
         children: Arc<[NodeId]>,
     },
+    Predicate {
+        input: NodeId,
+        predicates: Vec<BoundExpression>,
+        sparse_predicates: Option<Vec<BoundExpression>>,
+    },
     Conjunct {
-        slots: Vec<(NodeId, BoundExpression)>,
+        groups: Vec<(NodeId, usize)>,
         mode: ConjunctMode,
     },
     Filter {
@@ -204,12 +215,21 @@ impl ExecPlan {
                     NodeSpec::Struct { names, children } => {
                         Box::new(StructExec::new(names.clone(), Arc::clone(children)))
                     }
-                    NodeSpec::Conjunct { slots, mode } => Box::new(ConjunctExec::new(
-                        slots
+                    NodeSpec::Predicate {
+                        input,
+                        predicates,
+                        sparse_predicates,
+                    } => Box::new(PredicateExec::new(
+                        *input,
+                        predicates.clone(),
+                        sparse_predicates.clone(),
+                    )),
+                    NodeSpec::Conjunct { groups, mode } => Box::new(ConjunctExec::new(
+                        groups
                             .iter()
-                            .map(|(input, predicate)| ConjunctSlot {
-                                input: *input,
-                                predicate: predicate.clone(),
+                            .map(|(predicate, conjunct_count)| ConjunctGroup {
+                                predicate: *predicate,
+                                conjunct_count: *conjunct_count,
                             })
                             .collect(),
                         *mode,
@@ -270,12 +290,54 @@ pub fn build_plan(
         None => None,
         Some(filter) => {
             let conjuncts = split_conjuncts(filter);
-            let mut slots = Vec::with_capacity(conjuncts.len());
+            let mut grouped: Vec<(Option<FieldName>, Vec<Expression>)> = Vec::new();
             for conjunct in conjuncts {
-                let (input, bound) = builder.build_scoped(&conjunct)?;
-                slots.push((input, bound));
+                let full = conjunct.bind(builder.layout.dtype())?;
+                let names = builder.referenced_top_level_fields(&full)?;
+                if let [name] = names.as_slice() {
+                    if let Some((_, expressions)) = grouped
+                        .iter_mut()
+                        .find(|(field, _)| field.as_ref() == Some(name))
+                    {
+                        expressions.push(conjunct);
+                    } else {
+                        grouped.push((Some(name.clone()), vec![conjunct]));
+                    }
+                } else {
+                    grouped.push((None, vec![conjunct]));
+                }
             }
-            Some(builder.push(NodeSpec::Conjunct { slots, mode }))
+
+            let mut groups = Vec::with_capacity(grouped.len());
+            for (field, expressions) in grouped {
+                let conjunct_count = expressions.len();
+                let sparse_expressions = if expressions.len() > 1 && field.is_some() {
+                    let grouped_expression = and_collect(expressions.clone())
+                        .vortex_expect("a predicate group always contains an expression")
+                        .optimize_recursive(builder.layout.dtype())?;
+                    let normalized = optimized_conjuncts(&grouped_expression);
+                    (normalized.len() < expressions.len()).then_some(normalized)
+                } else {
+                    None
+                };
+                let (input, predicates) = match field.as_ref() {
+                    Some(field) => builder.build_column_group(field, &expressions)?,
+                    None => builder.build_scoped_group(&expressions)?,
+                };
+                let sparse_predicates = match (field.as_ref(), sparse_expressions) {
+                    (Some(field), Some(expressions)) => {
+                        Some(builder.bind_column_group(field, &expressions)?)
+                    }
+                    _ => None,
+                };
+                let predicate = builder.push(NodeSpec::Predicate {
+                    input,
+                    predicates,
+                    sparse_predicates,
+                });
+                groups.push((predicate, conjunct_count));
+            }
+            Some(builder.push(NodeSpec::Conjunct { groups, mode }))
         }
     };
 
@@ -321,8 +383,30 @@ impl Builder {
     /// Build the subtree for one expression: a struct over exactly the top-level fields the
     /// expression reads, plus that expression re-bound against the narrowed struct dtype.
     fn build_scoped(&mut self, expr: &Expression) -> VortexResult<(NodeId, BoundExpression)> {
-        let full = expr.bind(self.layout.dtype())?;
-        let names = self.referenced_top_level_fields(&full)?;
+        let (input, mut expressions) = self.build_scoped_group(std::slice::from_ref(expr))?;
+        Ok((
+            input,
+            expressions
+                .pop()
+                .vortex_expect("one scoped expression must produce one bound expression"),
+        ))
+    }
+
+    /// Build one input subtree shared by expressions that reference the same field set.
+    fn build_scoped_group(
+        &mut self,
+        expressions: &[Expression],
+    ) -> VortexResult<(NodeId, Vec<BoundExpression>)> {
+        let mut names = Vec::new();
+        for expression in expressions {
+            let full = expression.bind(self.layout.dtype())?;
+            for name in self.referenced_top_level_fields(&full)? {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        names.sort_by_key(|name| self.root_fields.find(name).unwrap_or(usize::MAX));
 
         let dtypes = names
             .iter()
@@ -336,7 +420,10 @@ impl Builder {
             StructFields::new(FieldNames::from(names.clone()), dtypes),
             Nullability::NonNullable,
         );
-        let bound = expr.bind(&narrowed)?;
+        let bound = expressions
+            .iter()
+            .map(|expression| expression.bind(&narrowed))
+            .collect::<VortexResult<Vec<_>>>()?;
 
         let mut children = Vec::with_capacity(names.len());
         for name in &names {
@@ -353,6 +440,39 @@ impl Builder {
             children: Arc::from(children),
         });
         Ok((node, bound))
+    }
+
+    /// Build a predicate input directly over one top-level field, removing the otherwise
+    /// redundant one-field struct and `GetItem` execution.
+    fn build_column_group(
+        &mut self,
+        field: &FieldName,
+        expressions: &[Expression],
+    ) -> VortexResult<(NodeId, Vec<BoundExpression>)> {
+        let index = self
+            .root_fields
+            .find(field)
+            .ok_or_else(|| vortex_err!("field {field} not found in the scan dtype"))?;
+        let field_layout = self.field_layout(index)?;
+        let input = self.build_layout(&field_layout, 0)?;
+        let predicates = self.bind_column_group(field, expressions)?;
+        Ok((input, predicates))
+    }
+
+    fn bind_column_group(
+        &self,
+        field: &FieldName,
+        expressions: &[Expression],
+    ) -> VortexResult<Vec<BoundExpression>> {
+        let dtype = self
+            .root_fields
+            .field(field)
+            .ok_or_else(|| vortex_err!("field {field} not found in the scan dtype"))?;
+        let needle = get_item(field.clone(), root());
+        expressions
+            .iter()
+            .map(|expression| replace(expression.clone(), &needle, root()).bind(&dtype))
+            .collect()
     }
 
     /// The struct layout's child for field `idx`, accounting for the validity slot.

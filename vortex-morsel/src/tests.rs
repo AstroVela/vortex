@@ -60,6 +60,7 @@ use crate::fixtures::write_fixture;
 use crate::harness::MorselConfig;
 use crate::harness::Query;
 use crate::harness::assert_same_rows;
+use crate::harness::run_layout_v27;
 use crate::harness::run_morsel;
 use crate::harness::run_v1;
 use crate::nodes::ConjunctMode;
@@ -210,6 +211,26 @@ fn queries() -> Vec<Query> {
 }
 
 const ROWS: usize = 1000;
+
+#[test]
+fn layout_v27_matches_v1_oracle() -> VortexResult<()> {
+    let session = session();
+    let fixture = misaligned_fixture(&session, ROWS)?;
+    let segments: Arc<dyn SegmentSource> = Arc::clone(&fixture.segments);
+
+    for query in queries() {
+        let v1 = run_v1(&session, &fixture.layout, &segments, &query)?;
+        let layout_v27 = run_layout_v27(&session, &fixture.layout, &segments, &query)?;
+        assert_same_rows(
+            &session,
+            &v1_dtype(&fixture.layout, &query)?,
+            &v1,
+            &layout_v27,
+        )
+        .map_err(|err| err.with_context(format!("query {}", query.name)))?;
+    }
+    Ok(())
+}
 
 /// Property: the executor agrees with V1 on every query, over misaligned chunks.
 #[rstest]
@@ -474,6 +495,59 @@ fn shared_cells_reuse_straddled_chunks() -> VortexResult<()> {
     );
     // Each of the 15 chunks (3 + 5 + 7) is decoded exactly once across the whole scan.
     assert_eq!(stats.decodes, 15);
+    Ok(())
+}
+
+/// Same-column conjuncts share one input subtree and therefore name no more IO than one conjunct
+/// over that column. The expressions still remain individually observable through the V1 oracle.
+#[test]
+fn same_column_conjuncts_share_one_predicate_input() -> VortexResult<()> {
+    let session = session();
+    let fixture = misaligned_fixture(&session, ROWS)?;
+    let segments: Arc<dyn SegmentSource> = Arc::clone(&fixture.segments);
+    let projection = select(vec!["c"], root());
+    let one_bound = Query {
+        name: "one-a-bound",
+        projection: projection.clone(),
+        filter: Some(gt(get_item("a", root()), lit(100i32))),
+    };
+    let two_bounds = Query {
+        name: "two-a-bounds",
+        projection,
+        filter: Some(and(
+            gt(get_item("a", root()), lit(100i32)),
+            lt(get_item("a", root()), lit(900i32)),
+        )),
+    };
+    let config = MorselConfig {
+        threads: 1,
+        morsel_rows: ROWS as u64,
+        share_decodes: false,
+        ..Default::default()
+    };
+
+    let one_v1 = run_v1(&session, &fixture.layout, &segments, &one_bound)?;
+    let one_morsel = run_morsel(&session, &fixture.layout, &segments, &one_bound, config)?;
+    assert_same_rows(
+        &session,
+        &v1_dtype(&fixture.layout, &one_bound)?,
+        &one_v1,
+        &one_morsel,
+    )?;
+
+    let two_v1 = run_v1(&session, &fixture.layout, &segments, &two_bounds)?;
+    let two_morsel = run_morsel(&session, &fixture.layout, &segments, &two_bounds, config)?;
+    assert_same_rows(
+        &session,
+        &v1_dtype(&fixture.layout, &two_bounds)?,
+        &two_v1,
+        &two_morsel,
+    )?;
+
+    let one_stats = one_morsel.stats.expect("morsel runs report stats");
+    let two_stats = two_morsel.stats.expect("morsel runs report stats");
+    assert_eq!(two_stats.io_uses, one_stats.io_uses);
+    assert_eq!(two_stats.decodes, one_stats.decodes);
     Ok(())
 }
 

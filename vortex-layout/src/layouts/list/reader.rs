@@ -103,6 +103,52 @@ impl ListReader {
         })
     }
 
+    pub(crate) fn try_new_with_readers(
+        layout: ListLayout,
+        name: Arc<str>,
+        session: VortexSession,
+        elements: LayoutReaderRef,
+        offsets: LayoutReaderRef,
+        validity: Option<LayoutReaderRef>,
+    ) -> VortexResult<Self> {
+        vortex_error::vortex_ensure!(
+            offsets.dtype() == &DType::Primitive(layout.offsets_ptype(), Nullability::NonNullable),
+            "List offsets reader has unexpected dtype {}",
+            offsets.dtype()
+        );
+        vortex_error::vortex_ensure!(
+            offsets.row_count().saturating_sub(1) == layout.row_count(),
+            "List offsets reader has {} rows, expected {}",
+            offsets.row_count(),
+            layout.row_count() + 1
+        );
+        vortex_error::vortex_ensure!(
+            validity.is_some() == layout.dtype().is_nullable(),
+            "List validity reader presence does not match parent nullability"
+        );
+        if let Some(validity) = &validity {
+            vortex_error::vortex_ensure!(
+                validity.dtype() == &DType::Bool(Nullability::NonNullable),
+                "List validity reader has unexpected dtype {}",
+                validity.dtype()
+            );
+            vortex_error::vortex_ensure!(
+                validity.row_count() == layout.row_count(),
+                "List validity reader has {} rows, expected {}",
+                validity.row_count(),
+                layout.row_count()
+            );
+        }
+        Ok(Self {
+            layout,
+            name,
+            session,
+            elements,
+            offsets,
+            validity,
+        })
+    }
+
     /// Projection for [`ListChildrenNeeded::Validity`] expressions. Reads only the validity child,
     /// synthesizing all-valid for a non-nullable list, and never touches the offsets or elements.
     fn project_validity(

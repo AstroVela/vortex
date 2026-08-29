@@ -123,6 +123,78 @@ impl StructReader {
         })
     }
 
+    pub(crate) fn try_new_with_readers(
+        layout: StructLayout,
+        name: Arc<str>,
+        session: VortexSession,
+        fields: Vec<LayoutReaderRef>,
+        validity: Option<LayoutReaderRef>,
+    ) -> VortexResult<Self> {
+        vortex_error::vortex_ensure!(
+            fields.len() == layout.struct_fields().nfields(),
+            "Struct plan supplied {} field readers for {} fields",
+            fields.len(),
+            layout.struct_fields().nfields()
+        );
+        for (index, (reader, dtype)) in fields
+            .iter()
+            .zip(layout.struct_fields().fields())
+            .enumerate()
+        {
+            vortex_error::vortex_ensure!(
+                reader.row_count() == layout.row_count(),
+                "Struct field {index} reader has {} rows, expected {}",
+                reader.row_count(),
+                layout.row_count()
+            );
+            vortex_error::vortex_ensure!(
+                reader.dtype() == &dtype,
+                "Struct field {index} reader dtype {} does not match {dtype}",
+                reader.dtype()
+            );
+        }
+        vortex_error::vortex_ensure!(
+            validity.is_some() == layout.dtype().is_nullable(),
+            "Struct validity reader presence does not match parent nullability"
+        );
+        if let Some(validity) = &validity {
+            vortex_error::vortex_ensure!(
+                validity.dtype() == &DType::Bool(Nullability::NonNullable),
+                "Struct validity reader has unexpected dtype {}",
+                validity.dtype()
+            );
+            vortex_error::vortex_ensure!(
+                validity.row_count() == layout.row_count(),
+                "Struct validity reader has {} rows, expected {}",
+                validity.row_count(),
+                layout.row_count()
+            );
+        }
+
+        let field_lookup = (layout.struct_fields().nfields() > 80).then(|| {
+            layout
+                .struct_fields()
+                .names()
+                .iter()
+                .enumerate()
+                .map(|(index, name)| (name.clone(), index))
+                .collect()
+        });
+        let expanded_root_expr = expanded_struct_root(layout.dtype(), layout.struct_fields())?;
+        let mut children = Vec::with_capacity(fields.len() + usize::from(validity.is_some()));
+        children.extend(validity);
+        children.extend(fields);
+        Ok(Self {
+            layout,
+            name,
+            session,
+            expanded_root_expr,
+            lazy_children: LazyReaderChildren::from_readers(children),
+            field_lookup,
+            partitioned_expr_cache: Default::default(),
+        })
+    }
+
     /// Return the [`StructFields`] of this layout.
     fn struct_fields(&self) -> &StructFields {
         self.layout.struct_fields()

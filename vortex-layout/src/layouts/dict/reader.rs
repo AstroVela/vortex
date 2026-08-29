@@ -99,6 +99,37 @@ impl DictReader {
         })
     }
 
+    pub(crate) fn try_new_with_readers(
+        layout: DictLayout,
+        name: Arc<str>,
+        session: VortexSession,
+        codes: LayoutReaderRef,
+        values: LayoutReaderRef,
+    ) -> VortexResult<Self> {
+        vortex_error::vortex_ensure!(
+            codes.row_count() == layout.row_count(),
+            "Dictionary codes reader has {} rows, expected {}",
+            codes.row_count(),
+            layout.row_count()
+        );
+        vortex_error::vortex_ensure!(
+            codes.dtype() == &layout.codes_dtype,
+            "Dictionary codes reader dtype {} does not match {}",
+            codes.dtype(),
+            layout.codes_dtype
+        );
+        Ok(Self {
+            values_len: usize::try_from(values.row_count())?,
+            layout,
+            name,
+            session,
+            values_array: Default::default(),
+            values_evals: Default::default(),
+            values,
+            codes,
+        })
+    }
+
     fn values_array(&self) -> SharedArrayFuture {
         // We capture the name, so it may be wrong if we re-use the same reader within multiple
         // different parent readers. But that's rare...

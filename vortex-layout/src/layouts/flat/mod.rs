@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-mod reader;
+pub(crate) mod reader;
 pub mod writer;
 
 use std::env;
@@ -28,6 +28,8 @@ use crate::LayoutReaderRef;
 use crate::VTable;
 use crate::children::OwnedLayoutChildren;
 use crate::layouts::flat::reader::FlatReader;
+use crate::reader_plan::FlatPlan;
+use crate::reader_plan::PlanRef as ReaderPlanRef;
 use crate::segments::SegmentId;
 use crate::segments::SegmentSource;
 
@@ -119,6 +121,10 @@ impl VTable for Flat {
             segment_source,
             session.clone(),
         )))
+    }
+
+    fn new_reader_plan(layout: &Layout<Self>) -> VortexResult<ReaderPlanRef> {
+        Ok(Arc::new(FlatPlan::new(layout)))
     }
 }
 

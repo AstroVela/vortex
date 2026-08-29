@@ -1,20 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! The five operator state machines: FLAT, CHUNKED, STRUCT, CONJUNCT and FILTER.
+//! The operator state machines used by the morsel execution arena.
 
 mod chunked;
 mod conjunct;
 mod filter;
 mod flat;
+mod predicate;
 mod struct_;
 
 pub use chunked::ChunkedExec;
 pub use conjunct::ConjunctExec;
+pub use conjunct::ConjunctGroup;
 pub use conjunct::ConjunctMode;
-pub use conjunct::ConjunctSlot;
 pub use filter::FilterExec;
 pub use flat::FlatExec;
+pub use predicate::PredicateExec;
 pub use struct_::StructExec;
 
 /// The mask density at or above which a predicate is evaluated over the whole range and

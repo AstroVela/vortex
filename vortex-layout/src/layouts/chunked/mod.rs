@@ -27,6 +27,8 @@ use crate::LayoutRef;
 use crate::VTable;
 use crate::children::OwnedLayoutChildren;
 use crate::layouts::chunked::reader::ChunkedReader;
+use crate::reader_plan::ChunkedPlan;
+use crate::reader_plan::PlanRef as ReaderPlanRef;
 use crate::segments::SegmentSource;
 
 /// Chunked layout vtable.
@@ -92,6 +94,10 @@ impl VTable for Chunked {
             session,
             ctx.clone(),
         )))
+    }
+
+    fn new_reader_plan(layout: &Layout<Self>) -> VortexResult<ReaderPlanRef> {
+        Ok(Arc::new(ChunkedPlan::try_new(layout)?))
     }
 }
 

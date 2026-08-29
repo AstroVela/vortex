@@ -16,6 +16,7 @@
 //! split strategy, and task concurrency settings, then produces array streams or iterators.
 pub mod layouts;
 pub mod plan;
+pub mod reader_plan;
 
 pub use children::*;
 pub use encoding::*;
