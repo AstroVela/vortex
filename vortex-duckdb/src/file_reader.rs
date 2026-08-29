@@ -28,7 +28,8 @@ use vortex::layout::scan::scan_builder::ScanBuilder;
 use vortex::layout::scan::scan_builder::ScanExecutor;
 use vortex::mask::Mask;
 use vortex_morsel::MorselScanExecutor;
-use vortex_morsel::SharedMorselWorkerPool;
+use vortex_morsel::ScanBackend;
+use vortex_morsel::scan_backend_from_env;
 
 use crate::RUNTIME;
 use crate::SESSION;
@@ -72,9 +73,6 @@ use crate::table_function::convert_result;
 // separate thread.
 
 static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::new);
-static MORSEL_WORKERS: LazyLock<Arc<SharedMorselWorkerPool>> = LazyLock::new(|| {
-    Arc::new(SharedMorselWorkerPool::new(4).vortex_expect("failed to start morsel worker pool"))
-});
 
 fn resolve_filesystem(url: &Url) -> VortexResult<(FileSystemRef, String)> {
     // Compat makes us use tokio which is very bad for local reads on
@@ -99,7 +97,7 @@ fn resolve_filesystem(url: &Url) -> VortexResult<(FileSystemRef, String)> {
 
 pub struct OpenFileReader {
     pub reader: LayoutReaderRef,
-    morsel_executor: Arc<dyn ScanExecutor>,
+    morsel_executor: Option<Arc<dyn ScanExecutor>>,
     /// File splits stored in inverse order
     pub splits: Vec<Split>,
     pub cache: ConversionCache,
@@ -113,10 +111,13 @@ impl OpenFileReader {
         let file = fs.open_read(&path).await?;
         let file = open_cached(&SESSION, file, &path, None, &|options| options).await?;
         let reader = file.layout_reader()?;
-        let morsel_executor: Arc<dyn ScanExecutor> = Arc::new(
-            MorselScanExecutor::new(Arc::clone(file.footer().layout()), file.segment_source())
-                .with_worker_pool(Arc::clone(&MORSEL_WORKERS)),
-        );
+        let morsel_executor = match scan_backend_from_env()? {
+            ScanBackend::V1 => None,
+            ScanBackend::Morsel(mode) => Some(Arc::new(
+                MorselScanExecutor::new(Arc::clone(file.footer().layout()), file.segment_source())
+                    .with_execution_mode(mode),
+            ) as Arc<dyn ScanExecutor>),
+        };
         Ok(OpenFileReader {
             reader,
             morsel_executor,
@@ -183,11 +184,13 @@ pub fn reader_initialize(file: &mut OpenFileReader, global: &GlobalState) -> Vor
     let reader = Arc::clone(&file.reader);
     let filter = &global.filter;
     let mut builder = ScanBuilder::new(SESSION.clone(), reader)
-        .with_executor(Arc::clone(&file.morsel_executor))
         .with_projection(global.projection.clone())
         .with_ordered(ordered)
         .with_some_filter(filter.filter.clone())
         .with_selection(filter.row_selection.clone());
+    if let Some(executor) = &file.morsel_executor {
+        builder = builder.with_executor(Arc::clone(executor));
+    }
     if let Some(row_range) = filter.row_range.as_ref() {
         builder = builder.with_row_range(row_range.clone());
     }

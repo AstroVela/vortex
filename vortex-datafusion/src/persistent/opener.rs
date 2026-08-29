@@ -51,6 +51,8 @@ use vortex::metrics::MetricsRegistry;
 use vortex::session::VortexSession;
 use vortex_arrow::ArrowSessionExt;
 use vortex_morsel::MorselScanExecutor;
+use vortex_morsel::ScanBackend;
+use vortex_morsel::scan_backend_from_env;
 use vortex_utils::aliases::dash_map::DashMap;
 use vortex_utils::aliases::dash_map::Entry;
 
@@ -356,12 +358,19 @@ impl FileOpener for VortexOpener {
                 }
             };
 
-            let morsel_executor = Arc::new(
-                MorselScanExecutor::new(Arc::clone(vxf.footer().layout()), vxf.segment_source())
-                    .with_threads(1),
-            );
-            let mut scan_builder = ScanBuilder::new(session.clone(), Arc::clone(&layout_reader))
-                .with_executor(morsel_executor);
+            let mut scan_builder = ScanBuilder::new(session.clone(), Arc::clone(&layout_reader));
+            if let ScanBackend::Morsel(mode) = scan_backend_from_env()
+                .map_err(|err| exec_datafusion_err!("Invalid scan backend: {err}"))?
+            {
+                scan_builder = scan_builder.with_executor(Arc::new(
+                    MorselScanExecutor::new(
+                        Arc::clone(vxf.footer().layout()),
+                        vxf.segment_source(),
+                    )
+                    .with_threads(1)
+                    .with_execution_mode(mode),
+                ));
+            }
 
             if let Some(vortex_plan) = file.extensions.get::<VortexAccessPlan>() {
                 scan_builder = vortex_plan.apply_to_builder(scan_builder);

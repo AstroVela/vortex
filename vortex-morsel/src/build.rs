@@ -43,6 +43,8 @@ use vortex_layout::layouts::chunked::Chunked;
 use vortex_layout::layouts::flat::Flat;
 use vortex_layout::layouts::flat::FlatLayout;
 use vortex_layout::layouts::struct_::Struct;
+use vortex_layout::layouts::zoned::LegacyStats;
+use vortex_layout::layouts::zoned::Zoned;
 
 use crate::io::IoKey;
 use crate::io::ProducerId;
@@ -1237,6 +1239,13 @@ impl Builder {
 
     /// Build the subtree for one column, recording its chunk boundaries as natural splits.
     fn build_layout(&mut self, layout: &LayoutRef, root_offset: u64) -> VortexResult<NodeId> {
+        if layout.is::<Zoned>() || layout.is::<LegacyStats>() {
+            let data = layout
+                .slot(0)?
+                .ok_or_else(|| vortex_err!("zoned layout has no data child"))?;
+            return self.build_layout(&data, root_offset);
+        }
+
         if layout.is::<Flat>() {
             self.splits.push(root_offset + layout.row_count());
             let flat = layout.as_::<Flat>().clone();

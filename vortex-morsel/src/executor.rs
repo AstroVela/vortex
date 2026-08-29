@@ -34,8 +34,8 @@ use vortex_utils::aliases::hash_map::HashMap;
 use crate::MorselScan;
 use crate::build::ExecPlan;
 use crate::build::build_plan;
-use crate::driver::SharedMorselWorkerPool;
 use crate::driver::morsels;
+use crate::node::ExecutionMode;
 use crate::nodes::ConjunctMode;
 
 type PlanCacheKey = (usize, String, Option<String>, ConjunctMode);
@@ -50,7 +50,7 @@ pub struct MorselScanExecutor {
     target_rows: u64,
     conjunct_mode: ConjunctMode,
     threads: usize,
-    worker_pool: Option<Arc<SharedMorselWorkerPool>>,
+    execution_mode: ExecutionMode,
 }
 
 impl MorselScanExecutor {
@@ -62,7 +62,7 @@ impl MorselScanExecutor {
             target_rows: 128 * 1024,
             conjunct_mode: ConjunctMode::Cascade,
             threads: 4,
-            worker_pool: None,
+            execution_mode: ExecutionMode::Pull,
         }
     }
 
@@ -84,10 +84,9 @@ impl MorselScanExecutor {
         self
     }
 
-    /// Reuse one persistent affinity-worker set across scans.
-    pub fn with_worker_pool(mut self, worker_pool: Arc<SharedMorselWorkerPool>) -> Self {
-        self.threads = worker_pool.threads();
-        self.worker_pool = Some(worker_pool);
+    /// Select recursive pull or leaf-driven push execution.
+    pub fn with_execution_mode(mut self, execution_mode: ExecutionMode) -> Self {
+        self.execution_mode = execution_mode;
         self
     }
 }
@@ -170,7 +169,7 @@ impl ScanExecutor for MorselScanExecutor {
         let coordinator_handle = handle.clone();
         let output_dtype = plan.output_dtype().clone();
         let threads = self.threads;
-        let worker_pool = self.worker_pool.clone();
+        let execution_mode = self.execution_mode;
         handle
             .spawn(async move {
                 let prepared = join_all(work.into_iter().map(
@@ -222,16 +221,16 @@ impl ScanExecutor for MorselScanExecutor {
                 let threads = ranges.len().min(threads);
                 let result = coordinator_handle
                     .spawn_blocking(move || {
-                        let mut scan = MorselScan::new(plan, segments, session)
+                        MorselScan::new(plan, segments, session)
                             .with_threads(threads)
                             .with_morsels(ranges)
+                            .with_sparse_morsels(true)
+                            .with_execution_mode(execution_mode)
                             .with_completion_sink(move |index, batch| {
                                 targets[index].complete(batch);
-                            });
-                        if let Some(worker_pool) = worker_pool {
-                            scan = scan.with_worker_pool(worker_pool);
-                        }
-                        scan.run().map(|_| ())
+                            })
+                            .run()
+                            .map(|_| ())
                     })
                     .await;
                 if let Err(err) = result {
@@ -253,8 +252,11 @@ struct CompletionTarget {
 }
 
 impl CompletionTarget {
-    fn complete(&self, batch: Option<ArrayRef>) {
-        self.group.complete(self.local_index, batch);
+    fn complete(&self, batch: VortexResult<Option<ArrayRef>>) {
+        match batch {
+            Ok(batch) => self.group.complete(self.local_index, batch),
+            Err(err) => self.group.fail(&err.to_string()),
+        }
     }
 }
 

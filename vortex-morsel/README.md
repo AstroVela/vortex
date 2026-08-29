@@ -10,7 +10,8 @@ source-provided non-blocking inline read for a required ticket; on a miss it sus
 ticket while workers service the background IO queues.
 
 The crate is a prototype and is not part of the public API. It supports flat, chunked and
-struct layouts only; anything else is a build error rather than a fallback.
+struct layouts, plus transparent zoned/statistics wrappers; anything else is a build error rather
+than a fallback.
 
 Cross-morsel decode reuse comes from **leased shared cells**, not a cache: lease counts are
 computed from the morsel cut before the scan starts, the first morsel to decode a unit publishes
@@ -31,3 +32,8 @@ with every configuration validated against V1's output before timing.
 ```bash
 cargo run --release -p vortex-morsel --features _test-harness --bin morsel-eval
 ```
+
+DuckDB and DataFusion SQL scans select the implementation through `VORTEX_SCAN_BACKEND`. The
+stable labels are `v1`, `pull`, and `push`; an unset variable defaults to `pull`. Run the same
+benchmark command three times with those values to compare the implementations without rebuilding
+or changing branches.
