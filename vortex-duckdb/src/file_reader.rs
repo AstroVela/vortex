@@ -27,11 +27,10 @@ use vortex::layout::LayoutReaderRef;
 use vortex::layout::scan::scan_builder::ScanBuilder;
 use vortex::layout::scan::scan_builder::ScanExecutor;
 use vortex::mask::Mask;
-use vortex_morsel::MorselScanExecutor;
-use vortex_morsel::ScanBackend;
-use vortex_morsel::SharedMorselWorkerPool;
-use vortex_morsel::scan_backend_from_env;
-use vortex_morsel_push::PushMorselScanExecutor;
+use vortex_morsel_scan::ScanBackend;
+use vortex_morsel_scan::ScanExecutorOptions;
+use vortex_morsel_scan::scan_backend_from_env;
+use vortex_morsel_scan::scan_executor;
 
 use crate::RUNTIME;
 use crate::SESSION;
@@ -75,8 +74,10 @@ use crate::table_function::convert_result;
 // separate thread.
 
 static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::new);
-static MORSEL_WORKERS: LazyLock<Arc<SharedMorselWorkerPool>> = LazyLock::new(|| {
-    Arc::new(SharedMorselWorkerPool::new(4).vortex_expect("failed to start morsel worker pool"))
+static MORSEL_SCAN_OPTIONS: LazyLock<ScanExecutorOptions> = LazyLock::new(|| {
+    ScanExecutorOptions::default()
+        .with_persistent_pull_workers(4)
+        .vortex_expect("failed to start morsel worker pool")
 });
 
 fn resolve_filesystem(url: &Url) -> VortexResult<(FileSystemRef, String)> {
@@ -116,17 +117,17 @@ impl OpenFileReader {
         let file = fs.open_read(&path).await?;
         let file = open_cached(&SESSION, file, &path, None, &|options| options).await?;
         let reader = file.layout_reader()?;
-        let morsel_executor = match scan_backend_from_env()? {
-            ScanBackend::V1 => None,
-            ScanBackend::Pull => Some(Arc::new(
-                MorselScanExecutor::new(Arc::clone(file.footer().layout()), file.segment_source())
-                    .with_worker_pool(Arc::clone(&MORSEL_WORKERS)),
-            ) as Arc<dyn ScanExecutor>),
-            ScanBackend::Push => Some(Arc::new(PushMorselScanExecutor::new(
-                Arc::clone(file.footer().layout()),
-                file.segment_source(),
-            )) as Arc<dyn ScanExecutor>),
+        let backend = scan_backend_from_env()?;
+        let default_options = ScanExecutorOptions::default();
+        let options = match backend {
+            ScanBackend::Pull => &*MORSEL_SCAN_OPTIONS,
+            ScanBackend::V1 | ScanBackend::Push => &default_options,
         };
+        let morsel_executor = scan_executor(
+            backend,
+            || (Arc::clone(file.footer().layout()), file.segment_source()),
+            options,
+        );
         Ok(OpenFileReader {
             reader,
             morsel_executor,

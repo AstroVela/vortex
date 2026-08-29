@@ -38,7 +38,6 @@
 //! Only the FLAT, CHUNKED and STRUCT layout nodes are supported, plus the FILTER and
 //! CONJUNCT operators. Anything else is rejected at build time by [`build::build_plan`].
 
-pub mod backend;
 pub mod build;
 pub mod cells;
 pub mod driver;
@@ -56,8 +55,6 @@ pub mod tpch;
 #[cfg(any(test, feature = "_test-harness"))]
 pub mod workloads;
 
-pub use backend::ScanBackend;
-pub use backend::scan_backend_from_env;
 pub use build::ExecPlan;
 pub use build::build_plan;
 pub use driver::MorselScan;

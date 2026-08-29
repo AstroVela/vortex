@@ -50,10 +50,9 @@ use vortex::metrics::Label;
 use vortex::metrics::MetricsRegistry;
 use vortex::session::VortexSession;
 use vortex_arrow::ArrowSessionExt;
-use vortex_morsel::MorselScanExecutor;
-use vortex_morsel::ScanBackend;
-use vortex_morsel::scan_backend_from_env;
-use vortex_morsel_push::PushMorselScanExecutor;
+use vortex_morsel_scan::ScanExecutorOptions;
+use vortex_morsel_scan::scan_backend_from_env;
+use vortex_morsel_scan::scan_executor;
 use vortex_utils::aliases::dash_map::DashMap;
 use vortex_utils::aliases::dash_map::Entry;
 
@@ -360,25 +359,16 @@ impl FileOpener for VortexOpener {
             };
 
             let mut scan_builder = ScanBuilder::new(session.clone(), Arc::clone(&layout_reader));
-            scan_builder = match scan_backend_from_env()
-                .map_err(|err| exec_datafusion_err!("Invalid scan backend: {err}"))?
-            {
-                ScanBackend::V1 => scan_builder,
-                ScanBackend::Pull => scan_builder.with_executor(Arc::new(
-                    MorselScanExecutor::new(
-                        Arc::clone(vxf.footer().layout()),
-                        vxf.segment_source(),
-                    )
-                    .with_threads(1),
-                )),
-                ScanBackend::Push => scan_builder.with_executor(Arc::new(
-                    PushMorselScanExecutor::new(
-                        Arc::clone(vxf.footer().layout()),
-                        vxf.segment_source(),
-                    )
-                    .with_threads(1),
-                )),
-            };
+            let backend = scan_backend_from_env()
+                .map_err(|err| exec_datafusion_err!("Invalid scan backend: {err}"))?;
+            let options = ScanExecutorOptions::default().with_threads(1);
+            if let Some(executor) = scan_executor(
+                backend,
+                || (Arc::clone(vxf.footer().layout()), vxf.segment_source()),
+                &options,
+            ) {
+                scan_builder = scan_builder.with_executor(executor);
+            }
 
             if let Some(vortex_plan) = file.extensions.get::<VortexAccessPlan>() {
                 scan_builder = vortex_plan.apply_to_builder(scan_builder);
