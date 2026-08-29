@@ -10008,6 +10008,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-fs",
+ "async-trait",
  "bindgen",
  "bitvec",
  "cbindgen",
@@ -10023,6 +10024,7 @@ dependencies = [
  "object_store",
  "parking_lot",
  "paste",
+ "prost 0.14.4",
  "reqwest 0.13.4",
  "rstest",
  "static_assertions",

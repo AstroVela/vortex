@@ -16,6 +16,10 @@ use vortex::error::VortexResult;
 use vortex::io::runtime::BlockingRuntime;
 use vortex::io::runtime::current::CurrentThreadRuntime;
 use vortex::io::session::RuntimeSessionExt;
+#[cfg(vortex_vane_distributed)]
+use vortex::scalar_fn::fns::byte_length::ByteLength;
+#[cfg(vortex_vane_distributed)]
+use vortex::scalar_fn::session::ScalarFnSessionExt;
 use vortex::session::VortexSession;
 
 use crate::duckdb::Database;
@@ -38,6 +42,8 @@ mod table_function;
 /// cbindgen:ignore
 mod cpp;
 mod copy;
+#[cfg(vortex_vane_distributed)]
+mod distributed;
 #[cfg(test)]
 mod e2e_test;
 
@@ -45,6 +51,13 @@ mod e2e_test;
 static RUNTIME: LazyLock<CurrentThreadRuntime> = LazyLock::new(CurrentThreadRuntime::new);
 static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     let session = VortexSession::default().with_handle(RUNTIME.handle());
+    #[cfg(vortex_vane_distributed)]
+    {
+        // ByteLength is constructible through `vortex::expr::byte_length`, but it is not part of
+        // Vortex's default scalar-function registry. Register it explicitly so expressions pushed
+        // into a scan can survive bind-data serialization and worker-plan deserialization.
+        session.scalar_fns().register(ByteLength);
+    }
     vortex_geo::initialize(&session);
     session
 });
@@ -61,6 +74,13 @@ fn init_tracing() {
                 .try_init(),
         );
     });
+}
+
+/// Initialize process-wide runtime support without registering against a
+/// DuckDB C API handle. Vane's C++ loader adapter owns catalog registration.
+#[cfg(vortex_vane_distributed)]
+pub fn initialize_runtime() {
+    init_tracing();
 }
 
 /// Initialize the Vortex extension by registering the extension functions.

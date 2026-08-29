@@ -23,3 +23,6 @@ trailer = """
 
 [fn]
 prefix = "extern"
+
+[defines]
+"vortex_vane_distributed" = "VORTEX_VANE_DISTRIBUTED"

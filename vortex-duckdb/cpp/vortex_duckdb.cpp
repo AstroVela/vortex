@@ -25,10 +25,19 @@
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 
+#ifdef VORTEX_VANE_DISTRIBUTED
+#include "duckdb/main/extension/extension_loader.hpp"
+#endif
+
 #include <cstring>
 #include <string>
 
 using namespace duckdb;
+
+#ifdef VORTEX_VANE_DISTRIBUTED
+void RegisterVortexCopyFunction(ExtensionLoader &loader);
+void RegisterVortexTableFunctions(ExtensionLoader &loader);
+#endif
 
 extern "C" char *duckdb_vx_value_to_string(duckdb_value value) {
     if (!value) {
@@ -299,3 +308,13 @@ extern "C" duckdb_state duckdb_vx_optimizer_extension_register(duckdb_database f
     }
     return DuckDBSuccess;
 }
+
+#ifdef VORTEX_VANE_DISTRIBUTED
+void vortex_vane_init(ExtensionLoader &loader) {
+    auto &db = loader.GetDatabaseInstance();
+    DBConfig::GetConfig(db).replacement_scans.emplace_back(VortexScanReplacement);
+    RegisterVortexTableFunctions(loader);
+    DBConfig::GetConfig(db).GetCallbackManager().Register(VortexOptimizerExtension());
+    RegisterVortexCopyFunction(loader);
+}
+#endif

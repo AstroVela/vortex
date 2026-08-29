@@ -8,6 +8,8 @@ use std::ptr;
 
 use num_traits::AsPrimitive;
 use vortex::error::VortexExpect;
+#[cfg(vortex_vane_distributed)]
+use vortex::error::vortex_err;
 
 use crate::convert::can_push_expression;
 use crate::copy::CopyFunctionBind;
@@ -17,6 +19,16 @@ use crate::copy::copy_to_finalize;
 use crate::copy::copy_to_initialize_global;
 use crate::copy::copy_to_sink;
 use crate::cpp;
+#[cfg(vortex_vane_distributed)]
+use crate::distributed::DistributedRuntimeGlobal;
+#[cfg(vortex_vane_distributed)]
+use crate::distributed::PortableDistributedBind;
+#[cfg(vortex_vane_distributed)]
+use crate::distributed::deserialize_bind;
+#[cfg(vortex_vane_distributed)]
+use crate::distributed::deserialize_runtime_bind;
+#[cfg(vortex_vane_distributed)]
+use crate::distributed::serialize_bind;
 use crate::duckdb::AggregatePushdownInput;
 use crate::duckdb::BindInput;
 use crate::duckdb::BindResult;
@@ -26,9 +38,13 @@ use crate::duckdb::DuckdbStringMap;
 use crate::duckdb::Expression;
 use crate::duckdb::LogicalType;
 use crate::duckdb::LogicalTypeRef;
+#[cfg(vortex_vane_distributed)]
+use crate::duckdb::TableFilterSet;
 use crate::duckdb::TableInitInput;
 use crate::duckdb::try_or;
 use crate::duckdb::try_or_null;
+#[cfg(vortex_vane_distributed)]
+use crate::projection::distributed_file_index_is_selected;
 use crate::table_function::Cardinality;
 use crate::table_function::TableFunctionBind;
 use crate::table_function::TableFunctionGlobal;
@@ -45,6 +61,24 @@ use crate::table_function::scan;
 use crate::table_function::statistics;
 use crate::table_function::table_scan_progress;
 use crate::table_function::to_string;
+
+#[repr(C)]
+#[cfg(vortex_vane_distributed)]
+pub struct VortexDistributedFileView {
+    pub source_url: *const u8,
+    pub source_url_len: usize,
+    pub path: *const u8,
+    pub path_len: usize,
+    pub size: u64,
+}
+
+#[repr(C)]
+#[cfg(vortex_vane_distributed)]
+pub struct VortexDistributedFieldView {
+    pub name: *const u8,
+    pub name_len: usize,
+    pub logical_type: cpp::duckdb_logical_type,
+}
 
 #[unsafe(no_mangle)]
 unsafe extern "C-unwind" fn duckdb_table_function_to_string(
@@ -258,6 +292,231 @@ pub unsafe extern "C-unwind" fn duckdb_table_function_bind_data_clone(
         .vortex_expect("bind_data null pointer");
     let copied_data = bind_data.clone();
     Data::from(Box::new(copied_data)).as_ptr()
+}
+
+#[cfg(vortex_vane_distributed)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn duckdb_table_function_distributed_bind_serialize(
+    bind_data: *const c_void,
+    error_out: *mut cpp::duckdb_vx_error,
+) -> cpp::duckdb_vx_data {
+    let bind_data = unsafe { bind_data.cast::<TableFunctionBind>().as_ref() }
+        .vortex_expect("bind_data null pointer");
+    try_or_null(error_out, || {
+        let portable = serialize_bind(bind_data)?;
+        Ok(Data::from(Box::new(portable)).as_ptr())
+    })
+}
+
+#[cfg(vortex_vane_distributed)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn duckdb_table_function_distributed_bind_deserialize(
+    bytes: *const u8,
+    size: usize,
+    error_out: *mut cpp::duckdb_vx_error,
+) -> cpp::duckdb_vx_data {
+    try_or_null(error_out, || {
+        if bytes.is_null() && size != 0 {
+            return Err(vortex_err!("Distributed Vortex bind bytes are null"));
+        }
+        let bytes = if size == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(bytes, size) }
+        };
+        let portable = deserialize_bind(bytes)?;
+        Ok(Data::from(Box::new(portable)).as_ptr())
+    })
+}
+
+#[cfg(vortex_vane_distributed)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn duckdb_table_function_distributed_bind_bytes(
+    portable_bind: *const c_void,
+    size_out: *mut usize,
+) -> *const u8 {
+    let portable_bind = unsafe { portable_bind.cast::<PortableDistributedBind>().as_ref() }
+        .vortex_expect("portable_bind null pointer");
+    unsafe { size_out.write(portable_bind.encoded.len()) };
+    portable_bind.encoded.as_ptr()
+}
+
+#[cfg(vortex_vane_distributed)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn duckdb_table_function_distributed_file_count(
+    portable_bind: *const c_void,
+) -> usize {
+    let portable_bind = unsafe { portable_bind.cast::<PortableDistributedBind>().as_ref() }
+        .vortex_expect("portable_bind null pointer");
+    portable_bind.files.len()
+}
+
+#[cfg(vortex_vane_distributed)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn duckdb_table_function_distributed_is_aggregate(
+    portable_bind: *const c_void,
+) -> bool {
+    let portable_bind = unsafe { portable_bind.cast::<PortableDistributedBind>().as_ref() }
+        .vortex_expect("portable_bind null pointer");
+    portable_bind.aggregate_scan
+}
+
+#[cfg(vortex_vane_distributed)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn duckdb_table_function_distributed_field_count(
+    portable_bind: *const c_void,
+) -> usize {
+    let portable_bind = unsafe { portable_bind.cast::<PortableDistributedBind>().as_ref() }
+        .vortex_expect("portable_bind null pointer");
+    portable_bind.column_fields.len()
+}
+
+#[cfg(vortex_vane_distributed)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn duckdb_table_function_distributed_field_at(
+    portable_bind: *const c_void,
+    index: usize,
+    field_out: *mut VortexDistributedFieldView,
+) -> bool {
+    let portable_bind = unsafe { portable_bind.cast::<PortableDistributedBind>().as_ref() }
+        .vortex_expect("portable_bind null pointer");
+    let Some(field) = portable_bind.column_fields.get(index) else {
+        return false;
+    };
+    unsafe {
+        field_out.write(VortexDistributedFieldView {
+            name: field.name.as_ptr(),
+            name_len: field.name.len(),
+            logical_type: field.logical_type.as_ptr(),
+        })
+    };
+    true
+}
+
+#[cfg(vortex_vane_distributed)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn duckdb_table_function_distributed_file_at(
+    portable_bind: *const c_void,
+    index: usize,
+    file_out: *mut VortexDistributedFileView,
+) -> bool {
+    let portable_bind = unsafe { portable_bind.cast::<PortableDistributedBind>().as_ref() }
+        .vortex_expect("portable_bind null pointer");
+    let Some(file) = portable_bind.files.get(index) else {
+        return false;
+    };
+    unsafe {
+        file_out.write(VortexDistributedFileView {
+            source_url: file.source_url.as_ptr(),
+            source_url_len: file.source_url.len(),
+            path: file.path.as_ptr(),
+            path_len: file.path.len(),
+            size: file.size,
+        })
+    };
+    true
+}
+
+#[cfg(vortex_vane_distributed)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn duckdb_table_function_distributed_file_is_selected(
+    filters: cpp::duckdb_vx_table_filter_set,
+    column_ids: *const u64,
+    column_ids_count: usize,
+    file_index: u64,
+    error_out: *mut cpp::duckdb_vx_error,
+) -> bool {
+    try_or(error_out, || {
+        if column_ids.is_null() && column_ids_count != 0 {
+            return Err(vortex_err!("Distributed Vortex column ids are null"));
+        }
+        let column_ids = if column_ids_count == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(column_ids, column_ids_count) }
+        };
+        let filters = if filters.is_null() {
+            None
+        } else {
+            Some(unsafe { TableFilterSet::borrow(filters) })
+        };
+        // SAFETY: A null context is explicitly supported for conservative
+        // coordinator planning and is never dereferenced by expression filters.
+        unsafe {
+            distributed_file_index_is_selected(filters, column_ids, file_index, ptr::null_mut())
+        }
+    })
+}
+
+#[cfg(vortex_vane_distributed)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn duckdb_table_function_init_global_distributed(
+    portable_bind: *const u8,
+    portable_bind_size: usize,
+    assigned_file_indexes: *const u64,
+    assigned_file_count: usize,
+    ignore_optional_filters: bool,
+    init_input: *const cpp::duckdb_vx_tfunc_init_input,
+    error_out: *mut cpp::duckdb_vx_error,
+) -> cpp::duckdb_vx_data {
+    try_or_null(error_out, || {
+        if portable_bind.is_null() && portable_bind_size != 0 {
+            return Err(vortex_err!("Distributed Vortex bind bytes are null"));
+        }
+        if assigned_file_indexes.is_null() && assigned_file_count != 0 {
+            return Err(vortex_err!("Distributed Vortex file indexes are null"));
+        }
+        let bytes = if portable_bind_size == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(portable_bind, portable_bind_size) }
+        };
+        let indexes = if assigned_file_count == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(assigned_file_indexes, assigned_file_count) }
+        };
+        let bind_data = deserialize_runtime_bind(bytes, indexes)?;
+        let input = unsafe { init_input.as_ref() }.vortex_expect("init_input null pointer");
+        let runtime_input = cpp::duckdb_vx_tfunc_init_input {
+            bind_data: (&raw const bind_data).cast(),
+            column_ids: input.column_ids,
+            column_ids_count: input.column_ids_count,
+            projection_ids: input.projection_ids,
+            projection_ids_count: input.projection_ids_count,
+            filters: input.filters,
+            client_context: input.client_context,
+        };
+        let global_data = init_global(&TableInitInput::new_distributed(
+            &runtime_input,
+            ignore_optional_filters,
+        ))?;
+        Ok(Data::from(Box::new(DistributedRuntimeGlobal {
+            bind_data,
+            global_data,
+        }))
+        .as_ptr())
+    })
+}
+
+#[cfg(vortex_vane_distributed)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn duckdb_table_function_distributed_bind_data(
+    global_data: *mut c_void,
+) -> *const c_void {
+    let global_data = unsafe { global_data.cast::<DistributedRuntimeGlobal>().as_ref() }
+        .vortex_expect("distributed global data null pointer");
+    (&raw const global_data.bind_data).cast()
+}
+
+#[cfg(vortex_vane_distributed)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn duckdb_table_function_distributed_global_data(
+    global_data: *mut c_void,
+) -> *mut c_void {
+    let global_data = unsafe { global_data.cast::<DistributedRuntimeGlobal>().as_mut() }
+        .vortex_expect("distributed global data null pointer");
+    (&raw mut global_data.global_data).cast()
 }
 
 #[unsafe(no_mangle)]

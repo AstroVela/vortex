@@ -3,6 +3,8 @@
 use std::ops::Range;
 
 use num_traits::AsPrimitive as _;
+#[cfg(vortex_vane_distributed)]
+use vortex::buffer::Buffer;
 use vortex::dtype::DType;
 use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
@@ -17,10 +19,14 @@ use vortex::expr::root;
 use vortex::expr::select;
 use vortex::layout::layouts::row_idx::row_idx;
 use vortex::scan::selection::Selection;
+#[cfg(vortex_vane_distributed)]
+use vortex::scan::strict_sorted_buffer::StrictSortedBuffer;
 use vortex_utils::aliases::hash_set::HashSet;
 
 use crate::convert::try_from_table_filter;
 use crate::convert::try_from_virtual_column_filter;
+#[cfg(vortex_vane_distributed)]
+use crate::cpp;
 use crate::duckdb::LogicalType;
 use crate::duckdb::TableFilterClass;
 use crate::duckdb::TableFilterSetRef;
@@ -245,12 +251,14 @@ fn push_filter_expr(filter_exprs: &mut Vec<Expression>, expr: &Expression) {
 impl Filter {
     /// Creates a table filter expression, row selection, and row range from the table filter set,
     /// column metadata, additional filter expressions, and the top-level DType.
+    #[cfg(vortex_vane_distributed)]
     pub fn new(
         table_filter_set: Option<&TableFilterSetRef>,
         column_ids: &[u64],
         column_fields: &[DuckdbField],
         additional_filters: &[Expression],
         dtype: &DType,
+        ignore_optional_filters: bool,
     ) -> VortexResult<Self> {
         let mut has_non_optional_filter = false;
 
@@ -260,8 +268,89 @@ impl Filter {
                 let idx_u: usize = idx.as_();
                 !is_virtual_column(column_ids[idx_u])
             }) {
+                if ignore_optional_filters && matches!(ex.as_class(), TableFilterClass::Optional(_))
+                {
+                    continue;
+                }
                 has_non_optional_filter |= !matches!(ex.as_class(), TableFilterClass::Optional(_));
 
+                let idx_u: usize = idx.as_();
+                let col_idx: usize = column_ids[idx_u].as_();
+                let name = &column_fields.get(col_idx).vortex_expect("exists").name;
+                if let Some(expr) =
+                    try_from_table_filter(ex, &col(name.as_str()), dtype, ignore_optional_filters)?
+                {
+                    push_filter_expr(&mut table_filter_exprs, &expr);
+                }
+            }
+        }
+
+        for expr in additional_filters {
+            push_filter_expr(&mut table_filter_exprs, expr);
+        }
+
+        let file_selection = Selection::All;
+        let mut row_selection = Selection::All;
+        let mut row_range = None;
+        let file_range = None;
+        if let Some(filter) = table_filter_set {
+            for (idx, expression) in filter.into_iter() {
+                if ignore_optional_filters
+                    && matches!(expression.as_class(), TableFilterClass::Optional(_))
+                {
+                    continue;
+                }
+                let idx: usize = idx.as_();
+                if column_ids[idx] == FILE_ROW_NUMBER_COLUMN_IDX {
+                    (row_selection, row_range) = try_from_virtual_column_filter(expression)?;
+                }
+            }
+        };
+
+        let out = Self {
+            filter: and_collect(table_filter_exprs),
+            row_selection,
+            row_range,
+            file_selection,
+            file_range,
+            has_non_optional_filter,
+        };
+        Ok(out)
+    }
+
+    #[cfg(not(vortex_vane_distributed))]
+    pub fn new(
+        table_filter_set: Option<&TableFilterSetRef>,
+        column_ids: &[u64],
+        column_fields: &[DuckdbField],
+        additional_filters: &[Expression],
+        dtype: &DType,
+    ) -> VortexResult<Self> {
+        Self::new_impl(
+            table_filter_set,
+            column_ids,
+            column_fields,
+            additional_filters,
+            dtype,
+        )
+    }
+
+    #[cfg(not(vortex_vane_distributed))]
+    fn new_impl(
+        table_filter_set: Option<&TableFilterSetRef>,
+        column_ids: &[u64],
+        column_fields: &[DuckdbField],
+        additional_filters: &[Expression],
+        dtype: &DType,
+    ) -> VortexResult<Self> {
+        let mut has_non_optional_filter = false;
+        let mut table_filter_exprs = Vec::new();
+        if let Some(filter) = table_filter_set {
+            for (idx, ex) in filter.into_iter().filter(|(idx, _)| {
+                let idx_u: usize = idx.as_();
+                !is_virtual_column(column_ids[idx_u])
+            }) {
+                has_non_optional_filter |= !matches!(ex.as_class(), TableFilterClass::Optional(_));
                 let idx_u: usize = idx.as_();
                 let col_idx: usize = column_ids[idx_u].as_();
                 let name = &column_fields.get(col_idx).vortex_expect("exists").name;
@@ -270,7 +359,6 @@ impl Filter {
                 }
             }
         }
-
         for expr in additional_filters {
             push_filter_expr(&mut table_filter_exprs, expr);
         }
@@ -289,18 +377,100 @@ impl Filter {
                     (file_selection, file_range) = try_from_virtual_column_filter(expression)?;
                 }
             }
-        };
+        }
 
-        let out = Self {
+        Ok(Self {
             filter: and_collect(table_filter_exprs),
             row_selection,
             row_range,
             file_selection,
             file_range,
             has_non_optional_filter,
-        };
-        Ok(out)
+        })
     }
+}
+
+/// Evaluate the coordinator's `file_index` table filter for a single stable
+/// file index. Planning has no execution context and therefore keeps unknown
+/// expression filters conservatively. Runtime evaluation must be exact: an
+/// unsupported required filter fails closed because DuckDB has delegated the
+/// virtual-column predicate to this scan.
+///
+/// # Safety
+///
+/// `client_context` must be null or point to a live DuckDB `ClientContext`
+/// for the duration of this call.
+#[cfg(vortex_vane_distributed)]
+pub(crate) unsafe fn distributed_file_index_is_selected(
+    table_filter_set: Option<&TableFilterSetRef>,
+    column_ids: &[u64],
+    file_index: u64,
+    client_context: cpp::duckdb_client_context,
+) -> VortexResult<bool> {
+    let Some(table_filter_set) = table_filter_set else {
+        return Ok(true);
+    };
+
+    for (filter_index, expression) in table_filter_set {
+        let filter_index = usize::try_from(filter_index)?;
+        let column_id = column_ids.get(filter_index).ok_or_else(|| {
+            vortex_err!(
+                "Vortex file-index filter references unknown projected column {filter_index}"
+            )
+        })?;
+        if *column_id != FILE_INDEX_COLUMN_IDX {
+            continue;
+        }
+
+        // SAFETY: The caller upholds the same ClientContext lifetime contract.
+        match unsafe { expression.matches_ubigint(client_context, file_index) }? {
+            Some(false) => return Ok(false),
+            Some(true) => {}
+            None if client_context.is_null() => {}
+            None => {
+                return Err(vortex_err!(
+                    "Vortex cannot exactly evaluate a runtime file_index filter"
+                ));
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Evaluate file-index table filters before the scan request opens any reader,
+/// then translate stable coordinator indexes to this bind's local partitions.
+///
+/// # Safety
+///
+/// `client_context` must be null or point to a live DuckDB `ClientContext`
+/// for the duration of this call.
+#[cfg(vortex_vane_distributed)]
+pub(crate) unsafe fn distributed_local_file_selection(
+    table_filter_set: Option<&TableFilterSetRef>,
+    column_ids: &[u64],
+    file_indexes: &[usize],
+    client_context: cpp::duckdb_client_context,
+) -> VortexResult<Selection> {
+    let mut selected = Vec::new();
+    for (local_index, &file_index) in file_indexes.iter().enumerate() {
+        // SAFETY: The caller upholds the same ClientContext lifetime contract.
+        if unsafe {
+            distributed_file_index_is_selected(
+                table_filter_set,
+                column_ids,
+                u64::try_from(file_index)?,
+                client_context,
+            )
+        }? {
+            selected.push(u64::try_from(local_index)?);
+        }
+    }
+    if selected.len() == file_indexes.len() {
+        return Ok(Selection::All);
+    }
+    Ok(Selection::IncludeByIndex(StrictSortedBuffer::try_new(
+        Buffer::from_iter(selected),
+    )?))
 }
 
 pub fn extract_schema_from_dtype(dtype: &DType) -> VortexResult<Vec<DuckdbField>> {

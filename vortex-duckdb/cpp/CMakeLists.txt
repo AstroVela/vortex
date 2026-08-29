@@ -16,6 +16,8 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+option(VORTEX_VANE_DISTRIBUTED "Enable Vane distributed table functions" OFF)
+
 # Default to debug if build config is not explicitly set.
 if (NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Debug)
@@ -24,17 +26,33 @@ endif()
 # Enable compiler warnings (matching build.rs flags).
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wpedantic -Werror")
 
-# The symlink points to target/duckdb-source-vX.Y.Z which contains duckdb-X.Y.Z/
-file(GLOB DUCKDB_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../duckdb/duckdb-*")
-if(DUCKDB_DIRS)
-    list(GET DUCKDB_DIRS 0 DUCKDB_DIR)
-    set(DUCKDB_INCLUDE "${DUCKDB_DIR}/src/include")
-    message(STATUS "Found DuckDB include: ${DUCKDB_INCLUDE}")
+if(VORTEX_VANE_DISTRIBUTED)
+    if(NOT DEFINED DUCKDB_SOURCE_DIR OR "${DUCKDB_SOURCE_DIR}" STREQUAL "")
+        message(FATAL_ERROR
+            "DUCKDB_SOURCE_DIR must name the exact Vane DuckDB source tree"
+        )
+    endif()
+    set(DUCKDB_INCLUDE "${DUCKDB_SOURCE_DIR}/src/include")
+    if(NOT EXISTS
+       "${DUCKDB_INCLUDE}/duckdb/function/distributed_table_function.hpp")
+        message(FATAL_ERROR
+            "DUCKDB_SOURCE_DIR does not provide Vane distributed scan headers"
+        )
+    endif()
+    add_compile_definitions(VORTEX_VANE_DISTRIBUTED=1)
 else()
-    message(FATAL_ERROR
-        "DuckDB source not found at ../duckdb/duckdb-*\n"
-        "Run 'cargo build -p vortex-duckdb' first to download DuckDB"
-    )
+    # The symlink points to target/duckdb-source-vX.Y.Z which contains duckdb-X.Y.Z/
+    file(GLOB DUCKDB_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../duckdb/duckdb-*")
+    if(DUCKDB_DIRS)
+        list(GET DUCKDB_DIRS 0 DUCKDB_DIR)
+        set(DUCKDB_INCLUDE "${DUCKDB_DIR}/src/include")
+        message(STATUS "Found DuckDB include: ${DUCKDB_INCLUDE}")
+    else()
+        message(FATAL_ERROR
+            "DuckDB source not found at ../duckdb/duckdb-*\n"
+            "Run 'cargo build -p vortex-duckdb' first to download DuckDB"
+        )
+    endif()
 endif()
 
 include_directories(include ../include)

@@ -255,6 +255,37 @@ impl From<&String> for DuckDBVersion {
     }
 }
 
+fn vane_build_enabled() -> bool {
+    match env::var("VORTEX_VANE_DISTRIBUTED") {
+        Err(env::VarError::NotPresent) => false,
+        Ok(value) if matches!(value.as_str(), "1" | "true") => true,
+        Ok(value) => {
+            println!(
+                "cargo:error=VORTEX_VANE_DISTRIBUTED must be `1` or `true` when set, got `{value}`"
+            );
+            exit(1);
+        }
+        Err(env::VarError::NotUnicode(_)) => {
+            println!("cargo:error=VORTEX_VANE_DISTRIBUTED must contain valid Unicode");
+            exit(1);
+        }
+    }
+}
+
+fn vane_enabled(duckdb_include_dir: &Path) -> bool {
+    let enabled = vane_build_enabled();
+    if enabled {
+        let distributed_header =
+            duckdb_include_dir.join("duckdb/function/distributed_table_function.hpp");
+        assert!(
+            distributed_header.is_file(),
+            "VORTEX_VANE_DISTRIBUTED requires {}",
+            distributed_header.display()
+        );
+    }
+    enabled
+}
+
 /// Returns false on a non-retryable client error (4xx) or after failing retries
 fn try_download_url(url: &str, path: &Path) -> bool {
     if path.exists() {
@@ -503,6 +534,28 @@ fn bindgen_c2rust(crate_dir: &Path, duckdb_include_dir: &Path) {
         .generate_comments(true)
         .parse_callbacks(Box::new(BindgenCargoCallbacks));
 
+    if vane_enabled(duckdb_include_dir) {
+        builder = builder
+            .rustified_enum("DUCKDB_VX_TABLE_FILTER_MATCH")
+            .clang_arg("-DVORTEX_VANE_DISTRIBUTED=1");
+
+        // Vane's build image provides libclang without Clang's resource
+        // headers. Ask the selected C compiler for its builtin include path.
+        let compiler = cc::Build::new().get_compiler();
+        if let Ok(output) = Command::new(compiler.path())
+            .arg("-print-file-name=include")
+            .output()
+            && output.status.success()
+        {
+            let builtin_include = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+            if builtin_include.is_dir() {
+                builder = builder
+                    .clang_arg("-isystem")
+                    .clang_arg(builtin_include.to_string_lossy());
+            }
+        }
+    }
+
     for function in DUCKDB_C_API_FUNCTIONS {
         builder = builder.allowlist_function(function);
     }
@@ -525,7 +578,8 @@ fn bindgen_c2rust(crate_dir: &Path, duckdb_include_dir: &Path) {
 
 /// Generate libvortex_duckdb.*
 fn compile_cpp(duckdb_include_dir: &Path) {
-    cc::Build::new()
+    let mut build = cc::Build::new();
+    build
         .std("c++20")
         .flags(["-Wall", "-Wextra", "-Wpedantic", "-Werror"])
         .cpp(true)
@@ -540,8 +594,11 @@ fn compile_cpp(duckdb_include_dir: &Path) {
         .flag(duckdb_include_dir)
         .include("include")
         .include("cpp/include")
-        .files(SOURCE_FILES)
-        .compile("vortex-duckdb-extras");
+        .files(SOURCE_FILES);
+    if vane_enabled(duckdb_include_dir) {
+        build.define("VORTEX_VANE_DISTRIBUTED", "1");
+    }
+    build.compile("vortex-duckdb-extras");
     for e in SOURCE_FILES {
         println!("cargo:rerun-if-changed={e}");
     }
@@ -581,8 +638,13 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_HTTP_TIMEOUT");
     println!("cargo:rerun-if-env-changed=HTTP_TIMEOUT");
     println!("cargo:rerun-if-env-changed=TARGET");
+    println!("cargo:rerun-if-env-changed=VORTEX_VANE_DISTRIBUTED");
 
     println!("cargo:rustc-check-cfg=cfg(duckdb_release)");
+    println!("cargo:rustc-check-cfg=cfg(vortex_vane_distributed)");
+    if vane_build_enabled() {
+        println!("cargo:rustc-cfg=vortex_vane_distributed");
+    }
 
     // These two variables are set in duckdb-vortex's CI. Don't download
     // duckdb if they are present
@@ -594,6 +656,16 @@ fn main() {
         env::var("DUCKDB_VERSION").is_ok(),
         env::var("DUCKDB_SOURCE_DIR").is_ok()
     );
+    if vane_build_enabled() {
+        assert!(
+            env::var_os("DUCKDB_SOURCE_DIR").is_some(),
+            "VORTEX_VANE_DISTRIBUTED requires DUCKDB_SOURCE_DIR"
+        );
+        assert!(
+            env::var_os("DUCKDB_VERSION").is_some_and(|version| !version.is_empty()),
+            "VORTEX_VANE_DISTRIBUTED requires a non-empty DUCKDB_VERSION"
+        );
+    }
     // If variables are not set, we are either running locally or
     // in vortex's CI.
 

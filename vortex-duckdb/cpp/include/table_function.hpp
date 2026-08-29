@@ -37,25 +37,72 @@ struct TableFunctionUngroupedAggregateInput {
 bool aggregate_pushdown(ClientContext &context, const TableFunctionUngroupedAggregateInput &input);
 
 struct VortexBindData final : FunctionData {
+#ifdef VORTEX_VANE_DISTRIBUTED
+    VortexBindData(unique_ptr<CData> ffi_data, const vector<LogicalType> &types, const vector<string> &names)
+        : ffi_data(std::move(ffi_data)), types(types), names(names) {
+    }
+#else
     VortexBindData(unique_ptr<CData> ffi_data, const vector<LogicalType> &types)
         : ffi_data(std::move(ffi_data)), types(types) {
     }
+#endif
     unique_ptr<FunctionData> Copy() const override;
     bool Equals(const FunctionData &other) const override;
 
     unique_ptr<CData> ffi_data;
     vector<LogicalType> types;
+#ifdef VORTEX_VANE_DISTRIBUTED
+    vector<string> names;
+    string scan_split_set_id;
+    struct DistributedFile {
+        string source_url;
+        string path;
+        idx_t size;
+
+        bool operator==(const DistributedFile &other) const {
+            return source_url == other.source_url && path == other.path && size == other.size;
+        }
+    };
+
+    struct PortableSnapshot {
+        string portable_bind;
+        vector<DistributedFile> distributed_files;
+        bool aggregate_scan = false;
+    };
+
+    PortableSnapshot CreatePortableSnapshot() const;
+
+    string portable_bind;
+    vector<DistributedFile> distributed_files;
+    bool aggregate_scan = false;
+    bool explicit_split_mode = false;
+    bool splits_applied = false;
+    vector<idx_t> eligible_file_indexes;
+    vector<idx_t> assigned_file_indexes;
+#endif
 };
 
 struct VortexGlobalData final : GlobalTableFunctionState {
+#ifdef VORTEX_VANE_DISTRIBUTED
+    explicit VortexGlobalData(unique_ptr<CData> ffi_data,
+                              bool distributed = false,
+                              bool force_empty_output = false)
+        : ffi_data(std::move(ffi_data)), distributed(distributed), force_empty_output(force_empty_output) {
+    }
+#else
     explicit VortexGlobalData(unique_ptr<CData> ffi_data) : ffi_data(std::move(ffi_data)) {
     }
+#endif
 
     idx_t MaxThreads() const override {
         return GlobalTableFunctionState::MAX_THREADS;
     }
 
     unique_ptr<CData> ffi_data;
+#ifdef VORTEX_VANE_DISTRIBUTED
+    bool distributed;
+    bool force_empty_output;
+#endif
 };
 
 struct VortexLocalData final : LocalTableFunctionState {

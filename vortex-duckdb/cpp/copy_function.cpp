@@ -11,6 +11,10 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/parser/parsed_data/create_copy_function_info.hpp"
 
+#ifdef VORTEX_VANE_DISTRIBUTED
+#include "duckdb/main/extension/extension_loader.hpp"
+#endif
+
 using namespace duckdb;
 
 struct CopyBindData final : TableFunctionData {
@@ -94,6 +98,24 @@ void copy_to_finalize(ClientContext &, FunctionData &, GlobalFunctionData &gstat
         throw ExecutorException(IntoErrString(error_out));
     }
 }
+
+#ifdef VORTEX_VANE_DISTRIBUTED
+void RegisterVortexCopyFunction(ExtensionLoader &loader) {
+    CopyFunction fn("vortex");
+    fn.copy_to_bind = copy_to_bind;
+    fn.copy_to_initialize_global = copy_to_initialize_global;
+    fn.copy_to_initialize_local = [](auto &, auto &) {
+        return make_uniq<LocalFunctionData>();
+    };
+    fn.copy_to_sink = copy_to_sink;
+    fn.copy_to_finalize = copy_to_finalize;
+    fn.extension = "vortex";
+    fn.execution_mode = [](bool, bool) {
+        return CopyFunctionExecutionMode::REGULAR_COPY_TO_FILE;
+    };
+    loader.RegisterFunction(std::move(fn));
+}
+#endif
 
 extern "C" duckdb_state duckdb_vx_register_copy_function(duckdb_database ffi_db) {
     D_ASSERT(ffi_db);

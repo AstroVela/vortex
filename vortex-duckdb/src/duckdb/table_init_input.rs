@@ -11,6 +11,8 @@ use crate::duckdb::TableFilterSetRef;
 
 pub struct TableInitInput<'a> {
     pub input: &'a cpp::duckdb_vx_tfunc_init_input,
+    #[cfg(vortex_vane_distributed)]
+    ignore_optional_filters: bool,
 }
 
 impl Debug for TableInitInput<'_> {
@@ -25,10 +27,36 @@ impl Debug for TableInitInput<'_> {
 
 impl<'a> TableInitInput<'a> {
     pub fn new(input: &'a cpp::duckdb_vx_tfunc_init_input) -> Self {
-        Self { input }
+        Self {
+            input,
+            #[cfg(vortex_vane_distributed)]
+            ignore_optional_filters: false,
+        }
+    }
+
+    #[cfg(vortex_vane_distributed)]
+    pub fn new_distributed(
+        input: &'a cpp::duckdb_vx_tfunc_init_input,
+        ignore_optional_filters: bool,
+    ) -> Self {
+        Self {
+            input,
+            ignore_optional_filters,
+        }
     }
 
     pub fn column_ids(&self) -> &[u64] {
+        #[cfg(vortex_vane_distributed)]
+        {
+            // `std::vector::data()` may be null for an empty vector, while Rust's
+            // `from_raw_parts` requires a non-null pointer even when the length is
+            // zero. Count-star and fully pruned scans can legitimately have no
+            // projected input columns.
+            if self.input.column_ids_count == 0 {
+                return &[];
+            }
+            assert!(!self.input.column_ids.is_null());
+        }
         unsafe { std::slice::from_raw_parts(self.input.column_ids, self.input.column_ids_count) }
     }
 
@@ -52,5 +80,10 @@ impl<'a> TableInitInput<'a> {
         } else {
             Some(unsafe { TableFilterSet::borrow(ptr) })
         }
+    }
+
+    #[cfg(vortex_vane_distributed)]
+    pub fn ignore_optional_filters(&self) -> bool {
+        self.ignore_optional_filters
     }
 }
