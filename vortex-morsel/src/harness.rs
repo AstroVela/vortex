@@ -31,8 +31,10 @@ use vortex_layout::segments::SegmentSource;
 use vortex_session::VortexSession;
 
 use crate::build::build_plan;
+use crate::driver::DemandHintDelivery;
 use crate::driver::MorselScan;
 use crate::driver::morsels;
+use crate::node::ExecutionMode;
 use crate::nodes::ConjunctMode;
 use crate::stats::ScanStats;
 
@@ -212,6 +214,12 @@ pub struct MorselConfig {
     pub mode: ConjunctMode,
     /// Whether the leased shared decoded cells are enabled.
     pub share_decodes: bool,
+    /// Value execution model.
+    pub execution_mode: ExecutionMode,
+    /// Future morsels admitted to filtered background I/O beyond active workers.
+    pub lookahead_morsels: usize,
+    /// Optional demand-hint delivery policy.
+    pub demand_hints: DemandHintDelivery,
 }
 
 impl Default for MorselConfig {
@@ -221,52 +229,11 @@ impl Default for MorselConfig {
             morsel_rows: 0,
             mode: ConjunctMode::Cascade,
             share_decodes: true,
+            execution_mode: ExecutionMode::Pull,
+            lookahead_morsels: 0,
+            demand_hints: DemandHintDelivery::Immediate,
         }
     }
-}
-
-/// A morsel scan prepared for repeated runs with one persistent worker pool.
-pub struct PreparedMorsel {
-    scan: MorselScan,
-}
-
-impl PreparedMorsel {
-    /// Run the prepared scan once.
-    pub fn run(&self) -> VortexResult<RunOutcome> {
-        let (batches, stats, wall) = self.scan.run_timed()?;
-        let rows = batches.iter().map(|b| b.len()).sum();
-        Ok(RunOutcome {
-            rows,
-            time_to_first_batch: stats.time_to_first_batch,
-            batches,
-            wall,
-            stats: Some(stats),
-            source_io_requests: None,
-            source_io_bytes: None,
-        })
-    }
-}
-
-/// Prepare a morsel scan and its reusable worker configuration.
-pub fn prepare_morsel(
-    session: &VortexSession,
-    layout: &LayoutRef,
-    segments: &Arc<dyn SegmentSource>,
-    query: &Query,
-    config: MorselConfig,
-) -> VortexResult<PreparedMorsel> {
-    let plan = Arc::new(build_plan(
-        layout,
-        &query.projection,
-        query.filter.as_ref(),
-        config.mode,
-    )?);
-    let cut = morsels(&plan, config.morsel_rows);
-    let scan = MorselScan::new(plan, Arc::clone(segments), session.clone())
-        .with_threads(config.threads)
-        .with_morsels(cut)
-        .with_share_decodes(config.share_decodes);
-    Ok(PreparedMorsel { scan })
 }
 
 /// Run the morsel executor with worker lifecycle excluded from the reported wall time.
@@ -282,7 +249,33 @@ pub fn run_morsel(
     query: &Query,
     config: MorselConfig,
 ) -> VortexResult<RunOutcome> {
-    prepare_morsel(session, layout, segments, query, config)?.run()
+    let plan = Arc::new(build_plan(
+        layout,
+        &query.projection,
+        query.filter.as_ref(),
+        config.mode,
+    )?);
+    let cut = morsels(&plan, config.morsel_rows);
+    let scan = MorselScan::new(plan, Arc::clone(segments), session.clone())
+        .with_threads(config.threads)
+        .with_morsels(cut)
+        .with_share_decodes(config.share_decodes)
+        .with_execution_mode(config.execution_mode)
+        .with_lookahead_morsels(config.lookahead_morsels)
+        .with_demand_hints(config.demand_hints);
+
+    let (batches, stats, wall) = scan.run_timed()?;
+
+    let rows = batches.iter().map(|b| b.len()).sum();
+    Ok(RunOutcome {
+        rows,
+        time_to_first_batch: stats.time_to_first_batch,
+        batches,
+        wall,
+        stats: Some(stats),
+        source_io_requests: None,
+        source_io_bytes: None,
+    })
 }
 
 /// Assert that two runs produced the same rows in the same order.

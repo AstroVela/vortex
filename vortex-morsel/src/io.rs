@@ -127,6 +127,7 @@ enum CellState {
         wait_started: Option<Instant>,
     },
     Ready(BufferHandle),
+    Failed(Arc<str>),
 }
 
 struct IoCell {
@@ -193,10 +194,11 @@ impl IoService {
             .collect()
     }
 
-    pub(crate) fn issue(&self, read: &IoRead) {
+    /// Issue a registered read, returning whether this call created its source future.
+    pub(crate) fn issue(&self, read: &IoRead) -> bool {
         let mut state = read.cell.state.lock();
         if !matches!(*state, CellState::Unissued) {
-            return;
+            return false;
         }
         let future = match read.key() {
             IoKey::Segment(id) => self.source.request(id),
@@ -205,6 +207,7 @@ impl IoService {
             future,
             wait_started: None,
         };
+        true
     }
 
     pub(crate) fn nowait_unsupported(&self) -> bool {
@@ -216,9 +219,13 @@ impl IoService {
     }
 
     pub(crate) fn read(&self, ticket: IoTicket) -> Option<IoRead> {
+        self.read_key(ticket.key())
+    }
+
+    pub(crate) fn read_key(&self, key: IoKey) -> Option<IoRead> {
         self.cells
             .lock()
-            .get(&ticket.key())
+            .get(&key)
             .cloned()
             .map(|cell| IoRead { cell })
     }
@@ -247,13 +254,21 @@ impl IoRead {
         self.cell.required.store(true, Ordering::Release);
     }
 
+    pub(crate) fn is_unissued(&self) -> bool {
+        matches!(*self.cell.state.lock(), CellState::Unissued)
+    }
+
+    pub(crate) fn is_failed(&self) -> bool {
+        matches!(*self.cell.state.lock(), CellState::Failed(_))
+    }
+
     /// Subscribe an affinity-owned continuation to this exact cell.
     ///
     /// Returns `true` when the continuation was parked. The state lock closes the completion race:
     /// a completion either drains this waker or is observed here before insertion.
     pub(crate) fn park(&self, waker: Waker) -> bool {
         let state = self.cell.state.lock();
-        if matches!(*state, CellState::Ready(_)) {
+        if matches!(*state, CellState::Ready(_) | CellState::Failed(_)) {
             return false;
         }
         self.cell.waiters.lock().push(waker);
@@ -274,6 +289,8 @@ pub(crate) enum IoReadPoll {
     },
     /// A stale wake observed a read another worker had already completed.
     AlreadyReady,
+    /// A source error retained in the cell until authoritative execution observes it.
+    Failed(Arc<str>),
 }
 
 impl IoRead {
@@ -287,6 +304,7 @@ impl IoRead {
         else {
             return match &*state {
                 CellState::Ready(_) => Ok(IoReadPoll::AlreadyReady),
+                CellState::Failed(error) => Ok(IoReadPoll::Failed(Arc::clone(error))),
                 CellState::Unissued => Err(vortex_err!("IO cell was polled before submission")),
                 CellState::Pending { .. } => unreachable!(),
             };
@@ -296,9 +314,31 @@ impl IoRead {
         loop {
             match future.poll_unpin(&mut cx) {
                 Poll::Ready(result) => {
-                    let handle = result?;
+                    let handle = match result {
+                        Ok(handle) => handle,
+                        Err(error) => {
+                            let error: Arc<str> = error.to_string().into();
+                            *state = CellState::Failed(Arc::clone(&error));
+                            drop(state);
+                            for waiter in std::mem::take(&mut *self.cell.waiters.lock()) {
+                                waiter.wake();
+                            }
+                            return Ok(IoReadPoll::Failed(error));
+                        }
+                    };
                     if handle.is_on_device() {
-                        let copy = handle.try_into_host()?;
+                        let copy = match handle.try_into_host() {
+                            Ok(copy) => copy,
+                            Err(error) => {
+                                let error: Arc<str> = error.to_string().into();
+                                *state = CellState::Failed(Arc::clone(&error));
+                                drop(state);
+                                for waiter in std::mem::take(&mut *self.cell.waiters.lock()) {
+                                    waiter.wake();
+                                }
+                                return Ok(IoReadPoll::Failed(error));
+                            }
+                        };
                         *future = async move { copy.await.map(BufferHandle::new_host) }.boxed();
                         continue;
                     }
@@ -356,9 +396,7 @@ impl IoPlane {
             if !cells.contains_key(&r#use.key) {
                 stats.io_registered += 1;
                 let (cell, created) = self.service.register(r#use.key, priority);
-                if created {
-                    stats.io_requests += 1;
-                } else {
+                if !created {
                     stats.io_cell_hits += 1;
                 }
                 self.unsubmitted.borrow_mut().push(Arc::clone(&cell));
@@ -407,12 +445,17 @@ impl IoPlane {
         match &*state {
             CellState::Ready(handle) => return Ok(Some(handle.clone())),
             CellState::Pending { .. } => return Ok(None),
+            CellState::Failed(error) => {
+                return Err(vortex_err!("segment read failed: {error}"));
+            }
             CellState::Unissued => {}
         }
 
         let IoKey::Segment(segment) = cell.key;
         if self.service.nowait_unsupported() {
             let future = self.service.source.request(segment);
+            stats.io_requests += 1;
+            stats.io_batches += 1;
             *state = CellState::Pending {
                 future,
                 wait_started: None,
@@ -422,6 +465,8 @@ impl IoPlane {
         stats.nowait_attempts += 1;
         match self.service.source.request_nowait(segment)? {
             ReadAtNowait::Ready(handle) => {
+                stats.io_requests += 1;
+                stats.io_batches += 1;
                 self.service.nowait_support.store(1, Ordering::Release);
                 stats.nowait_hits += 1;
                 stats.io_bytes += handle.len() as u64;
@@ -436,6 +481,8 @@ impl IoPlane {
                 self.service.nowait_support.store(1, Ordering::Release);
                 stats.nowait_misses += 1;
                 let future = self.service.source.request(segment);
+                stats.io_requests += 1;
+                stats.io_batches += 1;
                 *state = CellState::Pending {
                     future,
                     wait_started: None,
@@ -446,6 +493,8 @@ impl IoPlane {
                 self.service.nowait_support.store(2, Ordering::Release);
                 stats.nowait_unsupported += 1;
                 let future = self.service.source.request(segment);
+                stats.io_requests += 1;
+                stats.io_batches += 1;
                 *state = CellState::Pending {
                     future,
                     wait_started: None,

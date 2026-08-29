@@ -8,9 +8,10 @@
 //! This crate is the P1 spine of the design recorded in
 //! `docs/developer-guide/internals/scan-execution-models/morsel-based-plan-execution.md`: the scan
 //! is cut into *morsels* (contiguous root row ranges), and each morsel is driven by a tree of
-//! stateful [`ExecNode`] state machines that pull values from their children.
+//! stateful [`ExecNode`] state machines. [`ExecutionMode::Pull`] is the recursive oracle;
+//! [`ExecutionMode::Push`] activates leaves and routes batches upward through credited edges.
 //!
-//! The two halves of the contract are:
+//! The shared planning contract and two value-execution contracts are:
 //!
 //! * [`ExecNode::next_plan`] — planning. A node *names* the IO it will need by registering
 //!   [`IoUse`](io::IoUse)s against the [`IoPlane`](io::IoPlane), which hands back tickets. Nodes
@@ -21,6 +22,9 @@
 //!   wait on storage (Linux files use `preadv2(RWF_NOWAIT)`). A hit is consumed inline. A miss
 //!   suspends on the exact ticket and the scheduler submits its batch to the shared urgent IO
 //!   queue. Execution never polls a background future or waits for IO on the worker thread.
+//! * Typed [`ExecNode`] push methods — leaf-driven value production through compiled physical
+//!   pipelines on the owning worker. Authoritative [`ActivationTarget`] decisions are distinct
+//!   from optional [`DemandTarget`] I/O hints.
 //!
 //! Compared to the V1 `LayoutReader` path this executor differs in two measurable ways:
 //!
@@ -28,6 +32,8 @@
 //!    share one bounded worker pool; pending IO never parks a worker.
 //! 2. Each worker owns one arena and one active morsel. Arenas never migrate, and emission order
 //!    is restored by morsel index.
+//! 3. [`MorselScan::into_stream`] exposes ordered bounded output with explicit cancellation;
+//!    [`MorselScan::run`] remains the collecting adapter.
 //!
 //! Raw request cells are shared for the lifetime of a scan, deduplicating both pending and
 //! completed segment reads. Decoded chunks use leased shared cells ([`cells::SharedCells`]): a
@@ -41,7 +47,6 @@
 pub mod build;
 pub mod cells;
 pub mod driver;
-pub mod executor;
 #[cfg(any(test, feature = "_test-harness"))]
 pub mod fixtures;
 #[cfg(any(test, feature = "_test-harness"))]
@@ -56,17 +61,28 @@ pub mod tpch;
 pub mod workloads;
 
 pub use build::ExecPlan;
+pub use build::SourceActivation;
+pub use build::SourceRole;
 pub use build::build_plan;
+pub use driver::DemandHintDelivery;
 pub use driver::MorselScan;
-pub use driver::SharedMorselWorkerPool;
+pub use driver::MorselStream;
 pub use driver::morsels;
-pub use executor::MorselScanExecutor;
+pub use node::ActivationRows;
+pub use node::ActivationTarget;
+pub use node::DemandTarget;
 pub use node::ExecCx;
 pub use node::ExecNode;
 pub use node::ExecPoll;
+pub use node::ExecutionMode;
+pub use node::InputPort;
+pub use node::NodeState;
 pub use node::PlanCx;
 pub use node::PlanItem;
 pub use node::PlanPoll;
+pub use node::PushBatch;
+pub use node::PushCx;
+pub use node::Route;
 pub use node::Value;
 pub use node::ValueBatch;
 pub use stats::ScanStats;
