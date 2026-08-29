@@ -604,7 +604,7 @@ impl<T> Buffer<T> {
                             .align_offset(physical_alignment.as_usize());
                 Ok(BufferMut {
                     allocation,
-                    offset,
+                    ptr,
                     length,
                     alignment,
                     physical_alignment,
