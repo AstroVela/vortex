@@ -24,17 +24,17 @@ use vortex_io::session::RuntimeSession;
 use vortex_layout::LayoutRef;
 use vortex_layout::segments::SegmentSource;
 use vortex_layout::session::LayoutSession;
-use vortex_morsel::fixtures::Fixture;
-use vortex_morsel::fixtures::write_fixture;
-use vortex_morsel::harness::MorselConfig;
-use vortex_morsel::harness::Query;
-use vortex_morsel::harness::RunOutcome;
-use vortex_morsel::harness::assert_same_rows;
-use vortex_morsel::harness::run_morsel;
-use vortex_morsel::harness::run_v1;
-use vortex_morsel::harness::run_v1_tokio;
-use vortex_morsel::nodes::ConjunctMode;
-use vortex_morsel::workloads;
+use vortex_morsel_push::fixtures::Fixture;
+use vortex_morsel_push::fixtures::write_fixture;
+use vortex_morsel_push::harness::MorselConfig;
+use vortex_morsel_push::harness::Query;
+use vortex_morsel_push::harness::RunOutcome;
+use vortex_morsel_push::harness::assert_same_rows;
+use vortex_morsel_push::harness::run_morsel;
+use vortex_morsel_push::harness::run_v1;
+use vortex_morsel_push::harness::run_v1_tokio;
+use vortex_morsel_push::nodes::ConjunctMode;
+use vortex_morsel_push::workloads;
 use vortex_session::VortexSession;
 use vortex_utils::parallelism::get_available_parallelism;
 
@@ -308,7 +308,7 @@ fn run_once(
 }
 
 fn natural_splits(fixture: &Fixture, query: &Query) -> VortexResult<usize> {
-    let plan = vortex_morsel::build_plan(
+    let plan = vortex_morsel_push::build_plan(
         &fixture.layout,
         &query.projection,
         query.filter.as_ref(),

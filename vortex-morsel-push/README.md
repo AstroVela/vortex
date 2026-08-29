@@ -1,4 +1,4 @@
-# vortex-morsel
+# vortex-morsel-push
 
 An experimental morsel-driven scan executor for Vortex layouts — the P1 spine of the design in
 `docs/developer-guide/internals/scan-execution-models/morsel-based-plan-execution.md`.
@@ -29,5 +29,5 @@ with every configuration validated against V1's output before timing.
 ## Running the evaluation
 
 ```bash
-cargo run --release -p vortex-morsel --features _test-harness --bin morsel-eval
+cargo run --release -p vortex-morsel-push --features _test-harness --bin morsel-push-eval
 ```

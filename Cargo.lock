@@ -10906,6 +10906,7 @@ dependencies = [
  "vortex",
  "vortex-arrow",
  "vortex-morsel",
+ "vortex-morsel-push",
  "vortex-utils",
 ]
 
@@ -10968,6 +10969,7 @@ dependencies = [
  "vortex",
  "vortex-array",
  "vortex-morsel",
+ "vortex-morsel-push",
  "vortex-runend",
  "vortex-sequence",
  "vortex-spatial",
@@ -11304,6 +11306,35 @@ dependencies = [
 
 [[package]]
 name = "vortex-morsel"
+version = "0.1.0"
+dependencies = [
+ "arrow-schema 59.2.0",
+ "crossbeam-channel",
+ "futures",
+ "itertools 0.14.0",
+ "parking_lot",
+ "rstest",
+ "rustix",
+ "tokio",
+ "tpchgen",
+ "tpchgen-arrow",
+ "tracing",
+ "vortex",
+ "vortex-array",
+ "vortex-arrow",
+ "vortex-btrblocks",
+ "vortex-buffer",
+ "vortex-error",
+ "vortex-io",
+ "vortex-layout",
+ "vortex-mask",
+ "vortex-scan",
+ "vortex-session",
+ "vortex-utils",
+]
+
+[[package]]
+name = "vortex-morsel-push"
 version = "0.1.0"
 dependencies = [
  "arrow-schema 59.2.0",

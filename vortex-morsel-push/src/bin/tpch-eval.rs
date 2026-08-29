@@ -57,18 +57,18 @@ use vortex_io::std_file::FileReadAt;
 use vortex_layout::LayoutRef;
 use vortex_layout::segments::SegmentSource;
 use vortex_layout::segments::SharedSegmentSource;
-use vortex_morsel::ExecutionMode;
-use vortex_morsel::fixtures::write_streaming_fixture_no_table;
-use vortex_morsel::harness::MorselConfig;
-use vortex_morsel::harness::Query;
-use vortex_morsel::harness::RunOutcome;
-use vortex_morsel::harness::assert_same_rows;
-use vortex_morsel::harness::run_morsel;
-use vortex_morsel::harness::run_v1;
-use vortex_morsel::harness::run_v1_tokio;
-use vortex_morsel::harness::run_v1_tokio_with;
-use vortex_morsel::nodes::ConjunctMode;
-use vortex_morsel::tpch;
+use vortex_morsel_push::ExecutionMode;
+use vortex_morsel_push::fixtures::write_streaming_fixture_no_table;
+use vortex_morsel_push::harness::MorselConfig;
+use vortex_morsel_push::harness::Query;
+use vortex_morsel_push::harness::RunOutcome;
+use vortex_morsel_push::harness::assert_same_rows;
+use vortex_morsel_push::harness::run_morsel;
+use vortex_morsel_push::harness::run_v1;
+use vortex_morsel_push::harness::run_v1_tokio;
+use vortex_morsel_push::harness::run_v1_tokio_with;
+use vortex_morsel_push::nodes::ConjunctMode;
+use vortex_morsel_push::tpch;
 use vortex_session::VortexSession;
 use vortex_utils::parallelism::get_available_parallelism;
 
@@ -442,7 +442,7 @@ fn main() -> VortexResult<()> {
         None => SegmentBackend::Memory(Arc::clone(&segments)),
     };
 
-    let splits = vortex_morsel::build_plan(
+    let splits = vortex_morsel_push::build_plan(
         &fixture.layout,
         &queries_probe(),
         None,
@@ -784,7 +784,7 @@ fn parse_row_sizes(name: &str, value: &str) -> VortexResult<Vec<u64>> {
 fn sweep(
     runtime: &tokio::runtime::Runtime,
     session: &VortexSession,
-    fixture: &vortex_morsel::fixtures::Fixture,
+    fixture: &vortex_morsel_push::fixtures::Fixture,
     segments: &Arc<dyn SegmentSource>,
     queries: &[Query],
     available_cpus: usize,

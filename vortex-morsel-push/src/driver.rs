@@ -104,7 +104,11 @@ pub struct MorselScan {
     output_rows: usize,
     output_bytes: u64,
     demand_hints: DemandHintDelivery,
+    completion: Option<CompletionSink>,
+    sparse_morsels: bool,
 }
+
+type CompletionSink = Arc<dyn Fn(usize, VortexResult<Option<ArrayRef>>) + Send + Sync>;
 
 /// Delivery policy for optional scheduler-only demand hints.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2676,7 +2680,12 @@ impl Scheduler {
         self.output_changed.notify_all();
     }
 
-    fn stream_ordered(self: &Arc<Self>, tx: &Sender<CreditedBatch>) {
+    fn stream_ordered(
+        self: &Arc<Self>,
+        tx: &Sender<CreditedBatch>,
+        completion: Option<&CompletionSink>,
+    ) {
+        let mut completed_batches = Vec::new();
         loop {
             let (index, complete) = {
                 let mut order = self.output_order.lock();
@@ -2710,6 +2719,10 @@ impl Scheduler {
                     head_bypass,
                     released: false,
                 };
+                if completion.is_some() {
+                    completed_batches.push(item.receive());
+                    continue;
+                }
                 if tx.send(item).is_err() {
                     self.stop();
                     return;
@@ -2717,6 +2730,19 @@ impl Scheduler {
                 continue;
             }
             if complete {
+                if let Some(completion) = completion {
+                    let batch = match completed_batches.len() {
+                        0 => Ok(None),
+                        1 => Ok(completed_batches.pop()),
+                        _ => ChunkedArray::try_new(
+                            std::mem::take(&mut completed_batches),
+                            self.run.plan.output_dtype().clone(),
+                        )
+                        .map(IntoArray::into_array)
+                        .map(Some),
+                    };
+                    completion(index, batch);
+                }
                 let mut order = self.output_order.lock();
                 if order.next == index {
                     order.next += 1;
@@ -3473,6 +3499,8 @@ impl MorselScan {
             output_rows: usize::MAX,
             output_bytes: u64::MAX,
             demand_hints: DemandHintDelivery::Immediate,
+            completion: None,
+            sparse_morsels: false,
         }
     }
 
@@ -3504,9 +3532,16 @@ impl MorselScan {
             if range.start >= range.end {
                 return Err(vortex_err!("morsel ranges must be non-empty"));
             }
-            if range.start != expected_start {
+            if (!self.sparse_morsels && range.start != expected_start)
+                || (self.sparse_morsels && range.start < expected_start)
+            {
                 return Err(vortex_err!(
-                    "morsel cut must be sorted and contiguous at row {expected_start}"
+                    "morsel ranges must be sorted{}",
+                    if self.sparse_morsels {
+                        " and non-overlapping"
+                    } else {
+                        " and contiguous"
+                    }
                 ));
             }
             if range.end > row_count {
@@ -3514,7 +3549,7 @@ impl MorselScan {
             }
             expected_start = range.end;
         }
-        if expected_start != row_count {
+        if !self.sparse_morsels && expected_start != row_count {
             return Err(vortex_err!("morsel cut does not cover the plan"));
         }
         Ok(())
@@ -3542,6 +3577,21 @@ impl MorselScan {
     /// Configure delivery of optional scheduler-only demand hints.
     pub fn with_demand_hints(mut self, delivery: DemandHintDelivery) -> Self {
         self.demand_hints = delivery;
+        self
+    }
+
+    /// Deliver each completed morsel to a sink, including morsels with no output.
+    pub fn with_completion_sink(
+        mut self,
+        completion: impl Fn(usize, VortexResult<Option<ArrayRef>>) + Send + Sync + 'static,
+    ) -> Self {
+        self.completion = Some(Arc::new(completion));
+        self
+    }
+
+    /// Permit a sorted, non-overlapping subset of the plan's rows as the morsel cut.
+    pub fn with_sparse_morsels(mut self, sparse_morsels: bool) -> Self {
+        self.sparse_morsels = sparse_morsels;
         self
     }
 
@@ -3652,8 +3702,9 @@ impl MorselScan {
             cancellation.install(&scheduler);
         }
         let output_scheduler = Arc::clone(&scheduler);
+        let completion = self.completion.clone();
         let coordinator = std::thread::spawn(move || {
-            output_scheduler.stream_ordered(&output_tx);
+            output_scheduler.stream_ordered(&output_tx, completion.as_ref());
         });
         scheduler.submit_exact_lookahead();
         let worker_stats = workers.run(Arc::clone(&scheduler), signals)?;
