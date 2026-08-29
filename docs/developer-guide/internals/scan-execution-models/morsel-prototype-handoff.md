@@ -155,6 +155,14 @@ Three changes/experiments followed from that evidence:
    producing an index-backed result for projection. A pinned single-core microbenchmark at 131,072
    rows measured 6.415 us before versus 4.567 us after, a 1.40x speedup (28.8% less time) for that
    exact operation. The committed `cached_base/q12_shape` benchmark preserves this case.
+4. Predicate-produced rank masks are fresh bitmaps, so the first version of that path still built
+   and cached a temporary rank-index vector before mapping it through the base indices. The current
+   path walks the bitmap by `u64` word and writes original row indices directly into one exactly
+   sized output vector; already-cached rank masks retain the slice-based path. A Q12-shaped
+   uncached-rank microbenchmark improved from 12.75-13.09 us to 5.50-5.51 us (about 2.34x). Three
+   alternating 31-sample SF=1 x16/128k process pairs measured old medians of 1.691/1.918/2.154 ms
+   and fused medians of 1.679/1.709/1.686 ms. The median process result improved 1.918 to 1.686 ms
+   (12.1%), but the pairwise spread shows why the microbenchmark is the stronger attribution.
 
 Lowering the dense-to-sparse expression threshold from 20% to 10% was rejected. It avoided the
 rank-space handoff but forced Q12's final comparison over the full array and regressed three

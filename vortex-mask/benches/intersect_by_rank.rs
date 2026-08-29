@@ -181,6 +181,22 @@ fn cached_base(bencher: Bencher, (self_density, mask_density, _name): (f64, f64,
         .bench_refs(|(base, rank)| base.intersect_by_rank(rank));
 }
 
+/// Cached base indices with a fresh bitmap-backed rank mask on every iteration. Predicate
+/// evaluation produces masks with this representation, so no rank-index cache is available.
+#[divan::bench(args = CACHED_BASE_ARGS)]
+fn cached_base_fresh_rank(bencher: Bencher, (self_density, mask_density, _name): (f64, f64, &str)) {
+    let size = 131_072;
+    let base = create_random_indices_mask(size, self_density);
+    let rank_len = base.true_count();
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let threshold = (mask_density * 1000.0) as usize;
+    let rank_buffer = BitBuffer::from_iter((0..rank_len).map(|i| (i * 7 + 13) % 1000 < threshold));
+
+    bencher
+        .with_inputs(|| Mask::from_buffer(rank_buffer.clone()))
+        .bench_refs(|rank| base.intersect_by_rank(rank));
+}
+
 /// Very-sparse mask backed only by a BitBuffer (no cached indices). Targets the
 /// mask-driven dispatch path.
 #[divan::bench(args = VERY_SPARSE_MASK_ARGS)]

@@ -392,6 +392,20 @@ fn intersect_by_rank_indices(len: usize, self_indices: &[usize], mask_indices: &
     )
 }
 
+fn intersect_by_rank_bit_buffer(
+    len: usize,
+    self_indices: &[usize],
+    mask_values: &MaskValuesRef,
+) -> Mask {
+    let mut output = Vec::with_capacity(mask_values.true_count());
+    mask_values.bit_buffer().for_each_set_index(|idx| {
+        // SAFETY: rank-mask indices address `self_indices` because
+        // mask.len() == self.true_count() == self_indices.len().
+        output.push(unsafe { *self_indices.get_unchecked(idx) });
+    });
+    Mask::from_indices(len, output)
+}
+
 #[inline]
 fn intersect_bit_buffers_dispatch(
     self_buffer: &BitBuffer,
@@ -494,11 +508,12 @@ impl Mask {
                 if let Some(self_indices) = self_values.indices.get()
                     && mask_values.true_count().saturating_mul(32) < self.len()
                 {
-                    return intersect_by_rank_indices(
-                        self.len(),
-                        self_indices,
-                        mask_values.indices(),
-                    );
+                    return match mask_values.indices.get() {
+                        Some(mask_indices) => {
+                            intersect_by_rank_indices(self.len(), self_indices, mask_indices)
+                        }
+                        None => intersect_by_rank_bit_buffer(self.len(), self_indices, mask_values),
+                    };
                 }
 
                 // Four dispatch cases keyed by (self density, mask density):
@@ -680,8 +695,16 @@ mod tests {
         let rank = Mask::from_buffer(BitBuffer::from_iter(
             (0..16).map(|index| index == 1 || index == 10),
         ));
+        assert_eq!(
+            rank.values().and_then(|values| values.cached_indices()),
+            None
+        );
 
         let result = base.intersect_by_rank(&rank);
+        assert_eq!(
+            rank.values().and_then(|values| values.cached_indices()),
+            None
+        );
         assert_eq!(result.indices(), crate::AllOr::Some(&[8, 80][..]));
         assert_eq!(
             result.values().and_then(|values| values.cached_indices()),
