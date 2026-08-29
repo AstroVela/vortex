@@ -29,11 +29,14 @@ use crate::random_access::parquet_to_arrow_file;
 
 /// Dataset identifier used for data path generation.
 pub const DATASET: &str = "nested_structs";
+const DATASET_10X: &str = "nested_structs_10x";
 
 /// Number of rows in the nested structs dataset.
 pub const ROW_COUNT: usize = 1_000_000;
+pub const ROW_COUNT_10X: usize = ROW_COUNT * 10;
 
 pub struct NestedStructsData;
+pub struct NestedStructs10xData;
 
 #[async_trait]
 impl BenchDataset for NestedStructsData {
@@ -59,6 +62,34 @@ impl BenchDataset for NestedStructsData {
     }
 }
 
+#[async_trait]
+impl BenchDataset for NestedStructs10xData {
+    fn name(&self) -> &str {
+        "nested-structs-10x"
+    }
+
+    fn row_count(&self) -> u64 {
+        ROW_COUNT_10X as u64
+    }
+
+    fn take_index_scale(&self) -> usize {
+        10
+    }
+
+    async fn path(&self, format: Format) -> Result<PathBuf> {
+        match format {
+            Format::ArrowIpc => {
+                let parquet_path = nested_structs_10x_parquet().await?;
+                parquet_to_arrow_file(parquet_path, data_path(DATASET_10X, Format::ArrowIpc))
+            }
+            Format::OnDiskVortex => nested_structs_10x_vortex().await,
+            Format::VortexCompact => nested_structs_10x_vortex_compact().await,
+            Format::Parquet => nested_structs_10x_parquet().await,
+            other => unimplemented!("Random access bench not implemented for {other}"),
+        }
+    }
+}
+
 /// Batch size for data generation.
 const BATCH_SIZE: usize = 100_000;
 
@@ -78,8 +109,19 @@ const BATCH_SIZE: usize = 100_000;
 /// }
 /// ```
 pub async fn nested_structs_parquet() -> Result<PathBuf> {
+    nested_structs_parquet_with_rows(DATASET, ROW_COUNT).await
+}
+
+pub async fn nested_structs_10x_parquet() -> Result<PathBuf> {
+    nested_structs_parquet_with_rows(DATASET_10X, ROW_COUNT_10X).await
+}
+
+async fn nested_structs_parquet_with_rows(
+    dataset: &'static str,
+    row_count: usize,
+) -> Result<PathBuf> {
     idempotent_async(
-        data_path(DATASET, Format::Parquet),
+        data_path(dataset, Format::Parquet),
         |temp_path| async move {
             let inner_fields = Fields::from(vec![
                 Field::new("x", DataType::Float64, false),
@@ -100,8 +142,8 @@ pub async fn nested_structs_parquet() -> Result<PathBuf> {
             let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None)?;
             let mut rng = StdRng::seed_from_u64(42);
 
-            for batch_start in (0..ROW_COUNT).step_by(BATCH_SIZE) {
-                let batch_len = BATCH_SIZE.min(ROW_COUNT - batch_start);
+            for batch_start in (0..row_count).step_by(BATCH_SIZE) {
+                let batch_len = BATCH_SIZE.min(row_count - batch_start);
 
                 let ids = Int64Array::from_iter_values(
                     (batch_start as i64)..((batch_start + batch_len) as i64),
@@ -150,9 +192,23 @@ pub async fn nested_structs_vortex() -> Result<PathBuf> {
     write_parquet_as_vortex(parquet_path, &path, CompactionStrategy::Default).await
 }
 
+/// Get the path to the 10x nested structs Vortex file, converting from Parquet if needed.
+pub async fn nested_structs_10x_vortex() -> Result<PathBuf> {
+    let parquet_path = nested_structs_10x_parquet().await?;
+    let path = data_path(DATASET_10X, Format::OnDiskVortex);
+    write_parquet_as_vortex(parquet_path, &path, CompactionStrategy::Default).await
+}
+
 /// Get the path to the nested structs compact vortex file, converting from parquet if needed.
 pub async fn nested_structs_vortex_compact() -> Result<PathBuf> {
     let parquet_path = nested_structs_parquet().await?;
     let path = data_path(DATASET, Format::VortexCompact);
+    write_parquet_as_vortex(parquet_path, &path, CompactionStrategy::Compact).await
+}
+
+/// Get the path to the compact 10x nested structs Vortex file.
+pub async fn nested_structs_10x_vortex_compact() -> Result<PathBuf> {
+    let parquet_path = nested_structs_10x_parquet().await?;
+    let path = data_path(DATASET_10X, Format::VortexCompact);
     write_parquet_as_vortex(parquet_path, &path, CompactionStrategy::Compact).await
 }

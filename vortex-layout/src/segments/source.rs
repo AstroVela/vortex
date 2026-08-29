@@ -18,6 +18,23 @@ pub trait SegmentSource: 'static + Send + Sync {
     /// Request a segment, returning a future that will eventually resolve to the segment data.
     fn request(&self, id: SegmentId) -> SegmentFuture;
 
+    /// Register a segment for background reading and return its completion future.
+    ///
+    /// Sources with their own request queue may make this eligible before the future is polled.
+    /// Other sources retain the default demand-driven behavior.
+    fn request_background(&self, id: SegmentId) -> SegmentFuture {
+        self.request(id)
+    }
+
+    /// Register a batch of segments for background reading.
+    ///
+    /// The returned futures correspond positionally to `ids`. Sources with a request queue may
+    /// register the complete batch before making any member eligible, allowing adjacent requests
+    /// to be coalesced even when the driver is running concurrently.
+    fn request_background_batch(&self, ids: &[SegmentId]) -> Vec<SegmentFuture> {
+        ids.iter().map(|&id| self.request_background(id)).collect()
+    }
+
     /// Attempt to resolve a segment synchronously without waiting on storage.
     ///
     /// Sources that cannot guarantee non-blocking behavior return

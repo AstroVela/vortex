@@ -19,13 +19,13 @@
 //! * [`ExecNode::execute`] — value production. When a named required cell is still unissued,
 //!   [`ExecCx::ready`](node::ExecCx::ready) may attempt one source-provided read guaranteed not to
 //!   wait on storage (Linux files use `preadv2(RWF_NOWAIT)`). A hit is consumed inline. A miss
-//!   suspends on the exact ticket and the scheduler submits its batch to the shared urgent IO
-//!   queue. Execution never polls a background future or waits for IO on the worker thread.
+//!   waits on the exact ticket. The owning worker drives all already-planned futures together
+//!   until that dependency is ready, then resumes the same morsel.
 //!
 //! Compared to the V1 `LayoutReader` path this executor differs in two measurable ways:
 //!
-//! 1. There is no async task per evaluation. Planning, IO polling, and execution continuations
-//!    share one bounded worker pool; pending IO never parks a worker.
+//! 1. There is no async task per evaluation. Planning, IO waiting, and execution all stay on the
+//!    affinity-owned worker; a blocked worker cannot execute another morsel.
 //! 2. Each worker owns one arena and one active morsel. Arenas never migrate, and emission order
 //!    is restored by morsel index.
 //!
@@ -56,6 +56,9 @@ pub mod workloads;
 
 pub use build::ExecPlan;
 pub use build::build_plan;
+pub use build::build_plan_for_ranges;
+pub use build::natural_morsels_for;
+pub use driver::MorselExecutor;
 pub use driver::MorselScan;
 pub use driver::morsels;
 pub use node::ExecCx;
@@ -66,6 +69,7 @@ pub use node::PlanItem;
 pub use node::PlanPoll;
 pub use node::Value;
 pub use node::ValueBatch;
+pub use stats::MorselTrace;
 pub use stats::ScanStats;
 
 #[cfg(test)]

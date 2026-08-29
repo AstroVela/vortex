@@ -4,6 +4,7 @@
 //! The [`ExecNode`] contract and the arena that drives it.
 
 use std::ops::Range;
+use std::sync::OnceLock;
 
 use vortex_array::ArrayRef;
 use vortex_array::buffer::BufferHandle;
@@ -23,6 +24,21 @@ use crate::stats::ScanStats;
 
 /// Index of a node within an [`Arena`].
 pub type NodeId = u32;
+
+#[derive(Clone, Copy)]
+pub(crate) struct ScanCaches<'a> {
+    decoded: &'a SharedCells,
+    dictionaries: &'a [OnceLock<ArrayRef>],
+}
+
+impl<'a> ScanCaches<'a> {
+    pub(crate) fn new(decoded: &'a SharedCells, dictionaries: &'a [OnceLock<ArrayRef>]) -> Self {
+        Self {
+            decoded,
+            dictionaries,
+        }
+    }
+}
 
 /// A value produced by a node for its parent.
 #[derive(Clone)]
@@ -224,14 +240,20 @@ impl Arena {
 pub struct PlanCx<'a> {
     arena: &'a mut Arena,
     io: &'a IoPlane,
-    cells: &'a SharedCells,
+    caches: ScanCaches<'a>,
     stats: &'a mut ScanStats,
+    demand: Mask,
     /// Remaining IO uses this planning quantum may emit before the node should yield.
     budget: u32,
     priority: IoPriority,
 }
 
 impl<'a> PlanCx<'a> {
+    /// The known row demand for the node currently being planned.
+    pub fn demand(&self) -> &Mask {
+        &self.demand
+    }
+
     /// The remaining planning budget, in IO uses.
     pub fn budget(&self) -> u32 {
         self.budget
@@ -247,7 +269,12 @@ impl<'a> PlanCx<'a> {
     /// A hit lets the node skip issuing the read entirely: the caller's own lease (counted into
     /// the cell before the scan started) keeps the value alive until this morsel retires.
     pub fn decoded_available(&self, key: IoKey) -> bool {
-        self.cells.decoded(key).is_some()
+        self.caches.decoded.decoded(key).is_some()
+    }
+
+    /// Whether this scan has already decoded the values for a dictionary node.
+    pub(crate) fn dictionary_available(&self, id: NodeId) -> bool {
+        self.caches.dictionaries[id as usize].get().is_some()
     }
 
     /// Register a batch of IO uses, spending budget and returning tickets.
@@ -278,7 +305,19 @@ impl<'a> PlanCx<'a> {
     /// Returns `true` when the child completed, `false` when the shared budget ran out and the
     /// caller should yield and resume at this child.
     pub fn plan_child(&mut self, id: NodeId, range: Range<u64>, fresh: bool) -> VortexResult<bool> {
+        self.plan_child_with_demand(id, range, fresh, self.demand.clone())
+    }
+
+    /// Drive a child under a transformed row demand.
+    pub(crate) fn plan_child_with_demand(
+        &mut self,
+        id: NodeId,
+        range: Range<u64>,
+        fresh: bool,
+        demand: Mask,
+    ) -> VortexResult<bool> {
         let mut node = self.arena.take(id);
+        let saved = std::mem::replace(&mut self.demand, demand);
         let result = (|| {
             if fresh {
                 node.reset(range);
@@ -295,6 +334,7 @@ impl<'a> PlanCx<'a> {
                 }
             }
         })();
+        self.demand = saved;
         self.arena.put(id, node);
         result
     }
@@ -304,7 +344,7 @@ impl<'a> PlanCx<'a> {
 pub struct ExecCx<'a> {
     arena: &'a mut Arena,
     io: &'a IoPlane,
-    cells: &'a SharedCells,
+    caches: ScanCaches<'a>,
     session: &'a VortexSession,
     stats: &'a mut ScanStats,
     demand: Mask,
@@ -331,16 +371,29 @@ impl<'a> ExecCx<'a> {
 
     /// Take a decoded value from the shared cell for a unit, if a morsel already published one.
     pub fn shared_decoded(&mut self, key: IoKey) -> Option<ArrayRef> {
-        let hit = self.cells.decoded(key);
+        let hit = self.caches.decoded.decoded(key);
         if hit.is_some() {
-            self.stats.decode_reuses += 1;
+            let IoKey::Segment(segment) = key;
+            self.stats.record_decode_reuse(*segment);
         }
         hit
     }
 
     /// Publish a decoded value into the shared cell for a unit.
     pub fn publish_decoded(&self, key: IoKey, array: &ArrayRef) {
-        self.cells.publish(key, array);
+        self.caches.decoded.publish(key, array);
+    }
+
+    /// Clone dictionary values decoded earlier in this scan.
+    pub(crate) fn shared_dictionary(&self, id: NodeId) -> Option<ArrayRef> {
+        self.caches.dictionaries[id as usize].get().cloned()
+    }
+
+    /// Publish dictionary values for reuse during this scan. First writer wins.
+    pub(crate) fn publish_dictionary(&self, id: NodeId, array: ArrayRef) -> ArrayRef {
+        self.caches.dictionaries[id as usize]
+            .get_or_init(|| array)
+            .clone()
     }
 
     /// Mutable access to the run's counters.
@@ -426,15 +479,17 @@ pub(crate) fn begin_morsel(arena: &mut Arena, root: NodeId, range: Range<u64>) {
 pub(crate) fn poll_plan_morsel(
     arena: &mut Arena,
     root: NodeId,
+    demand: &Mask,
     io: &IoPlane,
-    cells: &SharedCells,
+    caches: ScanCaches<'_>,
     stats: &mut ScanStats,
 ) -> VortexResult<PlanPoll> {
     let mut cx = PlanCx {
         arena,
         io,
-        cells,
+        caches,
         stats,
+        demand: demand.clone(),
         budget: PLAN_BUDGET,
         priority: IoPriority::Required,
     };
@@ -448,21 +503,19 @@ pub(crate) fn poll_plan_morsel(
 pub(crate) fn poll_execute_morsel(
     arena: &mut Arena,
     root: NodeId,
-    range: &Range<u64>,
+    demand: &Mask,
     io: &IoPlane,
-    cells: &SharedCells,
+    caches: ScanCaches<'_>,
     session: &VortexSession,
     stats: &mut ScanStats,
 ) -> VortexResult<ExecPoll> {
-    let rows = usize::try_from(range.end - range.start)
-        .map_err(|_| vortex_err!("morsel row count exceeds usize"))?;
     let mut cx = ExecCx {
         arena,
         io,
-        cells,
+        caches,
         session,
         stats,
-        demand: Mask::new_true(rows),
+        demand: demand.clone(),
     };
     let mut node = cx.arena.take(root);
     let poll = node.execute(&mut cx);

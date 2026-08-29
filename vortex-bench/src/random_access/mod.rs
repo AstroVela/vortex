@@ -81,6 +81,11 @@ pub trait BenchDataset: Send + Sync {
     /// The total number of rows in this dataset.
     fn row_count(&self) -> u64;
 
+    /// Scale the standard random-access workload while preserving its selection density.
+    fn take_index_scale(&self) -> usize {
+        1
+    }
+
     /// Prepare the data file for the given format and return its path.
     ///
     /// This writes the file if it doesn't already exist.

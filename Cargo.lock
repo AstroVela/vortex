@@ -10609,6 +10609,7 @@ dependencies = [
  "insta",
  "itertools 0.14.0",
  "mimalloc",
+ "moka",
  "noodles-bgzf",
  "noodles-vcf",
  "parking_lot",
@@ -10638,7 +10639,10 @@ dependencies = [
  "url",
  "uuid",
  "vortex",
+ "vortex-array",
  "vortex-arrow",
+ "vortex-mask",
+ "vortex-morsel",
  "vortex-spatial",
  "vortex-tensor",
  "wkb",
@@ -11304,7 +11308,6 @@ name = "vortex-morsel"
 version = "0.1.0"
 dependencies = [
  "arrow-schema 59.2.0",
- "crossbeam-channel",
  "futures",
  "itertools 0.14.0",
  "parking_lot",

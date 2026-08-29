@@ -151,6 +151,7 @@ struct CountingReadAt {
     inner: Arc<dyn VortexReadAt>,
     counters: Arc<PhysicalIoCounters>,
     coalesce_override: Option<CoalesceConfig>,
+    concurrency_override: Option<usize>,
 }
 
 impl VortexReadAt for CountingReadAt {
@@ -164,7 +165,8 @@ impl VortexReadAt for CountingReadAt {
     }
 
     fn concurrency(&self) -> usize {
-        self.inner.concurrency()
+        self.concurrency_override
+            .unwrap_or_else(|| self.inner.concurrency())
     }
 
     fn size(&self) -> BoxFuture<'static, VortexResult<u64>> {
@@ -218,6 +220,7 @@ struct DiskBackend {
     runtime: Handle,
     evict_before_run: bool,
     coalesce_override: Option<CoalesceConfig>,
+    concurrency_override: Option<usize>,
 }
 
 enum SegmentBackend {
@@ -247,6 +250,7 @@ impl SegmentBackend {
                     inner: read,
                     counters: Arc::clone(&counters),
                     coalesce_override: disk.coalesce_override,
+                    concurrency_override: disk.concurrency_override,
                 };
                 let metrics = DefaultMetricsRegistry::default();
                 let source = FileSegmentSource::open(
@@ -379,6 +383,18 @@ fn main() -> VortexResult<()> {
             Some(CoalesceConfig::new(distance, max_size))
         }
     };
+    let concurrency_override = std::env::var("TPCH_IO_CONCURRENCY")
+        .ok()
+        .map(|value| {
+            let concurrency = value
+                .parse()
+                .map_err(|err| vortex_error::vortex_err!("invalid TPCH_IO_CONCURRENCY: {err}"))?;
+            if concurrency == 0 {
+                vortex_bail!("TPCH_IO_CONCURRENCY must be greater than zero");
+            }
+            Ok(concurrency)
+        })
+        .transpose()?;
     let backend = match disk_path.as_ref() {
         Some(path) => SegmentBackend::Disk(DiskBackend {
             path: path.clone(),
@@ -386,6 +402,7 @@ fn main() -> VortexResult<()> {
             runtime: Handle::new(Arc::downgrade(&io_executor)),
             evict_before_run,
             coalesce_override,
+            concurrency_override,
         }),
         None => SegmentBackend::Memory(Arc::clone(&segments)),
     };
@@ -454,6 +471,11 @@ fn main() -> VortexResult<()> {
             config.distance, config.max_size
         );
     }
+    if let SegmentBackend::Disk(disk) = &backend
+        && let Some(concurrency) = disk.concurrency_override
+    {
+        println!("file I/O concurrency override: {concurrency}");
+    }
     println!();
     println!("schema: {}", fixture.layout.dtype());
     println!();
@@ -482,19 +504,55 @@ fn main() -> VortexResult<()> {
         .map(|value| parse_row_sizes("TPCH_MORSEL_ROWS", &value))
         .transpose()?
         .unwrap_or_else(|| vec![PRIMARY_MORSEL_ROWS]);
+    let selected_morsel_threads = std::env::var("TPCH_MORSEL_THREADS")
+        .ok()
+        .map(|value| {
+            parse_row_sizes("TPCH_MORSEL_THREADS", &value)?
+                .into_iter()
+                .map(|threads| {
+                    usize::try_from(threads).map_err(|err| {
+                        vortex_error::vortex_err!("invalid TPCH_MORSEL_THREADS: {err}")
+                    })
+                })
+                .collect::<VortexResult<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_else(|| vec![threads]);
+    let selected_share_decodes = match std::env::var("TPCH_SHARE_DECODES").as_deref() {
+        Ok("1") => vec![true],
+        Ok("0") => vec![false],
+        Ok("both") => vec![true, false],
+        Ok(value) => vortex_bail!("TPCH_SHARE_DECODES must be `0`, `1`, or `both`, got `{value}`"),
+        Err(std::env::VarError::NotPresent) => vec![true],
+        Err(err) => vortex_bail!("invalid TPCH_SHARE_DECODES: {err}"),
+    };
     let morsel_only = std::env::var("TPCH_MORSEL_ONLY").is_ok_and(|value| value == "1")
-        || std::env::var_os("TPCH_MORSEL_ROWS").is_some();
+        || std::env::var_os("TPCH_MORSEL_ROWS").is_some()
+        || std::env::var_os("TPCH_MORSEL_THREADS").is_some()
+        || std::env::var_os("TPCH_SHARE_DECODES").is_some();
     let configs = |threads: usize| {
         if morsel_only {
-            return selected_morsel_rows
+            let selected_share_decodes = &selected_share_decodes;
+            return selected_morsel_threads
                 .iter()
                 .copied()
-                .map(|morsel_rows| {
-                    Row::Morsel(MorselConfig {
-                        threads,
-                        morsel_rows,
-                        ..Default::default()
-                    })
+                .flat_map(|morsel_threads| {
+                    selected_morsel_rows
+                        .iter()
+                        .copied()
+                        .flat_map(move |morsel_rows| {
+                            selected_share_decodes
+                                .iter()
+                                .copied()
+                                .map(move |share_decodes| {
+                                    Row::Morsel(MorselConfig {
+                                        threads: morsel_threads,
+                                        morsel_rows,
+                                        share_decodes,
+                                        ..Default::default()
+                                    })
+                                })
+                        })
                 })
                 .collect();
         }

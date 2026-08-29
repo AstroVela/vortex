@@ -42,7 +42,6 @@ vortex-session = { workspace = true }
 vortex-utils = { workspace = true }
 
 futures = { workspace = true }
-crossbeam-channel = { workspace = true }
 vortex-io = { workspace = true, optional = true }
 vortex-btrblocks = { workspace = true, optional = true }
 vortex-arrow = { workspace = true, optional = true }

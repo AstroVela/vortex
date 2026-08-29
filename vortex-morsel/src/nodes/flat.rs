@@ -48,6 +48,8 @@ pub struct FlatExec {
     segment_rows: u64,
     /// Root-coordinate offset of this segment's row zero, for stamping `source_range`.
     root_offset: u64,
+    /// Root-coordinate range whose morsels use this stored unit.
+    lease_range: Range<u64>,
     estimated_bytes: usize,
     producer: ProducerId,
 
@@ -60,7 +62,12 @@ pub struct FlatExec {
 
 impl FlatExec {
     /// Build a flat node over a flat layout.
-    pub fn new(layout: &FlatLayout, root_offset: u64, producer: ProducerId) -> Self {
+    pub fn new(
+        layout: &FlatLayout,
+        root_offset: u64,
+        lease_range: Range<u64>,
+        producer: ProducerId,
+    ) -> Self {
         let segment_rows = layout.row_count();
         let estimated_bytes = estimate_bytes(layout.dtype(), segment_rows);
         Self {
@@ -70,6 +77,7 @@ impl FlatExec {
             array_tree: layout.array_tree().cloned(),
             segment_rows,
             root_offset,
+            lease_range,
             estimated_bytes,
             producer,
             range: 0..0,
@@ -99,7 +107,13 @@ impl FlatExec {
             .map_err(|_| vortex_err!("segment row count exceeds usize"))?;
         let session = cx.session().clone();
         let array = parts.decode(&self.dtype, rows, &self.read_ctx, &session)?;
-        cx.stats().decodes += 1;
+        cx.stats().record_decode(*self.segment);
+        tracing::trace!(
+            target: "vortex_morsel::flat_decode",
+            segment = *self.segment,
+            values = array.len(),
+            "decoded flat values"
+        );
         cx.publish_decoded(IoKey::Segment(self.segment), &array);
         Ok(Some(array))
     }
@@ -140,7 +154,7 @@ impl ExecNode for FlatExec {
         batch.push(IoUse {
             key: IoKey::Segment(self.segment),
             extent: 0..self.segment_rows,
-            source_range: self.root_offset..self.root_offset + self.segment_rows,
+            source_range: self.lease_range.clone(),
             producer: self.producer,
             estimated_bytes: self.estimated_bytes,
         });

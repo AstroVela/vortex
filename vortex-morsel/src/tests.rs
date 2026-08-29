@@ -731,11 +731,11 @@ impl SegmentSource for PairedPendingSource {
     }
 }
 
-/// One CPU worker must submit every planned read before waiting for either one. Each of this
-/// source's first two futures remains pending until the other has been polled, so the old inline
-/// `block_on` driver reaches the watchdog while the continuation scheduler completes immediately.
+/// One CPU worker must drive every planned read together while waiting. Each of this source's first
+/// two futures remains pending until the other has been polled, so waiting on only one future
+/// reaches the watchdog while the planned-read driver completes immediately.
 #[rstest]
-fn planned_reads_progress_together_without_parking_a_worker() -> VortexResult<()> {
+fn worker_wait_drives_planned_reads_together() -> VortexResult<()> {
     let session = session();
     let values: Vec<i32> = (0..32).collect();
     let fixture = block_on(|_handle| async {

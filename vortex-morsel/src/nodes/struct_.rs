@@ -31,6 +31,7 @@ use crate::node::ValueBatch;
 pub struct StructExec {
     names: FieldNames,
     children: Arc<[NodeId]>,
+    validity: Option<NodeId>,
 
     // Per-morsel state.
     range: Range<u64>,
@@ -38,21 +39,24 @@ pub struct StructExec {
     plan_started: bool,
     exec_cursor: usize,
     fields: Vec<ArrayRef>,
+    validity_array: Option<ArrayRef>,
     done: bool,
 }
 
 impl StructExec {
     /// Build a struct node over one child per projected field.
-    pub fn new(names: FieldNames, children: Arc<[NodeId]>) -> Self {
+    pub fn new(names: FieldNames, children: Arc<[NodeId]>, validity: Option<NodeId>) -> Self {
         debug_assert_eq!(names.len(), children.len());
         Self {
             names,
             children,
+            validity,
             range: 0..0,
             plan_cursor: 0,
             plan_started: false,
             exec_cursor: 0,
             fields: Vec::new(),
+            validity_array: None,
             done: false,
         }
     }
@@ -65,17 +69,25 @@ impl ExecNode for StructExec {
         self.plan_started = false;
         self.exec_cursor = 0;
         self.fields.clear();
+        self.validity_array = None;
         self.done = false;
     }
 
     fn next_plan(&mut self, cx: &mut PlanCx<'_>) -> VortexResult<PlanPoll> {
-        while self.plan_cursor < self.children.len() {
+        let child_count = self.children.len() + usize::from(self.validity.is_some());
+        while self.plan_cursor < child_count {
             if cx.out_of_budget() {
                 return Ok(PlanPoll::Item(PlanItem::Plan));
             }
             let fresh = !self.plan_started;
             self.plan_started = true;
-            if cx.plan_child(self.children[self.plan_cursor], self.range.clone(), fresh)? {
+            let child = if self.plan_cursor < self.children.len() {
+                self.children[self.plan_cursor]
+            } else {
+                self.validity
+                    .ok_or_else(|| vortex_err!("struct validity child is missing"))?
+            };
+            if cx.plan_child(child, self.range.clone(), fresh)? {
                 self.plan_cursor += 1;
                 self.plan_started = false;
             } else {
@@ -92,6 +104,17 @@ impl ExecNode for StructExec {
 
         let demand = cx.demand().clone();
         let len = demand.true_count();
+        if let Some(validity) = self.validity
+            && self.validity_array.is_none()
+        {
+            match cx.child_array(validity, demand.clone())? {
+                ChildPoll::Value(array) => self.validity_array = Some(array),
+                ChildPoll::Blocked(waits) => return Ok(ExecPoll::Blocked(waits)),
+                ChildPoll::Done => {
+                    return Err(vortex_err!("struct validity child produced no value"));
+                }
+            }
+        }
         if self.fields.capacity() < self.children.len() {
             self.fields
                 .reserve(self.children.len().saturating_sub(self.fields.len()));
@@ -111,8 +134,11 @@ impl ExecNode for StructExec {
         }
 
         let fields = std::mem::take(&mut self.fields);
-        let array = StructArray::try_new(self.names.clone(), fields, len, Validity::NonNullable)?
-            .into_array();
+        let validity = self
+            .validity_array
+            .take()
+            .map_or(Validity::NonNullable, Validity::Array);
+        let array = StructArray::try_new(self.names.clone(), fields, len, validity)?.into_array();
         self.done = true;
 
         Ok(ExecPoll::Value(ValueBatch {
@@ -124,6 +150,9 @@ impl ExecNode for StructExec {
     fn retire(&mut self, cx: &mut RetireCx<'_>) {
         for &child in self.children.iter() {
             cx.retire_child(child);
+        }
+        if let Some(validity) = self.validity {
+            cx.retire_child(validity);
         }
     }
 

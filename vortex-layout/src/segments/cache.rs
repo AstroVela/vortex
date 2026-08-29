@@ -13,6 +13,7 @@ use vortex_array::buffer::BufferHandle;
 use vortex_buffer::ByteBuffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_io::ReadAtNowait;
 use vortex_metrics::Counter;
 use vortex_metrics::Label;
 use vortex_metrics::MetricBuilder;
@@ -147,8 +148,33 @@ impl SegmentCacheSourceAdapter {
 
 impl SegmentSource for SegmentCacheSourceAdapter {
     fn request(&self, id: SegmentId) -> SegmentFuture {
+        self.request_with(id, self.source.request(id))
+    }
+
+    fn request_background(&self, id: SegmentId) -> SegmentFuture {
+        self.request_with(id, self.source.request_background(id))
+    }
+
+    fn request_background_batch(&self, ids: &[SegmentId]) -> Vec<SegmentFuture> {
+        ids.iter()
+            .copied()
+            .zip(self.source.request_background_batch(ids))
+            .map(|(id, delegate)| self.request_with(id, delegate))
+            .collect()
+    }
+
+    fn request_nowait(&self, id: SegmentId) -> VortexResult<ReadAtNowait> {
+        self.source.request_nowait(id)
+    }
+
+    fn prefers_background_reads(&self) -> bool {
+        self.source.prefers_background_reads()
+    }
+}
+
+impl SegmentCacheSourceAdapter {
+    fn request_with(&self, id: SegmentId, delegate: SegmentFuture) -> SegmentFuture {
         let cache = Arc::clone(&self.cache);
-        let delegate = self.source.request(id);
 
         async move {
             if let Ok(Some(segment)) = cache.get(id).await {

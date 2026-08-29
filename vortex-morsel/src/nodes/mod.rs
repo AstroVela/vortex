@@ -5,6 +5,7 @@
 
 mod chunked;
 mod conjunct;
+mod dict;
 mod filter;
 mod flat;
 mod struct_;
@@ -13,6 +14,7 @@ pub use chunked::ChunkedExec;
 pub use conjunct::ConjunctExec;
 pub use conjunct::ConjunctMode;
 pub use conjunct::ConjunctSlot;
+pub use dict::DictExec;
 pub use filter::FilterExec;
 pub use flat::FlatExec;
 pub use struct_::StructExec;

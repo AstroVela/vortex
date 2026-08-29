@@ -79,7 +79,7 @@ impl CoalesceConfig {
 
     /// Configuration appropriate for local filesystem access.
     pub const fn file() -> Self {
-        Self::new(64 << 10, 4 << 20) // 64KB distance, 4MB max
+        Self::new(64 << 10, 2 << 20) // 64KB distance, 2MB max
     }
 
     /// Configuration appropriate for object storage (S3, GCS, etc.).
@@ -517,7 +517,7 @@ mod tests {
     fn test_coalesce_config_file() {
         let config = CoalesceConfig::file();
         assert_eq!(config.distance, 64 << 10); // 64KB
-        assert_eq!(config.max_size, 4 << 20); // 4MB
+        assert_eq!(config.max_size, 2 << 20); // 2MB
     }
 
     #[test]

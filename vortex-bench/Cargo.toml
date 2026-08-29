@@ -27,6 +27,8 @@ vortex = { workspace = true, features = [
     "tokio",
     "zstd",
 ] }
+vortex-morsel = { workspace = true }
+vortex-mask = { workspace = true }
 vortex-arrow = { workspace = true }
 vortex-spatial = { workspace = true }
 vortex-tensor = { workspace = true } # TODO(connor): In the future, this might be inside vortex.
@@ -50,6 +52,7 @@ humansize = { workspace = true }
 indicatif = { workspace = true, features = ["futures"] }
 itertools = { workspace = true }
 mimalloc = { workspace = true }
+moka = { workspace = true, features = ["sync"] }
 noodles-bgzf = { workspace = true, features = ["async"] }
 noodles-vcf = { workspace = true, features = ["async"] }
 parking_lot = { workspace = true }
@@ -86,6 +89,7 @@ wkb = { workspace = true }
 insta = { workspace = true }
 rstest = { workspace = true }
 tempfile = { workspace = true }
+vortex-array = { workspace = true, features = ["_test-harness"] }
 
 [features]
 unstable_encodings = ["vortex/unstable_encodings"]

@@ -10,13 +10,14 @@
 //!
 //! A scan owns one [`IoService`], while each affinity-owned morsel has a small [`IoPlane`] that
 //! records only the tickets named by that morsel. The service deduplicates raw reads scan-wide and
-//! the shared worker pool polls required and speculative futures as independent work items.
+//! a blocked worker polls the relevant planned futures until its exact dependencies are ready.
 
 use std::cell::RefCell;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU8;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
@@ -135,7 +136,10 @@ struct IoCell {
     waiters: Mutex<Vec<Waker>>,
     required: AtomicBool,
     submitted: AtomicBool,
+    poll_owner: AtomicUsize,
 }
+
+const NO_POLL_OWNER: usize = usize::MAX;
 
 /// Scan-wide registry of raw segment requests.
 ///
@@ -174,6 +178,7 @@ impl IoService {
             waiters: Mutex::new(Vec::new()),
             required: AtomicBool::new(priority == IoPriority::Required),
             submitted: AtomicBool::new(false),
+            poll_owner: AtomicUsize::new(NO_POLL_OWNER),
         });
         cells.insert(key, Arc::clone(&cell));
         (cell, true)
@@ -193,18 +198,54 @@ impl IoService {
             .collect()
     }
 
-    pub(crate) fn issue(&self, read: &IoRead) {
+    pub(crate) fn issue(&self, read: &IoRead, background: bool) {
         let mut state = read.cell.state.lock();
         if !matches!(*state, CellState::Unissued) {
             return;
         }
         let future = match read.key() {
+            IoKey::Segment(id) if background => self.source.request_background(id),
             IoKey::Segment(id) => self.source.request(id),
         };
         *state = CellState::Pending {
             future,
             wait_started: None,
         };
+    }
+
+    /// Issue a scheduler batch while preserving its registration boundary at the segment source.
+    pub(crate) fn issue_batch(&self, reads: &[IoRead], background: bool) {
+        if !background {
+            for read in reads {
+                self.issue(read, false);
+            }
+            return;
+        }
+
+        let mut states = Vec::with_capacity(reads.len());
+        let mut ids = Vec::with_capacity(reads.len());
+        for read in reads {
+            let state = read.cell.state.lock();
+            if matches!(*state, CellState::Unissued) {
+                ids.push(match read.key() {
+                    IoKey::Segment(id) => id,
+                });
+                states.push(state);
+            }
+        }
+
+        let futures = self.source.request_background_batch(&ids);
+        assert_eq!(
+            futures.len(),
+            states.len(),
+            "SegmentSource::request_background_batch must return one future per ID"
+        );
+        for (mut state, future) in states.into_iter().zip(futures) {
+            *state = CellState::Pending {
+                future,
+                wait_started: None,
+            };
+        }
     }
 
     pub(crate) fn nowait_unsupported(&self) -> bool {
@@ -247,6 +288,31 @@ impl IoRead {
         self.cell.required.store(true, Ordering::Release);
     }
 
+    pub(crate) fn is_ready(&self) -> bool {
+        matches!(*self.cell.state.lock(), CellState::Ready(_))
+    }
+
+    pub(crate) fn claim_poll(&self, worker: usize) -> bool {
+        self.cell
+            .poll_owner
+            .compare_exchange(NO_POLL_OWNER, worker, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            || self.cell.poll_owner.load(Ordering::Acquire) == worker
+    }
+
+    pub(crate) fn release_poll(&self, worker: usize) {
+        if self
+            .cell
+            .poll_owner
+            .compare_exchange(worker, NO_POLL_OWNER, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            for waiter in self.cell.waiters.lock().iter() {
+                waiter.wake_by_ref();
+            }
+        }
+    }
+
     /// Subscribe an affinity-owned continuation to this exact cell.
     ///
     /// Returns `true` when the continuation was parked. The state lock closes the completion race:
@@ -256,7 +322,10 @@ impl IoRead {
         if matches!(*state, CellState::Ready(_)) {
             return false;
         }
-        self.cell.waiters.lock().push(waker);
+        let mut waiters = self.cell.waiters.lock();
+        if !waiters.iter().any(|waiter| waiter.will_wake(&waker)) {
+            waiters.push(waker);
+        }
         true
     }
 }
@@ -389,6 +458,32 @@ impl IoPlane {
             .collect()
     }
 
+    /// Clone the reads this morsel has established as required.
+    pub(crate) fn required_reads(&self) -> Vec<IoRead> {
+        self.cells
+            .borrow()
+            .values()
+            .filter(|cell| cell.required.load(Ordering::Acquire))
+            .cloned()
+            .map(|cell| IoRead { cell })
+            .collect()
+    }
+
+    /// Return the segment IDs named by this morsel in stable order.
+    pub(crate) fn segment_ids(&self) -> Vec<u32> {
+        let mut ids = self
+            .cells
+            .borrow()
+            .keys()
+            .map(|key| match key {
+                IoKey::Segment(id) => **id,
+            })
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
     /// Resolve a ticket inline when the source can prove the bytes are immediately available.
     ///
     /// The cell is retained so duplicate uses inside this morsel share the same handle.
@@ -411,7 +506,11 @@ impl IoPlane {
         }
 
         let IoKey::Segment(segment) = cell.key;
+        let queued_for_batch = cell.submitted.load(Ordering::Acquire);
         if self.service.nowait_unsupported() {
+            if queued_for_batch {
+                return Ok(None);
+            }
             let future = self.service.source.request(segment);
             *state = CellState::Pending {
                 future,
@@ -435,6 +534,9 @@ impl IoPlane {
             ReadAtNowait::WouldBlock => {
                 self.service.nowait_support.store(1, Ordering::Release);
                 stats.nowait_misses += 1;
+                if queued_for_batch {
+                    return Ok(None);
+                }
                 let future = self.service.source.request(segment);
                 *state = CellState::Pending {
                     future,
@@ -445,6 +547,9 @@ impl IoPlane {
             ReadAtNowait::Unsupported => {
                 self.service.nowait_support.store(2, Ordering::Release);
                 stats.nowait_unsupported += 1;
+                if queued_for_batch {
+                    return Ok(None);
+                }
                 let future = self.service.source.request(segment);
                 *state = CellState::Pending {
                     future,

@@ -25,9 +25,10 @@ use crate::segments::RequestMetrics;
 pin_project! {
     /// Converts request lifecycle events into batches of physical reads.
     ///
-    /// Polled requests become eligible in registration order. An eligible request may absorb nearby
-    /// registered requests according to `coalesce_window`. Each poll emits every physical read
-    /// currently available, up to `batch_size`; it never waits for a full batch.
+    /// Background requests become eligible in registration order, while promoted demand runs
+    /// first. An eligible request may absorb nearby registered requests according to
+    /// `coalesce_window`. Each poll emits every physical read currently available, up to
+    /// `batch_size`; it never waits for a full batch.
     pub(crate) struct IoRequestStream<S> {
         #[pin]
         events: S,
@@ -115,7 +116,10 @@ where
         }
 
         // Unpolled requests cannot initiate I/O, so a closed source is done once none are eligible.
-        if *this.inner_done && this.state.polled_requests.is_empty() {
+        if *this.inner_done
+            && this.state.promoted_requests.is_empty()
+            && this.state.polled_requests.is_empty()
+        {
             return Poll::Ready(None);
         }
 
@@ -128,6 +132,10 @@ where
 struct State {
     // Maintains the set of pending requests, ordered by insertion.
     requests: BTreeMap<RequestId, ReadRequest>,
+
+    // Requests whose consumers are actively waiting. These are selected before speculative
+    // requests, while retaining registration order within the promoted class.
+    promoted_requests: BTreeMap<RequestId, ReadRequest>,
 
     // Maintains a set of polled requests, ordered by insertion.
     // Note that we intentionally choose a (polled, insertion) priority, such that earlier requests
@@ -147,6 +155,7 @@ impl State {
     fn new(metrics: RequestMetrics, coalesced_buffer_alignment: Alignment) -> Self {
         Self {
             requests: BTreeMap::new(),
+            promoted_requests: BTreeMap::new(),
             polled_requests: BTreeMap::new(),
             requests_by_offset: BTreeSet::new(),
             metrics,
@@ -166,6 +175,16 @@ impl State {
                 self.requests_by_offset.insert((req.offset, req.id));
                 self.requests.insert(req.id, req);
             }
+            ReadEvent::BackgroundRequests(requests) => {
+                for req in requests {
+                    if req.callback.is_canceled() {
+                        trace!(?req, "ReadRequest dropped before background registration");
+                        continue;
+                    }
+                    self.requests_by_offset.insert((req.offset, req.id));
+                    self.polled_requests.insert(req.id, req);
+                }
+            }
             ReadEvent::Polled(req_id) => {
                 if let Some(req) = self.requests.remove(&req_id) {
                     if req.callback.is_canceled() {
@@ -173,6 +192,21 @@ impl State {
                         trace!(?req, "ReadRequest dropped before poll");
                     } else {
                         self.polled_requests.insert(req_id, req);
+                    }
+                }
+            }
+            ReadEvent::Promoted(req_id) => {
+                let req = self
+                    .promoted_requests
+                    .remove(&req_id)
+                    .or_else(|| self.polled_requests.remove(&req_id))
+                    .or_else(|| self.requests.remove(&req_id));
+                if let Some(req) = req {
+                    if req.callback.is_canceled() {
+                        self.requests_by_offset.remove(&(req.offset, req_id));
+                        trace!(?req, "ReadRequest dropped before promotion");
+                    } else {
+                        self.promoted_requests.insert(req_id, req);
                     }
                 }
             }
@@ -184,6 +218,10 @@ impl State {
                 if let Some(req) = self.polled_requests.remove(&req_id) {
                     self.requests_by_offset.remove(&(req.offset, req_id));
                     trace!(?req, "ReadRequest dropped after poll");
+                }
+                if let Some(req) = self.promoted_requests.remove(&req_id) {
+                    self.requests_by_offset.remove(&(req.offset, req_id));
+                    trace!(?req, "ReadRequest dropped after promotion");
                 }
             }
         }
@@ -211,8 +249,16 @@ impl State {
         }
     }
 
-    /// Find the next uncoalesced request, choosing only polled requests.
+    /// Find the next uncoalesced request, choosing promoted requests before background work.
     fn next_uncoalesced(&mut self) -> Option<ReadRequest> {
+        while let Some((req_id, req)) = self.promoted_requests.pop_first() {
+            self.requests_by_offset.remove(&(req.offset, req_id));
+            if req.callback.is_canceled() {
+                trace!("Dropping canceled request");
+                continue;
+            }
+            return Some(req);
+        }
         while let Some((req_id, req)) = self.polled_requests.pop_first() {
             self.requests_by_offset.remove(&(req.offset, req_id));
             if req.callback.is_canceled() {
@@ -267,8 +313,9 @@ impl State {
                 }
 
                 let req = self
-                    .polled_requests
+                    .promoted_requests
                     .get(&req_id)
+                    .or_else(|| self.polled_requests.get(&req_id))
                     .or_else(|| self.requests.get(&req_id))
                     .vortex_expect("Missing request in requests_by_offset");
 
@@ -299,8 +346,9 @@ impl State {
                     current_start = new_start;
                     current_end = new_end;
                     let req = self
-                        .polled_requests
+                        .promoted_requests
                         .remove(&req_id)
+                        .or_else(|| self.polled_requests.remove(&req_id))
                         .or_else(|| self.requests.remove(&req_id))
                         .vortex_expect("Missing request in requests_by_offset");
 
@@ -316,8 +364,9 @@ impl State {
         // Remove any dropped requests
         for (req_offset, req_id) in keys_to_remove {
             self.requests_by_offset.remove(&(req_offset, req_id));
-            self.polled_requests
+            self.promoted_requests
                 .remove(&req_id)
+                .or_else(|| self.polled_requests.remove(&req_id))
                 .or_else(|| self.requests.remove(&req_id));
         }
 
@@ -442,6 +491,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_promotion_runs_before_background_requests() {
+        let (req1, _rx1) = create_request(1, 0, 10);
+        let (req2, _rx2) = create_request(2, 100, 10);
+
+        let events = vec![
+            ReadEvent::Request(req1),
+            ReadEvent::Request(req2),
+            ReadEvent::Polled(1),
+            ReadEvent::Polled(2),
+            ReadEvent::Promoted(2),
+        ];
+
+        let outputs = collect_outputs(events, None).await;
+        assert_eq!(
+            outputs
+                .iter()
+                .map(|request| request.offset())
+                .collect::<Vec<_>>(),
+            [100, 0]
+        );
+    }
+
+    #[tokio::test]
     async fn test_bounded_request_batches() {
         let mut events = Vec::new();
         let mut receivers = Vec::new();
@@ -517,6 +589,31 @@ mod tests {
 
         let outputs = collect_outputs(
             events,
+            Some(CoalesceConfig {
+                distance: 0,
+                max_size: 1024,
+            }),
+        )
+        .await;
+        assert_eq!(outputs.len(), 1);
+
+        match outputs[0].inner() {
+            IoRequestInner::Coalesced(coalesced) => {
+                assert_eq!(*coalesced.range(), 0..30);
+                assert_eq!(coalesced.requests().len(), 3);
+            }
+            _ => panic!("Expected coalesced request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_background_batch_is_coalesced_atomically() {
+        let (req1, _rx1) = create_request(1, 0, 10);
+        let (req2, _rx2) = create_request(2, 10, 10);
+        let (req3, _rx3) = create_request(3, 20, 10);
+
+        let outputs = collect_outputs(
+            vec![ReadEvent::BackgroundRequests(vec![req1, req2, req3])],
             Some(CoalesceConfig {
                 distance: 0,
                 max_size: 1024,

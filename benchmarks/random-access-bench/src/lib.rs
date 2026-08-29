@@ -24,6 +24,7 @@ use vortex_bench::random_access::ArrowIpcRandomAccessor;
 use vortex_bench::random_access::BenchDataset;
 use vortex_bench::random_access::ParquetRandomAccessor;
 use vortex_bench::random_access::RandomAccessor;
+use vortex_bench::random_access::RandomAccessorRet;
 use vortex_bench::random_access::VortexRandomAccessor;
 use vortex_bench::utils::constants::STORAGE_NVME;
 use vortex_bench::v3;
@@ -69,13 +70,15 @@ const POISSON_EXPECTED_COUNT: usize = 100;
 /// Generate indices for the given dataset and access pattern.
 fn generate_indices(dataset: &dyn BenchDataset, pattern: AccessPattern) -> Vec<u64> {
     let row_count = dataset.row_count();
+    let scale = dataset.take_index_scale();
     let mut rng = StdRng::seed_from_u64(42);
 
     match pattern {
         AccessPattern::Correlated => {
             // Pick random cluster starts, then emit CLUSTER_SIZE consecutive indices from each.
-            let mut indices = Vec::with_capacity(NUM_CLUSTERS * CLUSTER_SIZE);
-            for _ in 0..NUM_CLUSTERS {
+            let clusters = NUM_CLUSTERS * scale;
+            let mut indices = Vec::with_capacity(clusters * CLUSTER_SIZE);
+            for _ in 0..clusters {
                 let start = rng.random_range(0..row_count.saturating_sub(CLUSTER_SIZE as u64));
                 for offset in 0..CLUSTER_SIZE as u64 {
                     indices.push(start + offset);
@@ -87,11 +90,12 @@ fn generate_indices(dataset: &dyn BenchDataset, pattern: AccessPattern) -> Vec<u
         AccessPattern::Uniform => {
             // Poisson process: exponential inter-arrival times with rate chosen to yield
             // ~POISSON_EXPECTED_COUNT indices across the dataset.
-            let rate = POISSON_EXPECTED_COUNT as f64 / row_count as f64;
+            let expected_count = POISSON_EXPECTED_COUNT * scale;
+            let rate = expected_count as f64 / row_count as f64;
             // SAFETY: rate is always positive (POISSON_EXPECTED_COUNT > 0, row_count > 0).
             #[expect(clippy::unwrap_used)]
             let exp = Exp::new(rate).unwrap();
-            let mut indices = Vec::with_capacity(POISSON_EXPECTED_COUNT);
+            let mut indices = Vec::with_capacity(expected_count);
             let mut pos = 0.0_f64;
             loop {
                 let gap: f64 = exp.sample(&mut rng);
@@ -153,9 +157,27 @@ async fn benchmark_random_access(
     let mut accessor = open_accessor(dataset, format).await?;
 
     loop {
+        let diagnostics =
+            std::env::var("VORTEX_RANDOM_ACCESS_IO_DIAGNOSTICS").is_ok_and(|value| value == "1");
+        if diagnostics {
+            eprintln!(
+                "random access IO begin: name={measurement_name}, selected_values={}",
+                indices.len()
+            );
+        }
         let start = Instant::now();
         let arr = accessor.take(indices).await?;
         runs.push(start.elapsed());
+        if diagnostics {
+            let output_rows = match &arr {
+                RandomAccessorRet::RecordBatch(batch) => Some(batch.num_rows()),
+                RandomAccessorRet::ArrayRef(array) => Some(array.len()),
+                RandomAccessorRet::Native(_) => None,
+            };
+            let output_rows =
+                output_rows.map_or_else(|| "native".to_string(), |rows| rows.to_string());
+            eprintln!("random access IO end: name={measurement_name}, output_rows={output_rows}");
+        }
         drop(arr);
 
         if overall_start.elapsed() >= time_limit {

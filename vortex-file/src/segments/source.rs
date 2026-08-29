@@ -56,8 +56,12 @@ use crate::read::RequestId;
 pub enum ReadEvent {
     /// A segment read has been registered.
     Request(ReadRequest),
-    /// A registered read future has been polled.
+    /// A complete batch of segment reads has been registered for background execution.
+    BackgroundRequests(Vec<ReadRequest>),
+    /// A registered read is eligible to run as background work.
     Polled(RequestId),
+    /// A demanded read should run before queued background reads.
+    Promoted(RequestId),
     /// A registered read future was dropped before completion.
     Dropped(RequestId),
 }
@@ -71,7 +75,7 @@ pub enum ReadEvent {
 ///
 /// Each read future has four states:
 /// * `registered` - the read future has been created, but not yet polled.
-/// * `requested` - the read future has been polled.
+/// * `requested` - the read is eligible for background I/O or has been demanded.
 /// * `in-flight` - the read request has been sent to the underlying storage system.
 /// * `resolved` - the read future has completed and resolved a result.
 ///
@@ -223,6 +227,14 @@ impl<R: VortexReadAt> ReadDriver<R> {
                 num_active = self.num_active,
                 "submitting positional read batch"
             );
+            for req in &reqs {
+                tracing::trace!(
+                    target: "vortex_file::physical_read",
+                    offset = req.offset(),
+                    length = req.len(),
+                    "submitting physical byte range"
+                );
+            }
 
             let requests = reqs
                 .iter()
@@ -241,9 +253,12 @@ impl<R: VortexReadAt> Stream for ReadDriver<R> {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.as_mut().get_mut();
 
-        // Observe every batch already available so submission can fill all free slots at once.
-        if !this.batches_done {
-            loop {
+        // Keep unsubmitted work in IoRequestStream, where promotion can still reorder it. The
+        // production stream emits one physical request at a time, so this loop removes exactly
+        // the number that can be submitted now and combines them into one read_ranges call.
+        if !this.batches_done && this.num_active < this.concurrency && this.pending.is_empty() {
+            let available = this.concurrency - this.num_active;
+            while this.pending.len() < available {
                 match this.batches.poll_next_unpin(cx) {
                     Poll::Ready(Some(batch)) => this.pending.extend(batch),
                     Poll::Ready(None) => {
@@ -329,7 +344,7 @@ impl FileSegmentSource {
             StreamExt::boxed(recv),
             coalesce_config,
             max_alignment,
-            concurrency,
+            1,
             metrics.clone(),
         )
         .boxed();
@@ -364,16 +379,12 @@ impl FileSegmentSource {
             next_id: Arc::new(AtomicUsize::new(0)),
         }
     }
-}
 
-impl SegmentSource for FileSegmentSource {
-    fn request(&self, id: SegmentId) -> SegmentFuture {
-        // We eagerly register the read request here assuming the behaviour of [`FileSegmentSource`], where
-        // coalescing becomes effective prior to the future being polled.
+    fn prepare_request(&self, id: SegmentId) -> VortexResult<(ReadRequest, SegmentFuture)> {
         let spec = *match self.segments.get(*id as usize) {
             Some(spec) => spec,
             None => {
-                return future::ready(Err(vortex_err!("Missing segment: {}", id))).boxed();
+                return Err(vortex_err!("Missing segment: {}", id));
             }
         };
 
@@ -385,31 +396,80 @@ impl SegmentSource for FileSegmentSource {
 
         let (send, recv) = oneshot::channel();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let event = ReadEvent::Request(ReadRequest {
+        let request = ReadRequest {
             id,
             offset,
             length: length as usize,
             alignment,
             callback: send,
-        });
+        };
 
-        // If we fail to submit the event, we create a future that has failed.
-        if let Err(e) = self.events.unbounded_send(event) {
-            return future::ready(Err(vortex_err!("Failed to submit read request: {e}"))).boxed();
-        }
-
-        let fut = ReadFuture {
+        let future = ReadFuture {
             id,
             recv,
-            polled: false,
+            promoted: false,
             finished: false,
             events: self.events.clone(),
             driver: self.driver.clone(),
             driver_panic: Arc::clone(&self.driver_panic),
-        };
+        }
+        .boxed();
 
-        // One allocation: we only box the returned SegmentFuture, not the inner ReadFuture.
-        fut.boxed()
+        Ok((request, future))
+    }
+
+    fn request_with_priority(&self, id: SegmentId, background: bool) -> SegmentFuture {
+        // We eagerly register the read request here assuming the behaviour of [`FileSegmentSource`], where
+        // coalescing becomes effective prior to the future being polled.
+        let (request, future) = match self.prepare_request(id) {
+            Ok(request) => request,
+            Err(err) => return future::ready(Err(err)).boxed(),
+        };
+        let request_id = request.id;
+
+        if let Err(e) = self.events.unbounded_send(ReadEvent::Request(request)) {
+            return future::ready(Err(vortex_err!("Failed to submit read request: {e}"))).boxed();
+        }
+        if background && let Err(e) = self.events.unbounded_send(ReadEvent::Polled(request_id)) {
+            return future::ready(Err(vortex_err!("Failed to submit background read: {e}")))
+                .boxed();
+        }
+
+        future
+    }
+}
+
+impl SegmentSource for FileSegmentSource {
+    fn request(&self, id: SegmentId) -> SegmentFuture {
+        self.request_with_priority(id, false)
+    }
+
+    fn request_background(&self, id: SegmentId) -> SegmentFuture {
+        self.request_with_priority(id, true)
+    }
+
+    fn request_background_batch(&self, ids: &[SegmentId]) -> Vec<SegmentFuture> {
+        let mut requests = Vec::with_capacity(ids.len());
+        let mut futures = Vec::with_capacity(ids.len());
+        for &id in ids {
+            match self.prepare_request(id) {
+                Ok((request, future)) => {
+                    requests.push(request);
+                    futures.push(future);
+                }
+                Err(err) => futures.push(future::ready(Err(err)).boxed()),
+            }
+        }
+
+        if !requests.is_empty() {
+            // One channel event preserves the scheduler's batch boundary: the driver cannot observe
+            // an eligible member until every request in the batch is in its spatial index.
+            drop(
+                self.events
+                    .unbounded_send(ReadEvent::BackgroundRequests(requests)),
+            );
+        }
+        futures
     }
 
     fn request_nowait(&self, id: SegmentId) -> VortexResult<ReadAtNowait> {
@@ -433,7 +493,7 @@ impl SegmentSource for FileSegmentSource {
 struct ReadFuture {
     id: usize,
     recv: oneshot::Receiver<VortexResult<BufferHandle>>,
-    polled: bool,
+    promoted: bool,
     finished: bool,
     events: mpsc::UnboundedSender<ReadEvent>,
     driver: SharedDriver,
@@ -445,7 +505,7 @@ impl Future for ReadFuture {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.recv.poll_unpin(cx) {
-            // note: we are skipping polled and dropped events for this if the future is ready on
+            // note: we are skipping promotion and dropped events for this if the future is ready on
             //       the first poll, that means this request was completed before it was polled,
             //       as part of a coalesced request.
             Poll::Ready(Ok(result)) => {
@@ -467,10 +527,9 @@ impl Future for ReadFuture {
                 }
                 Poll::Pending => Poll::Pending,
             },
-            Poll::Pending if !self.polled => {
-                self.polled = true;
-                // Notify the I/O stream that this request has been polled.
-                match self.events.unbounded_send(ReadEvent::Polled(self.id)) {
+            Poll::Pending if !self.promoted => {
+                self.promoted = true;
+                match self.events.unbounded_send(ReadEvent::Promoted(self.id)) {
                     Ok(()) => Poll::Pending,
                     Err(e) => Poll::Ready(Err(vortex_err!("ReadRequest dropped by runtime: {e}"))),
                 }

@@ -12,6 +12,7 @@ use random_access_bench::RunConfig;
 use vortex_bench::Format;
 use vortex_bench::datasets::feature_vectors::FeatureVectorsData;
 use vortex_bench::datasets::nested_lists::NestedListsData;
+use vortex_bench::datasets::nested_structs::NestedStructs10xData;
 use vortex_bench::datasets::nested_structs::NestedStructsData;
 use vortex_bench::datasets::taxi_data::TaxiData;
 use vortex_bench::display::DisplayFormat;
@@ -29,6 +30,8 @@ enum DatasetArg {
     NestedLists,
     #[clap(name = "nested-structs")]
     NestedStructs,
+    #[clap(name = "nested-structs-10x")]
+    NestedStructs10x,
 }
 
 impl DatasetArg {
@@ -38,6 +41,7 @@ impl DatasetArg {
             Self::FeatureVectors => Box::new(FeatureVectorsData),
             Self::NestedLists => Box::new(NestedListsData),
             Self::NestedStructs => Box::new(NestedStructsData),
+            Self::NestedStructs10x => Box::new(NestedStructs10xData),
         }
     }
 }

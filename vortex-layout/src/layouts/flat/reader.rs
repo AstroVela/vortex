@@ -70,6 +70,7 @@ impl FlatReader {
         let session = self.session.clone();
         let dtype = self.layout.dtype().clone();
         let array_tree = self.layout.array_tree().cloned();
+        let segment_id = self.layout.segment_id();
         async move {
             let segment = segment_fut.await?;
             let parts = if let Some(array_tree) = array_tree {
@@ -79,9 +80,16 @@ impl FlatReader {
                 // Parse the flatbuffer from the segment itself.
                 SerializedArray::try_from(segment)?
             };
-            parts
+            let array = parts
                 .decode(&dtype, row_count, &ctx, &session)
-                .map_err(Arc::new)
+                .map_err(Arc::new)?;
+            tracing::trace!(
+                target: "vortex_layout::flat_decode",
+                segment = *segment_id,
+                values = array.len(),
+                "decoded flat values"
+            );
+            Ok(array)
         }
         .boxed()
         .shared()
