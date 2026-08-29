@@ -148,6 +148,59 @@ impl<O: OffsetBuilderPType> VarBinBuilder<O> {
         Ok(())
     }
 
+    /// Reserves room for one value of up to `max_len` bytes and returns the uninitialized
+    /// tail of the data buffer to write it into.
+    ///
+    /// This lets a producer that writes into a caller-supplied buffer — an encoder emitting
+    /// into `&mut [MaybeUninit<u8>]`, say — target the builder's data buffer directly instead
+    /// of staging the value elsewhere and copying it in. Write into the returned slice, then
+    /// call [`commit_value`](Self::commit_value) with the number of bytes written.
+    ///
+    /// The returned slice is exactly `max_len` bytes. Nothing is appended until `commit_value`
+    /// runs, so dropping the slice without committing leaves the builder unchanged.
+    ///
+    /// Use [`append_decoded`](Self::append_decoded) instead when the byte total and per-row
+    /// lengths are known before writing, as they are on a decode path. This pair is for the
+    /// opposite case — a compressor whose output length per value is only known once the value
+    /// has been written — so it reserves a worst-case window per value and commits the actual
+    /// length afterwards.
+    #[inline]
+    pub fn value_spare_capacity(&mut self, max_len: usize) -> &mut [MaybeUninit<u8>] {
+        self.data.reserve(max_len);
+        &mut self.data.spare_capacity_mut()[..max_len]
+    }
+
+    /// Commits the first `len` bytes written into [`value_spare_capacity`](Self::value_spare_capacity)
+    /// as one non-null value.
+    ///
+    /// # Safety
+    ///
+    /// The caller must have written `len` initialized bytes into the slice returned by the
+    /// immediately preceding `value_spare_capacity` call, and `len` must not exceed the
+    /// `max_len` passed to it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the resulting end offset does not fit in `O`, matching
+    /// [`append_value`](Self::append_value).
+    #[inline]
+    pub unsafe fn commit_value(&mut self, len: usize) {
+        let end = self.data.len() + len;
+        let offset = O::from(end).unwrap_or_else(|| {
+            vortex_panic!(
+                "Failed to convert sum of {} and {} to offset of type {}",
+                self.data.len(),
+                len,
+                std::any::type_name::<O>()
+            )
+        });
+        // SAFETY: the caller initialized `len` bytes of the reserved spare capacity, so the
+        // data buffer holds `end` initialized bytes.
+        unsafe { self.data.set_len(end) };
+        self.offsets.push(offset);
+        self.validity.append_true();
+    }
+
     /// Appends a null value.
     ///
     /// Unlike [`append_null`](ArrayBuilder::append_null) this does not check that the builder is
@@ -721,6 +774,89 @@ mod tests {
     use crate::expr::stats::Stat;
     use crate::expr::stats::StatsProviderExt;
     use crate::scalar::Scalar;
+
+    /// Writing values through the spare-capacity sink must build the same array as
+    /// appending them, including when a value commits fewer bytes than it reserved
+    /// (the FSST case: compressed output is shorter than the worst-case bound).
+    #[test]
+    fn commit_value_matches_append_value() -> VortexResult<()> {
+        let values: &[&[u8]] = &[b"hello", b"", b"a much longer value than the others", b"x"];
+
+        let mut appended = VarBinBuilder::<i32>::with_capacity(DType::Utf8(Nullable), 0);
+        let mut committed = VarBinBuilder::<i32>::with_capacity(DType::Utf8(Nullable), 0);
+        for value in values {
+            appended.append_value(value);
+            // Reserve a deliberately over-sized window, then commit only what was written.
+            let spare = committed.value_spare_capacity(value.len() * 2 + 8);
+            for (slot, byte) in spare.iter_mut().zip(value.iter()) {
+                slot.write(*byte);
+            }
+            // SAFETY: `value.len()` bytes were initialized above, within the reservation.
+            unsafe { committed.commit_value(value.len()) };
+        }
+
+        let mut ctx = array_session().create_execution_ctx();
+        assert_arrays_eq!(
+            appended.finish_into_varbin(),
+            committed.finish_into_varbin(),
+            &mut ctx
+        );
+        Ok(())
+    }
+
+    /// The sink interleaves with nulls without disturbing offsets or validity.
+    #[test]
+    fn commit_value_interleaves_with_nulls() -> VortexResult<()> {
+        let mut appended = VarBinBuilder::<i32>::with_capacity(DType::Utf8(Nullable), 0);
+        appended.append(Some(b"one"));
+        appended.append(None);
+        appended.append(Some(b"three"));
+
+        let mut sunk = VarBinBuilder::<i32>::with_capacity(DType::Utf8(Nullable), 0);
+        for value in [Some(b"one".as_slice()), None, Some(b"three".as_slice())] {
+            match value {
+                Some(v) => {
+                    let spare = sunk.value_spare_capacity(v.len());
+                    for (slot, byte) in spare.iter_mut().zip(v.iter()) {
+                        slot.write(*byte);
+                    }
+                    // SAFETY: `v.len()` bytes were initialized above.
+                    unsafe { sunk.commit_value(v.len()) };
+                }
+                None => sunk.push_null(),
+            }
+        }
+
+        let mut ctx = array_session().create_execution_ctx();
+        assert_arrays_eq!(
+            appended.finish_into_varbin(),
+            sunk.finish_into_varbin(),
+            &mut ctx
+        );
+        Ok(())
+    }
+
+    /// A reservation that is never committed leaves the builder untouched.
+    #[test]
+    fn value_spare_capacity_without_commit_appends_nothing() -> VortexResult<()> {
+        let mut builder = VarBinBuilder::<i32>::with_capacity(DType::Utf8(Nullable), 0);
+        builder.append_value(b"kept");
+        let spare = builder.value_spare_capacity(64);
+        for slot in spare.iter_mut() {
+            slot.write(b'?');
+        }
+
+        let mut expected = VarBinBuilder::<i32>::with_capacity(DType::Utf8(Nullable), 0);
+        expected.append_value(b"kept");
+
+        let mut ctx = array_session().create_execution_ctx();
+        assert_arrays_eq!(
+            builder.finish_into_varbin(),
+            expected.finish_into_varbin(),
+            &mut ctx
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_builder() {
