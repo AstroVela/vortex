@@ -5,8 +5,6 @@
 
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::LazyLock;
-use std::sync::Weak;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
@@ -29,6 +27,7 @@ use vortex_layout::scan::scan_builder::ScanExecutor;
 use vortex_layout::scan::scan_builder::ScanRequest;
 use vortex_layout::segments::SegmentSource;
 use vortex_mask::AllOr;
+use vortex_mask::Mask;
 use vortex_utils::aliases::hash_map::HashMap;
 
 use crate::MorselScan;
@@ -38,10 +37,7 @@ use crate::driver::SharedMorselWorkerPool;
 use crate::driver::morsels;
 use crate::nodes::ConjunctMode;
 
-type PlanCacheKey = (usize, String, Option<String>, ConjunctMode);
-
-static PLAN_CACHE: LazyLock<Mutex<HashMap<PlanCacheKey, Weak<ExecPlan>>>> =
-    LazyLock::new(Mutex::default);
+type PlanCacheKey = (String, Option<String>, ConjunctMode);
 
 /// Morsel-driven execution backend for a layout scan builder.
 pub struct MorselScanExecutor {
@@ -51,6 +47,7 @@ pub struct MorselScanExecutor {
     conjunct_mode: ConjunctMode,
     threads: usize,
     worker_pool: Option<Arc<SharedMorselWorkerPool>>,
+    plan_cache: Mutex<HashMap<PlanCacheKey, Arc<ExecPlan>>>,
 }
 
 impl MorselScanExecutor {
@@ -63,6 +60,7 @@ impl MorselScanExecutor {
             conjunct_mode: ConjunctMode::Cascade,
             threads: 4,
             worker_pool: None,
+            plan_cache: Mutex::default(),
         }
     }
 
@@ -106,17 +104,15 @@ impl ScanExecutor for MorselScanExecutor {
 
         let projection = unbind(&request.projection)?;
         let filter = request.filter.as_ref().map(unbind).transpose()?;
-        let layout_key = Arc::as_ptr(&self.layout) as *const () as usize;
         let plan_key = (
-            layout_key,
             projection.to_string(),
             filter.as_ref().map(ToString::to_string),
             self.conjunct_mode,
         );
         let plan = {
-            let mut cache = PLAN_CACHE.lock();
-            match cache.get(&plan_key).and_then(Weak::upgrade) {
-                Some(plan) => plan,
+            let mut cache = self.plan_cache.lock();
+            match cache.get(&plan_key) {
+                Some(plan) => Arc::clone(plan),
                 None => {
                     let plan = Arc::new(build_plan(
                         &self.layout,
@@ -124,7 +120,7 @@ impl ScanExecutor for MorselScanExecutor {
                         filter.as_ref(),
                         self.conjunct_mode,
                     )?);
-                    cache.insert(plan_key, Arc::downgrade(&plan));
+                    cache.insert(plan_key, Arc::clone(&plan));
                     plan
                 }
             }
@@ -150,7 +146,7 @@ impl ScanExecutor for MorselScanExecutor {
                     request.layout_reader.pruning_evaluation(
                         &morsel.range,
                         filter,
-                        request.selection.row_mask(&morsel.range).mask().clone(),
+                        morsel.selection_mask.clone(),
                     )
                 })
                 .transpose()?;
@@ -176,9 +172,9 @@ impl ScanExecutor for MorselScanExecutor {
                 let prepared = join_all(work.into_iter().map(
                     |(morsel, pruning, sender)| async move {
                         let ranges = match pruning {
-                            Some(pruning) => {
-                                pruning.await.map(|mask| mask_ranges(&morsel.range, &mask))
-                            }
+                            Some(pruning) => pruning.await.map(|mask| {
+                                pruned_ranges(&morsel.range, &morsel.selection_mask, mask)
+                            }),
                             None => Ok(morsel.selected_ranges),
                         };
                         (ranges, sender)
@@ -309,7 +305,7 @@ impl OutputGroup {
     }
 }
 
-fn mask_ranges(range: &Range<u64>, mask: &vortex_mask::Mask) -> Vec<Range<u64>> {
+fn mask_ranges(range: &Range<u64>, mask: &Mask) -> Vec<Range<u64>> {
     match mask.slices() {
         AllOr::All => vec![range.clone()],
         AllOr::None => Vec::new(),
@@ -318,6 +314,11 @@ fn mask_ranges(range: &Range<u64>, mask: &vortex_mask::Mask) -> Vec<Range<u64>> 
             .map(|&(start, end)| range.start + start as u64..range.start + end as u64)
             .collect(),
     }
+}
+
+fn pruned_ranges(range: &Range<u64>, selection: &Mask, pruning: Mask) -> Vec<Range<u64>> {
+    let mask = pruning & selection;
+    mask_ranges(range, &mask)
 }
 
 fn unbind(expr: &BoundExpression) -> VortexResult<Expression> {
@@ -335,6 +336,7 @@ fn unbind(expr: &BoundExpression) -> VortexResult<Expression> {
 
 struct SelectedMorsel {
     range: Range<u64>,
+    selection_mask: Mask,
     selected_ranges: Vec<Range<u64>>,
 }
 
@@ -352,7 +354,8 @@ fn selected_morsels(
         })
         .filter_map(|range| {
             let mask = selection.row_mask(&range);
-            let selected_ranges = match mask.mask().slices() {
+            let selection_mask = mask.mask().clone();
+            let selected_ranges = match selection_mask.slices() {
                 AllOr::All => vec![range.clone()],
                 AllOr::None => Vec::new(),
                 AllOr::Some(slices) => slices
@@ -362,8 +365,31 @@ fn selected_morsels(
             };
             (!selected_ranges.is_empty()).then_some(SelectedMorsel {
                 range,
+                selection_mask,
                 selected_ranges,
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use vortex_mask::Mask;
+
+    use super::pruned_ranges;
+
+    #[test]
+    fn pruning_cannot_reintroduce_unselected_rows() {
+        let range = 100..108;
+        let selection = Mask::from_indices(8, [0, 2, 5]);
+
+        assert_eq!(
+            pruned_ranges(&range, &selection, Mask::new_true(8)),
+            vec![100..101, 102..103, 105..106]
+        );
+        assert_eq!(
+            pruned_ranges(&range, &selection, Mask::from_indices(8, [2, 3, 5, 7])),
+            vec![102..103, 105..106]
+        );
+    }
 }
