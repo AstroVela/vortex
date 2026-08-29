@@ -12,6 +12,8 @@ ticket while workers service the background IO queues.
 The crate is a prototype and is not part of the public API. It supports flat, chunked and
 struct layouts only; anything else is a build error rather than a fallback.
 
+The source commit and the scoped update procedure are recorded in [UPSTREAM.md](UPSTREAM.md).
+
 Cross-morsel decode reuse comes from **leased shared cells**, not a cache: lease counts are
 computed from the morsel cut before the scan starts, the first morsel to decode a unit publishes
 it, every retiring morsel releases its lease, and the last release drops the array. No budget, no
