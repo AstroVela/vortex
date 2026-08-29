@@ -285,7 +285,7 @@ fn scan_builder_streams_ordered_morsels_and_prunes_zones() -> VortexResult<()> {
         let projection = select(vec!["a"], root()).bind(reader.dtype())?;
         let filter = gt(get_item("a", root()), lit(11_i32)).bind(reader.dtype())?;
         let executor = Arc::new(
-            MorselScanExecutor::new(Arc::clone(&fixture.layout), segments).with_target_rows(8),
+            MorselScanExecutor::new(Arc::clone(&fixture.layout), segments).with_target_rows(16),
         );
 
         let batches = ScanBuilder::new(run_session, reader)
@@ -304,7 +304,7 @@ fn scan_builder_streams_ordered_morsels_and_prunes_zones() -> VortexResult<()> {
     assert_eq!(batches.iter().map(|batch| batch.len()).sum::<usize>(), 4);
     assert_eq!(
         first_data_requests, 0,
-        "the first zoned morsel should be pruned before reading its data segment"
+        "the first zone inside a partially-pruned morsel should not read its data segment"
     );
     Ok(())
 }

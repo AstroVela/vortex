@@ -58,6 +58,7 @@ pub mod workloads;
 pub use build::ExecPlan;
 pub use build::build_plan;
 pub use driver::MorselScan;
+pub use driver::SharedMorselWorkerPool;
 pub use driver::morsels;
 pub use executor::MorselScanExecutor;
 pub use node::ExecCx;

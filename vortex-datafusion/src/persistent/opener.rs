@@ -356,10 +356,10 @@ impl FileOpener for VortexOpener {
                 }
             };
 
-            let morsel_executor = Arc::new(MorselScanExecutor::new(
-                Arc::clone(vxf.footer().layout()),
-                vxf.segment_source(),
-            ));
+            let morsel_executor = Arc::new(
+                MorselScanExecutor::new(Arc::clone(vxf.footer().layout()), vxf.segment_source())
+                    .with_threads(1),
+            );
             let mut scan_builder = ScanBuilder::new(session.clone(), Arc::clone(&layout_reader))
                 .with_executor(morsel_executor);
 

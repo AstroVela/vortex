@@ -28,6 +28,7 @@ use vortex::layout::scan::scan_builder::ScanBuilder;
 use vortex::layout::scan::scan_builder::ScanExecutor;
 use vortex::mask::Mask;
 use vortex_morsel::MorselScanExecutor;
+use vortex_morsel::SharedMorselWorkerPool;
 
 use crate::RUNTIME;
 use crate::SESSION;
@@ -71,6 +72,9 @@ use crate::table_function::convert_result;
 // separate thread.
 
 static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::new);
+static MORSEL_WORKERS: LazyLock<Arc<SharedMorselWorkerPool>> = LazyLock::new(|| {
+    Arc::new(SharedMorselWorkerPool::new(4).vortex_expect("failed to start morsel worker pool"))
+});
 
 fn resolve_filesystem(url: &Url) -> VortexResult<(FileSystemRef, String)> {
     // Compat makes us use tokio which is very bad for local reads on
@@ -109,10 +113,10 @@ impl OpenFileReader {
         let file = fs.open_read(&path).await?;
         let file = open_cached(&SESSION, file, &path, None, &|options| options).await?;
         let reader = file.layout_reader()?;
-        let morsel_executor: Arc<dyn ScanExecutor> = Arc::new(MorselScanExecutor::new(
-            Arc::clone(file.footer().layout()),
-            file.segment_source(),
-        ));
+        let morsel_executor: Arc<dyn ScanExecutor> = Arc::new(
+            MorselScanExecutor::new(Arc::clone(file.footer().layout()), file.segment_source())
+                .with_worker_pool(Arc::clone(&MORSEL_WORKERS)),
+        );
         Ok(OpenFileReader {
             reader,
             morsel_executor,

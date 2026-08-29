@@ -72,7 +72,11 @@ pub struct MorselScan {
     morsels: Arc<[Range<u64>]>,
     threads: usize,
     share_decodes: bool,
+    completion: Option<CompletionSink>,
+    worker_pool: Option<Arc<SharedMorselWorkerPool>>,
 }
+
+type CompletionSink = Arc<dyn Fn(usize, Option<ArrayRef>) + Send + Sync>;
 
 struct WorkerRun {
     plan: Arc<ExecPlan>,
@@ -81,6 +85,7 @@ struct WorkerRun {
     io: Arc<IoService>,
     cells: SharedCells,
     start: Instant,
+    completion: Option<CompletionSink>,
 }
 
 #[derive(Clone, Copy)]
@@ -163,6 +168,39 @@ struct Worker {
 /// A set of ready morsel workers whose lifecycle is outside a timed scan.
 struct MorselWorkerPool {
     workers: Vec<Worker>,
+}
+
+/// A persistent set of morsel workers that can be shared by successive scans.
+///
+/// Runs are serialized because every scan dispatches work to every worker. Keeping the workers
+/// alive removes thread creation and shutdown from short query execution paths.
+pub struct SharedMorselWorkerPool {
+    inner: Mutex<MorselWorkerPool>,
+    threads: usize,
+}
+
+impl SharedMorselWorkerPool {
+    /// Start a persistent pool with the requested number of workers.
+    pub fn new(threads: usize) -> VortexResult<Self> {
+        let threads = threads.max(1);
+        Ok(Self {
+            inner: Mutex::new(MorselWorkerPool::new(threads)?),
+            threads,
+        })
+    }
+
+    /// The number of workers available to each scan.
+    pub fn threads(&self) -> usize {
+        self.threads
+    }
+
+    fn run(
+        &self,
+        scheduler: Arc<Scheduler>,
+        signals: Vec<Receiver<WorkerSignal>>,
+    ) -> VortexResult<Vec<ScanStats>> {
+        self.inner.lock().run(scheduler, signals)
+    }
 }
 
 impl MorselWorkerPool {
@@ -574,7 +612,9 @@ impl Scheduler {
     }
 
     fn complete(&self, index: usize, batch: Option<ArrayRef>) {
-        if let Some(batch) = batch {
+        if let Some(completion) = &self.run.completion {
+            completion(index, batch);
+        } else if let Some(batch) = batch {
             self.results.lock().push((index, batch));
         }
         if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
@@ -770,6 +810,8 @@ impl MorselScan {
             morsels,
             threads: 1,
             share_decodes: true,
+            completion: None,
+            worker_pool: None,
         }
     }
 
@@ -788,6 +830,22 @@ impl MorselScan {
     /// Enable or disable the leased shared decoded cells.
     pub fn with_share_decodes(mut self, share: bool) -> Self {
         self.share_decodes = share;
+        self
+    }
+
+    /// Deliver each completed morsel to a sink instead of collecting all outputs.
+    pub fn with_completion_sink(
+        mut self,
+        completion: impl Fn(usize, Option<ArrayRef>) + Send + Sync + 'static,
+    ) -> Self {
+        self.completion = Some(Arc::new(completion));
+        self
+    }
+
+    /// Drive this scan with a persistent worker pool.
+    pub fn with_worker_pool(mut self, worker_pool: Arc<SharedMorselWorkerPool>) -> Self {
+        self.threads = worker_pool.threads;
+        self.worker_pool = Some(worker_pool);
         self
     }
 
@@ -819,7 +877,7 @@ impl MorselScan {
 
     /// Run the scan with worker creation and shutdown outside the measured interval.
     pub(crate) fn run_timed(&self) -> VortexResult<(Vec<ArrayRef>, ScanStats, Duration)> {
-        let workers = (self.threads > 1)
+        let workers = (self.worker_pool.is_none() && self.threads > 1)
             .then(|| MorselWorkerPool::new(self.threads))
             .transpose()?;
         let start = Instant::now();
@@ -835,12 +893,14 @@ impl MorselScan {
             io: IoService::new(Arc::clone(&self.segments)),
             cells,
             start,
+            completion: self.completion.clone(),
         });
 
         let (scheduler, signals) = Scheduler::new(Arc::clone(&run), self.threads);
-        let worker_stats = match workers.as_ref() {
-            Some(workers) => workers.run(Arc::clone(&scheduler), signals)?,
-            None => vec![scheduler.worker_loop(0, &signals[0])],
+        let worker_stats = match (&self.worker_pool, workers.as_ref()) {
+            (Some(workers), _) => workers.run(Arc::clone(&scheduler), signals)?,
+            (None, Some(workers)) => workers.run(Arc::clone(&scheduler), signals)?,
+            (None, None) => vec![scheduler.worker_loop(0, &signals[0])],
         };
         let (batches, stats) = scheduler.finish(worker_stats)?;
 
