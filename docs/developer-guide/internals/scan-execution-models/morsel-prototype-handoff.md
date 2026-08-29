@@ -155,6 +155,12 @@ Three changes/experiments followed from that evidence:
    producing an index-backed result for projection. A pinned single-core microbenchmark at 131,072
    rows measured 6.415 us before versus 4.567 us after, a 1.40x speedup (28.8% less time) for that
    exact operation. The committed `cached_base/q12_shape` benchmark preserves this case.
+4. Dense bitmap rank intersection now dispatches to an AVX-512 VPOPCNTDQ kernel when the host also
+   has BMI2. It computes eight base-word popcounts together, then uses scalar BMI2 PDEP per lane;
+   x86 has no vector bit-level PDEP. Two pinned release runs measured stable kernel speedups of
+   1.49-1.50x at 65,536 rows, 1.50-1.51x at 131,072 rows, and 1.52-1.53x at 1,048,576 rows. The
+   existing sparse cached-index path remains preferable for Q12's final refinement, so this is a
+   dense-bitmap improvement rather than a claim of an end-to-end Q12 gain.
 
 Lowering the dense-to-sparse expression threshold from 20% to 10% was rejected. It avoided the
 rank-space handoff but forced Q12's final comparison over the full array and regressed three
@@ -388,7 +394,7 @@ across four workers when decoded sharing is disabled.
 | `vortex-morsel/src/driver.rs` | Persistent worker affinity, I/O queues, wakeups, and output ordering |
 | `vortex-morsel/src/harness.rs` | Reusable prepared scan and three-reader harness entry points |
 | `vortex-morsel/src/bin/tpch-eval.rs` | Exactness, persistent benchmark runners, hot/cold backends, counters, and timing matrix |
-| `vortex-mask/src/intersect_by_rank.rs` | Rank-mask representation dispatch and cached-index composition |
+| `vortex-mask/src/intersect_by_rank.rs` | Rank-mask representation dispatch, cached-index composition, and AVX-512 dense-bitmap intersection |
 | `vortex-io/src/read_at.rs` | Reader contract and local/object-store coalescing defaults |
 | `vortex-file/src/read/driver.rs` | Physical request batching and coalescing |
 | `vortex-file/src/segments/source.rs` | File segment futures and background-read preference |

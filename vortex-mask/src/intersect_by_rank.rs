@@ -287,6 +287,77 @@ fn intersect_bit_buffers<D: DepositBits>(
     )
 }
 
+/// Intersect two bitmap-backed masks eight base words at a time.
+///
+/// AVX-512 supplies the eight independent base-word popcounts. Rank extraction still has a
+/// sequential cursor, and x86 has no vector bit-level PDEP, so each lane is deposited with BMI2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512vpopcntdq,bmi2")]
+unsafe fn intersect_bit_buffers_avx512(
+    self_buffer: &BitBuffer,
+    mask_buffer: &BitBuffer,
+    true_count: usize,
+) -> Mask {
+    use std::arch::x86_64::__m512i;
+    use std::arch::x86_64::_mm512_loadu_si512;
+    use std::arch::x86_64::_mm512_popcnt_epi64;
+    use std::arch::x86_64::_mm512_storeu_si512;
+    use std::arch::x86_64::_pdep_u64;
+
+    let len = self_buffer.len();
+    let mut result = BufferMut::with_capacity(len.div_ceil(64));
+    let mut reader = RankBitReader::new(mask_buffer);
+    let self_chunks = self_buffer.chunks();
+    let mut chunks = self_chunks.iter();
+
+    while chunks.len() >= 8 {
+        let base_words = [
+            chunks.next().vortex_expect("eight chunks available"),
+            chunks.next().vortex_expect("eight chunks available"),
+            chunks.next().vortex_expect("eight chunks available"),
+            chunks.next().vortex_expect("eight chunks available"),
+            chunks.next().vortex_expect("eight chunks available"),
+            chunks.next().vortex_expect("eight chunks available"),
+            chunks.next().vortex_expect("eight chunks available"),
+            chunks.next().vortex_expect("eight chunks available"),
+        ];
+
+        // SAFETY: `base_words` contains exactly 64 readable bytes and the intrinsic supports
+        // unaligned input. The target-feature contract guarantees AVX-512 VPOPCNTDQ.
+        let base = unsafe { _mm512_loadu_si512(base_words.as_ptr().cast::<__m512i>()) };
+        let counts = _mm512_popcnt_epi64(base);
+        let mut count_lanes = [0u64; 8];
+        // SAFETY: `count_lanes` contains exactly 64 writable bytes and the intrinsic supports
+        // unaligned output.
+        unsafe { _mm512_storeu_si512(count_lanes.as_mut_ptr().cast::<__m512i>(), counts) };
+
+        let mut output = [0u64; 8];
+        for lane in 0..8 {
+            let count = usize::try_from(count_lanes[lane]).vortex_expect("popcount fits in usize");
+            output[lane] = _pdep_u64(reader.read(count), base_words[lane]);
+        }
+        result.extend_from_slice(&output);
+    }
+
+    for self_chunk in chunks {
+        let self_count = self_chunk.count_ones() as usize;
+        let rank_bits = reader.read(self_count);
+        push_result_chunk::<Bmi2>(&mut result, self_chunk, self_count, rank_bits);
+    }
+
+    if self_chunks.remainder_len() != 0 {
+        let self_chunk = self_chunks.remainder_bits();
+        let self_count = self_chunk.count_ones() as usize;
+        let rank_bits = reader.read(self_count);
+        push_result_chunk::<Bmi2>(&mut result, self_chunk, self_count, rank_bits);
+    }
+
+    mask_from_buffer(
+        BitBuffer::new(result.freeze().into_byte_buffer(), len),
+        true_count,
+    )
+}
+
 fn intersect_bit_buffer_by_rank_indices<D: DepositBits>(
     self_buffer: &BitBuffer,
     mask_indices: &[usize],
@@ -398,17 +469,25 @@ fn intersect_bit_buffers_dispatch(
     mask_buffer: &BitBuffer,
     true_count: usize,
 ) -> Mask {
-    type IntersectBuffers = fn(&BitBuffer, &BitBuffer, usize) -> Mask;
+    type IntersectBuffers = unsafe fn(&BitBuffer, &BitBuffer, usize) -> Mask;
     static KERNEL: CpuKernel<IntersectBuffers> = CpuKernel::new(|| {
         #[cfg(target_arch = "x86_64")]
         {
+            if std::arch::is_x86_feature_detected!("avx512f")
+                && std::arch::is_x86_feature_detected!("avx512vpopcntdq")
+                && std::arch::is_x86_feature_detected!("bmi2")
+            {
+                return intersect_bit_buffers_avx512;
+            }
             if std::arch::is_x86_feature_detected!("bmi2") {
                 return intersect_bit_buffers::<Bmi2>;
             }
         }
         intersect_bit_buffers::<Portable>
     });
-    KERNEL.get()(self_buffer, mask_buffer, true_count)
+    // SAFETY: the selector only returns kernels that are safe or whose required CPU features were
+    // probed before selection.
+    unsafe { KERNEL.get()(self_buffer, mask_buffer, true_count) }
 }
 
 #[inline]
@@ -827,6 +906,35 @@ mod tests {
 
         assert_eq!(base.intersect_by_rank(&rank_from_buffer), expected);
         assert_eq!(base.intersect_by_rank(&rank_from_indices), expected);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx512_bitbuffer_kernel_matches_portable_with_offsets() {
+        use super::Portable;
+        use super::intersect_bit_buffers;
+        use super::intersect_bit_buffers_avx512;
+
+        if !(std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512vpopcntdq")
+            && std::arch::is_x86_feature_detected!("bmi2"))
+        {
+            return;
+        }
+
+        let base_source =
+            BitBuffer::from_iter((0..1_050).map(|i| (i % 3 == 0) ^ (i % 11 == 0) ^ (i % 17 == 0)));
+        let base = base_source.slice(5..1_030);
+        let rank_len = base.true_count();
+        let mut rank_source = vec![false; 3];
+        rank_source.extend((0..rank_len).map(|i| (i % 5 == 0) || (i % 13 == 3)));
+        let rank = BitBuffer::from(rank_source).slice(3..3 + rank_len);
+        let output_count = rank.true_count();
+
+        let expected = intersect_bit_buffers::<Portable>(&base, &rank, output_count);
+        // SAFETY: CPU features were checked above.
+        let actual = unsafe { intersect_bit_buffers_avx512(&base, &rank, output_count) };
+        assert_eq!(actual, expected);
     }
 
     fn expected_intersect_by_rank(base_bits: &[bool], rank_bits: &[bool]) -> Mask {
