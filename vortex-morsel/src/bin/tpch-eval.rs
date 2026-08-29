@@ -19,18 +19,45 @@
 //! Run with:
 //! `cargo run --release -p vortex-morsel --features _test-harness --bin tpch-eval -- [scale]`
 
+use std::fs::File;
+use std::io::Seek;
+use std::io::SeekFrom;
+use std::io::Write;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
+use futures::future::BoxFuture;
+use rustix::fs::Advice;
+use rustix::fs::fadvise;
 use vortex::VortexSessionDefault;
+use vortex::file::SegmentSpec;
+use vortex::file::segments::FileSegmentSource;
+use vortex::file::segments::RequestMetrics;
+use vortex::metrics::DefaultMetricsRegistry;
+use vortex_array::buffer::BufferHandle;
+use vortex_buffer::Alignment;
+use vortex_buffer::ByteBuffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
+use vortex_io::CoalesceConfig;
+use vortex_io::ReadAtNowait;
+use vortex_io::ReadAtRequest;
+use vortex_io::ReadAtStream;
+use vortex_io::VortexReadAt;
+use vortex_io::runtime::Executor;
+use vortex_io::runtime::Handle;
 use vortex_io::runtime::single::block_on;
 use vortex_io::session::RuntimeSessionExt;
+use vortex_io::std_file::FileReadAt;
 use vortex_layout::LayoutRef;
 use vortex_layout::segments::SegmentSource;
-use vortex_morsel::fixtures::write_fixture_no_table;
+use vortex_layout::segments::SharedSegmentSource;
+use vortex_morsel::fixtures::write_streaming_fixture_no_table;
 use vortex_morsel::harness::MorselConfig;
 use vortex_morsel::harness::Query;
 use vortex_morsel::harness::RunOutcome;
@@ -44,7 +71,8 @@ use vortex_morsel::tpch;
 use vortex_session::VortexSession;
 use vortex_utils::parallelism::get_available_parallelism;
 
-const ITERATIONS: usize = 5;
+const DEFAULT_ITERATIONS: usize = 5;
+const PRIMARY_MORSEL_ROWS: u64 = 131_072;
 
 #[derive(Clone, Copy)]
 enum Row {
@@ -82,12 +110,180 @@ impl Row {
 struct Timing {
     label: String,
     median: Duration,
+    min: Duration,
+    max: Duration,
     rows: usize,
     ttfb: Option<Duration>,
     requests: Option<u64>,
+    bytes: Option<u64>,
+    segment_bytes: Option<u64>,
+    waits: Option<u64>,
+    nowait_attempts: Option<u64>,
+    nowait_hits: Option<u64>,
+    nowait_misses: Option<u64>,
+    nowait_unsupported: Option<u64>,
+    wait_time: Option<Duration>,
     decodes: Option<u64>,
     reuses: Option<u64>,
     morsels: Option<u64>,
+    io_uses: Option<u64>,
+    logical_requests: Option<u64>,
+    io_batches: Option<u64>,
+    execute_io_blocks: Option<u64>,
+    morsels_blocked_for_io: Option<u64>,
+    io_uses_per_morsel_min: Option<u64>,
+    io_uses_per_morsel_max: Option<u64>,
+    io_requests_per_morsel_min: Option<u64>,
+    io_requests_per_morsel_max: Option<u64>,
+    io_batches_per_morsel_min: Option<u64>,
+    io_batches_per_morsel_max: Option<u64>,
+    io_blocks_per_morsel_max: Option<u64>,
+}
+
+#[derive(Default)]
+struct PhysicalIoCounters {
+    ranges: AtomicU64,
+    bytes: AtomicU64,
+}
+
+#[derive(Clone)]
+struct CountingReadAt {
+    inner: Arc<dyn VortexReadAt>,
+    counters: Arc<PhysicalIoCounters>,
+    coalesce_override: Option<CoalesceConfig>,
+}
+
+impl VortexReadAt for CountingReadAt {
+    fn uri(&self) -> Option<&Arc<str>> {
+        self.inner.uri()
+    }
+
+    fn coalesce_config(&self) -> Option<CoalesceConfig> {
+        self.coalesce_override
+            .or_else(|| self.inner.coalesce_config())
+    }
+
+    fn concurrency(&self) -> usize {
+        self.inner.concurrency()
+    }
+
+    fn size(&self) -> BoxFuture<'static, VortexResult<u64>> {
+        self.inner.size()
+    }
+
+    fn read_at(
+        &self,
+        offset: u64,
+        length: usize,
+        alignment: Alignment,
+    ) -> BoxFuture<'static, VortexResult<BufferHandle>> {
+        self.counters.ranges.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .bytes
+            .fetch_add(length as u64, Ordering::Relaxed);
+        self.inner.read_at(offset, length, alignment)
+    }
+
+    fn read_ranges(&self, requests: Arc<[ReadAtRequest]>) -> ReadAtStream {
+        self.counters
+            .ranges
+            .fetch_add(requests.len() as u64, Ordering::Relaxed);
+        self.counters.bytes.fetch_add(
+            requests.iter().map(|request| request.length as u64).sum(),
+            Ordering::Relaxed,
+        );
+        self.inner.read_ranges(requests)
+    }
+
+    fn read_at_nowait(
+        &self,
+        offset: u64,
+        length: usize,
+        alignment: Alignment,
+    ) -> VortexResult<ReadAtNowait> {
+        let result = self.inner.read_at_nowait(offset, length, alignment)?;
+        if matches!(result, ReadAtNowait::Ready(_)) {
+            self.counters.ranges.fetch_add(1, Ordering::Relaxed);
+            self.counters
+                .bytes
+                .fetch_add(length as u64, Ordering::Relaxed);
+        }
+        Ok(result)
+    }
+}
+
+struct DiskBackend {
+    path: PathBuf,
+    specs: Arc<[SegmentSpec]>,
+    runtime: Handle,
+    evict_before_run: bool,
+    coalesce_override: Option<CoalesceConfig>,
+}
+
+enum SegmentBackend {
+    Memory(Arc<dyn SegmentSource>),
+    Disk(DiskBackend),
+}
+
+type MeasuredSegmentSource = (Arc<dyn SegmentSource>, Option<Arc<PhysicalIoCounters>>);
+
+impl SegmentBackend {
+    fn source(&self, session: &VortexSession) -> VortexResult<MeasuredSegmentSource> {
+        match self {
+            Self::Memory(source) => Ok((Arc::clone(source), None)),
+            Self::Disk(disk) => {
+                if disk.evict_before_run {
+                    let file = File::open(&disk.path)?;
+                    fadvise(&file, 0, None, Advice::DontNeed).map_err(|err| {
+                        vortex_error::vortex_err!("failed to evict {}: {err}", disk.path.display())
+                    })?;
+                    drop(file);
+                }
+
+                let read: Arc<dyn VortexReadAt> =
+                    Arc::new(FileReadAt::open(&disk.path, session.handle())?);
+                let counters = Arc::new(PhysicalIoCounters::default());
+                let read = CountingReadAt {
+                    inner: read,
+                    counters: Arc::clone(&counters),
+                    coalesce_override: disk.coalesce_override,
+                };
+                let metrics = DefaultMetricsRegistry::default();
+                let source = FileSegmentSource::open(
+                    Arc::clone(&disk.specs),
+                    read,
+                    session.handle(),
+                    RequestMetrics::new(&metrics, vec![]),
+                );
+                let source: Arc<dyn SegmentSource> = Arc::new(SharedSegmentSource::new(source));
+                Ok((source, Some(counters)))
+            }
+        }
+    }
+}
+
+fn write_segment_pack(path: &Path, buffers: &[ByteBuffer]) -> VortexResult<Arc<[SegmentSpec]>> {
+    let mut file = File::create(path)?;
+    let mut offset = 0u64;
+    let mut specs = Vec::with_capacity(buffers.len());
+    for buffer in buffers {
+        let alignment = buffer.alignment();
+        let aligned = offset.next_multiple_of(*alignment as u64);
+        if aligned > offset {
+            file.seek(SeekFrom::Start(aligned))?;
+        }
+        file.write_all(buffer.as_ref())?;
+        let length = u32::try_from(buffer.len())
+            .map_err(|_| vortex_error::vortex_err!("segment exceeds u32 length"))?;
+        specs.push(SegmentSpec {
+            offset: aligned,
+            length,
+            alignment,
+        });
+        offset = aligned + u64::from(length);
+    }
+    file.sync_all()?;
+    Ok(specs.into())
 }
 
 fn main() -> VortexResult<()> {
@@ -95,12 +291,16 @@ fn main() -> VortexResult<()> {
     // serialise what btrblocks produces and the readers can decode it.
     let session = VortexSession::default();
     let threads = get_available_parallelism().unwrap_or(4);
+    let iterations: usize = std::env::var("TPCH_ITERATIONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_ITERATIONS)
+        .max(1);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(threads)
         .enable_all()
         .build()
         .map_err(|err| vortex_error::vortex_err!("failed to build the tokio runtime: {err}"))?;
-
     let scale: f64 = std::env::args()
         .nth(1)
         .and_then(|arg| arg.parse().ok())
@@ -142,11 +342,53 @@ fn main() -> VortexResult<()> {
         let session = session.clone();
         block_on(move |handle| {
             let session = session.with_handle(handle);
-            async move { write_fixture_no_table(columns, strategy, &session).await }
+            async move { write_streaming_fixture_no_table(columns, strategy, &session).await }
         })?
     };
+    // `VortexSession` clones share their extension registry, so the single-thread fixture writer
+    // above temporarily replaces the runtime handle for every clone. Install the persistent Tokio
+    // executor only after the writer has finished.
+    let io_executor: Arc<dyn Executor> = Arc::new(runtime.handle().clone());
+    let session = session.with_handle(Handle::new(Arc::downgrade(&io_executor)));
     let write_elapsed = write_start.elapsed();
     let segments: Arc<dyn SegmentSource> = Arc::clone(&fixture.segments);
+    let disk_path = std::env::var_os("TPCH_DISK_PATH").map(PathBuf::from);
+    let disk_cache_mode = std::env::var("TPCH_CACHE_MODE").unwrap_or_else(|_| "cold".to_string());
+    let evict_before_run = match disk_cache_mode.as_str() {
+        "cold" => true,
+        "hot" => false,
+        mode => vortex_bail!("TPCH_CACHE_MODE must be `cold` or `hot`, got `{mode}`"),
+    };
+    let coalesce_override = match (
+        std::env::var("TPCH_COALESCE_DISTANCE").ok(),
+        std::env::var("TPCH_COALESCE_MAX_BYTES").ok(),
+    ) {
+        (None, None) => None,
+        (distance, max_size) => {
+            let defaults = CoalesceConfig::file();
+            let distance = distance
+                .map(|value| value.parse())
+                .transpose()
+                .map_err(|err| vortex_error::vortex_err!("invalid TPCH_COALESCE_DISTANCE: {err}"))?
+                .unwrap_or(defaults.distance);
+            let max_size = max_size
+                .map(|value| value.parse())
+                .transpose()
+                .map_err(|err| vortex_error::vortex_err!("invalid TPCH_COALESCE_MAX_BYTES: {err}"))?
+                .unwrap_or(defaults.max_size);
+            Some(CoalesceConfig::new(distance, max_size))
+        }
+    };
+    let backend = match disk_path.as_ref() {
+        Some(path) => SegmentBackend::Disk(DiskBackend {
+            path: path.clone(),
+            specs: write_segment_pack(path, &fixture.segment_buffers)?,
+            runtime: Handle::new(Arc::downgrade(&io_executor)),
+            evict_before_run,
+            coalesce_override,
+        }),
+        None => SegmentBackend::Memory(Arc::clone(&segments)),
+    };
 
     let splits = vortex_morsel::build_plan(
         &fixture.layout,
@@ -167,23 +409,95 @@ fn main() -> VortexResult<()> {
          coalesce {block_target}B -> compress -> buffer -> chunk -> flat); no zone maps, no dict \
          layout"
     );
+    let mut segment_lengths: Vec<_> = fixture
+        .segment_buffers
+        .iter()
+        .map(ByteBuffer::len)
+        .collect();
+    segment_lengths.sort_unstable();
+    let segment_payload_bytes: usize = segment_lengths.iter().sum();
+    let segment_min = segment_lengths.first().copied().unwrap_or(0);
+    let segment_median = segment_lengths
+        .get(segment_lengths.len() / 2)
+        .copied()
+        .unwrap_or(0);
+    let segment_max = segment_lengths.last().copied().unwrap_or(0);
     println!(
-        "host: {threads} logical cores; segments in memory; {ITERATIONS} alternating iterations, \
-         median reported"
+        "segment payloads: {} segments, {segment_payload_bytes} bytes total, \
+         {segment_min}/{segment_median}/{segment_max} bytes min/median/max",
+        segment_lengths.len()
     );
+    match disk_path {
+        Some(path) if evict_before_run => println!(
+            "host: {threads} available logical CPUs; file-backed segments at {}; cold cache: \
+             POSIX_FADV_DONTNEED before every run; {iterations} alternating iterations, median \
+             reported",
+            path.display()
+        ),
+        Some(path) => println!(
+            "host: {threads} available logical CPUs; file-backed segments at {}; hot cache: pages retained \
+             after fixture write and correctness warm-up; {iterations} alternating iterations, \
+             median reported",
+            path.display()
+        ),
+        None => println!(
+            "host: {threads} available logical CPUs; segments in memory; one untimed warm-up + \
+             {iterations} grouped iterations per configuration, median reported"
+        ),
+    }
+    println!("both executors use workers prepared outside the timed interval");
+    if let SegmentBackend::Disk(disk) = &backend
+        && let Some(config) = disk.coalesce_override
+    {
+        println!(
+            "file coalescing override: distance={} bytes, max={} bytes",
+            config.distance, config.max_size
+        );
+    }
     println!();
     println!("schema: {}", fixture.layout.dtype());
     println!();
 
-    let queries = tpch::lineitem_queries(fixture.layout.dtype())?;
+    let mut queries = tpch::lineitem_queries(fixture.layout.dtype())?;
+    if let Ok(query) = std::env::var("TPCH_QUERY") {
+        queries.retain(|candidate| candidate.name == query);
+        if queries.is_empty() {
+            vortex_bail!("TPCH_QUERY did not match a scan query: {query}");
+        }
+    }
 
     // Sweep mode: thread-scaling curves and a morsel-size sweep, to decompose *why* the
     // four-thread rows win rather than only reporting that they do.
     if std::env::var("TPCH_SWEEP").is_ok_and(|v| v == "1") {
-        return sweep(&runtime, &session, &fixture, &segments, &queries, threads);
+        if matches!(&backend, SegmentBackend::Disk(_)) {
+            vortex_bail!("TPCH_SWEEP is not supported with TPCH_DISK_PATH yet");
+        }
+        return sweep(
+            &runtime, &session, &fixture, &segments, &queries, threads, iterations,
+        );
     }
 
+    let selected_morsel_rows = std::env::var("TPCH_MORSEL_ROWS")
+        .ok()
+        .map(|value| parse_row_sizes("TPCH_MORSEL_ROWS", &value))
+        .transpose()?
+        .unwrap_or_else(|| vec![PRIMARY_MORSEL_ROWS]);
+    let morsel_only = std::env::var("TPCH_MORSEL_ONLY").is_ok_and(|value| value == "1")
+        || std::env::var_os("TPCH_MORSEL_ROWS").is_some();
     let configs = |threads: usize| {
+        if morsel_only {
+            return selected_morsel_rows
+                .iter()
+                .copied()
+                .map(|morsel_rows| {
+                    Row::Morsel(MorselConfig {
+                        threads,
+                        morsel_rows,
+                        ..Default::default()
+                    })
+                })
+                .collect();
+        }
         vec![
             Row::V1Single,
             Row::V1Tokio(threads),
@@ -202,7 +516,7 @@ fn main() -> VortexResult<()> {
             }),
             Row::Morsel(MorselConfig {
                 threads,
-                morsel_rows: 65_536,
+                morsel_rows: PRIMARY_MORSEL_ROWS,
                 ..Default::default()
             }),
         ]
@@ -211,7 +525,14 @@ fn main() -> VortexResult<()> {
     for query in &queries {
         // Exactness first. Any disagreement aborts: on a real query over real data, a
         // configuration that does not reproduce V1's output exactly is a bug, not a table row.
-        let oracle = run_v1(&session, &fixture.layout, &segments, query)?;
+        let oracle = run_once(
+            &runtime,
+            &session,
+            &fixture.layout,
+            &backend,
+            query,
+            Row::V1Single,
+        )?;
         let dtype = query
             .projection
             .bind(fixture.layout.dtype())?
@@ -219,7 +540,7 @@ fn main() -> VortexResult<()> {
             .clone();
 
         for row in configs(threads) {
-            let outcome = run_once(&runtime, &session, &fixture.layout, &segments, query, row)?;
+            let outcome = run_once(&runtime, &session, &fixture.layout, &backend, query, row)?;
             if outcome.rows != oracle.rows {
                 vortex_bail!(
                     "{} / {}: row count {} != V1's {}",
@@ -236,16 +557,34 @@ fn main() -> VortexResult<()> {
 
         let validated = configs(threads);
         let mut samples: Vec<Vec<RunOutcome>> = validated.iter().map(|_| Vec::new()).collect();
-        for _ in 0..ITERATIONS {
+        if matches!(&backend, SegmentBackend::Memory(_)) {
             for (idx, row) in validated.iter().enumerate() {
-                samples[idx].push(run_once(
+                // A serial configuration otherwise leaves most cores idle immediately before the
+                // next parallel configuration. Warm and sample each in-memory executor as an
+                // independent steady-state compute benchmark.
+                drop(run_once(
                     &runtime,
                     &session,
                     &fixture.layout,
-                    &segments,
+                    &backend,
                     query,
                     *row,
                 )?);
+                for _ in 0..iterations {
+                    let mut outcome =
+                        run_once(&runtime, &session, &fixture.layout, &backend, query, *row)?;
+                    outcome.batches.clear();
+                    samples[idx].push(outcome);
+                }
+            }
+        } else {
+            for _ in 0..iterations {
+                for (idx, row) in validated.iter().enumerate() {
+                    let mut outcome =
+                        run_once(&runtime, &session, &fixture.layout, &backend, query, *row)?;
+                    outcome.batches.clear();
+                    samples[idx].push(outcome);
+                }
             }
         }
 
@@ -254,16 +593,62 @@ fn main() -> VortexResult<()> {
             .zip(samples)
             .map(|(row, mut runs)| {
                 runs.sort_by_key(|run| run.wall);
+                let min = runs.first().map(|run| run.wall).unwrap_or_default();
+                let max = runs.last().map(|run| run.wall).unwrap_or_default();
                 let median = &runs[runs.len() / 2];
                 Timing {
                     label: row.label(),
                     median: median.wall,
+                    min,
+                    max,
                     rows: median.rows,
                     ttfb: median.time_to_first_batch,
-                    requests: median.stats.as_ref().map(|s| s.io_requests),
+                    requests: median
+                        .source_io_requests
+                        .or_else(|| median.stats.as_ref().map(|s| s.io_requests)),
+                    bytes: median
+                        .source_io_bytes
+                        .or_else(|| median.stats.as_ref().map(|s| s.io_bytes)),
+                    segment_bytes: median.stats.as_ref().map(|s| s.io_bytes),
+                    waits: median.stats.as_ref().map(|s| s.io_waits),
+                    nowait_attempts: median.stats.as_ref().map(|s| s.nowait_attempts),
+                    nowait_hits: median.stats.as_ref().map(|s| s.nowait_hits),
+                    nowait_misses: median.stats.as_ref().map(|s| s.nowait_misses),
+                    nowait_unsupported: median.stats.as_ref().map(|s| s.nowait_unsupported),
+                    wait_time: median.stats.as_ref().map(|s| s.io_wait_time),
                     decodes: median.stats.as_ref().map(|s| s.decodes),
                     reuses: median.stats.as_ref().map(|s| s.decode_reuses),
                     morsels: median.stats.as_ref().map(|s| s.morsels),
+                    io_uses: median.stats.as_ref().map(|s| s.io_uses),
+                    logical_requests: median.stats.as_ref().map(|s| s.io_requests),
+                    io_batches: median.stats.as_ref().map(|s| s.io_batches),
+                    execute_io_blocks: median.stats.as_ref().map(|s| s.execute_io_blocks),
+                    morsels_blocked_for_io: median.stats.as_ref().map(|s| s.morsels_blocked_for_io),
+                    io_uses_per_morsel_min: median
+                        .stats
+                        .as_ref()
+                        .and_then(|s| s.io_uses_per_morsel_min),
+                    io_uses_per_morsel_max: median.stats.as_ref().map(|s| s.io_uses_per_morsel_max),
+                    io_requests_per_morsel_min: median
+                        .stats
+                        .as_ref()
+                        .and_then(|s| s.io_requests_per_morsel_min),
+                    io_requests_per_morsel_max: median
+                        .stats
+                        .as_ref()
+                        .map(|s| s.io_requests_per_morsel_max),
+                    io_batches_per_morsel_min: median
+                        .stats
+                        .as_ref()
+                        .and_then(|s| s.io_batches_per_morsel_min),
+                    io_batches_per_morsel_max: median
+                        .stats
+                        .as_ref()
+                        .map(|s| s.io_batches_per_morsel_max),
+                    io_blocks_per_morsel_max: median
+                        .stats
+                        .as_ref()
+                        .map(|s| s.io_blocks_per_morsel_max),
                 }
             })
             .collect();
@@ -272,6 +657,7 @@ fn main() -> VortexResult<()> {
     }
 
     println!("Every configuration reproduced V1's dtype, row count and ordered content exactly.");
+    drop(io_executor);
     Ok(())
 }
 
@@ -280,37 +666,56 @@ fn queries_probe() -> vortex_array::expr::Expression {
     vortex_array::expr::root()
 }
 
-/// Decompose the four-thread win, and probe oversubscription.
+fn parse_row_sizes(name: &str, value: &str) -> VortexResult<Vec<u64>> {
+    let sizes: Vec<u64> = value
+        .split(',')
+        .map(str::trim)
+        .map(|size| {
+            size.parse::<u64>()
+                .map_err(|err| vortex_error::vortex_err!("invalid {name} value `{size}`: {err}"))
+        })
+        .collect::<VortexResult<_>>()?;
+    if sizes.is_empty() || sizes.contains(&0) {
+        vortex_bail!("{name} must contain positive comma-separated row counts");
+    }
+    Ok(sizes)
+}
+
+/// Sweep worker counts relative to the process's available logical CPUs.
 ///
-/// This host reports `Thread(s) per core: 1`, so physical and logical cores are the same number
-/// and "one driving thread per physical core" is exactly the `D x4` row. What that leaves open is
-/// whether going *past* one thread per core helps. It matters because the two executors sit at
-/// very different points already: the morsel driver runs one morsel per thread, so four threads
-/// means four concurrent units, while V1 spawns `concurrency` split tasks per worker (default 4),
-/// so four workers means sixteen concurrent units on four threads. V1 is already heavily
-/// oversubscribed at the task level; the morsel driver is not oversubscribed at all.
+/// CPU affinity determines whether `available_cpus` represents physical cores, SMT siblings, or a
+/// mixture. Record the host topology and affinity mask beside a sweep before interpreting a row as
+/// one worker per physical core. V1 also spawns `concurrency` split tasks per runtime worker, while
+/// the morsel driver has one affinity-owned active morsel per worker.
 fn sweep(
     runtime: &tokio::runtime::Runtime,
     session: &VortexSession,
     fixture: &vortex_morsel::fixtures::Fixture,
     segments: &Arc<dyn SegmentSource>,
     queries: &[Query],
-    cores: usize,
+    available_cpus: usize,
+    iterations: usize,
 ) -> VortexResult<()> {
-    println!("## Driving threads vs cores ({cores} physical cores, 1 thread per core)");
+    println!("## Driving threads vs available CPUs ({available_cpus} logical CPUs)");
     println!();
     println!(
-        "Morsel driver: one morsel in flight per thread. `x{cores}` is one thread per physical \
-         core; beyond that the host is oversubscribed."
+        "Morsel driver: one affinity-owned active morsel per worker. Interpret \
+         `x{available_cpus}` using the process affinity mask and host CPU topology."
     );
     println!();
 
-    let thread_counts = [1usize, 2, cores, cores * 2, cores * 4];
+    let thread_counts = [
+        1usize,
+        2,
+        available_cpus,
+        available_cpus * 2,
+        available_cpus * 4,
+    ];
     print!("| query |");
     for n in &thread_counts {
         print!(" D x{n} |");
     }
-    println!(" best | vs D x{cores} |");
+    println!(" best | vs D x{available_cpus} |");
     print!("|---|");
     for _ in 0..thread_counts.len() + 2 {
         print!("--:|");
@@ -320,7 +725,7 @@ fn sweep(
     for query in queries {
         let mut walls = Vec::new();
         for &n in &thread_counts {
-            walls.push(median(ITERATIONS, || {
+            walls.push(median(iterations, || {
                 run_morsel(
                     session,
                     &fixture.layout,
@@ -333,13 +738,13 @@ fn sweep(
                 )
             })?);
         }
-        let at_cores = walls[2];
+        let at_available_cpus = walls[2];
         let best = walls
             .iter()
             .enumerate()
             .min_by_key(|(_, w)| **w)
             .map(|(idx, w)| (thread_counts[idx], *w))
-            .unwrap_or((cores, at_cores));
+            .unwrap_or((available_cpus, at_available_cpus));
         print!("| {} |", query.name);
         for wall in &walls {
             print!(" {} |", millis(*wall));
@@ -347,12 +752,12 @@ fn sweep(
         println!(
             " x{} | {:.2}x |",
             best.0,
-            best.1.as_secs_f64() / at_cores.as_secs_f64()
+            best.1.as_secs_f64() / at_available_cpus.as_secs_f64()
         );
     }
     println!();
 
-    println!("## V1 concurrent units: {cores} workers x per-worker split concurrency");
+    println!("## V1 concurrent units: {available_cpus} workers x per-worker split concurrency");
     println!();
     println!(
         "V1's parallelism is workers x concurrency. This sweeps the second factor to check the \
@@ -361,7 +766,7 @@ fn sweep(
     println!();
     print!("| query | V1 x1 |");
     for c in [1usize, 2, 4, 8, 16] {
-        print!(" tok{cores} c={c} |");
+        print!(" tok{available_cpus} c={c} |");
     }
     println!(" best |");
     print!("|---|--:|");
@@ -371,12 +776,12 @@ fn sweep(
     println!();
 
     for query in queries {
-        let single = median(ITERATIONS, || {
+        let single = median(iterations, || {
             run_v1(session, &fixture.layout, segments, query)
         })?;
         let mut walls = Vec::new();
         for c in [1usize, 2, 4, 8, 16] {
-            walls.push(median(ITERATIONS, || {
+            walls.push(median(iterations, || {
                 run_v1_tokio_with(runtime, session, &fixture.layout, segments, query, Some(c))
             })?);
         }
@@ -389,16 +794,16 @@ fn sweep(
     }
     println!();
 
-    println!("## Morsel size at {cores} threads");
+    println!("## Morsel size at {available_cpus} threads");
     println!();
-    println!("| query | morsels@splits | splits | 16k | 64k | 256k | 1M |");
+    println!("| query | morsels@splits | splits | 16k | 128k | 256k | 1M |");
     println!("|---|--:|--:|--:|--:|--:|--:|");
     for query in queries {
         let mut cells = Vec::new();
         let mut morsel_count = 0;
-        for size in [0u64, 16_384, 65_536, 262_144, 1_048_576] {
+        for size in [0u64, 16_384, PRIMARY_MORSEL_ROWS, 262_144, 1_048_576] {
             let config = MorselConfig {
-                threads: cores,
+                threads: available_cpus,
                 morsel_rows: size,
                 ..Default::default()
             };
@@ -409,7 +814,7 @@ fn sweep(
                     .map(|s| s.morsels)
                     .unwrap_or(0);
             }
-            let wall = median(ITERATIONS, || {
+            let wall = median(iterations, || {
                 run_morsel(session, &fixture.layout, segments, query, config)
             })?;
             cells.push(millis(wall));
@@ -441,15 +846,26 @@ fn run_once(
     runtime: &tokio::runtime::Runtime,
     session: &VortexSession,
     layout: &LayoutRef,
-    segments: &Arc<dyn SegmentSource>,
+    backend: &SegmentBackend,
     query: &Query,
     row: Row,
 ) -> VortexResult<RunOutcome> {
-    match row {
-        Row::V1Single => run_v1(session, layout, segments, query),
-        Row::V1Tokio(_) => run_v1_tokio(runtime, session, layout, segments, query),
-        Row::Morsel(config) => run_morsel(session, layout, segments, query, config),
+    let run_session = match backend {
+        SegmentBackend::Memory(_) => session.clone(),
+        SegmentBackend::Disk(disk) => session.clone().with_handle(disk.runtime.clone()),
+    };
+    let (segments, counters) = backend.source(&run_session)?;
+
+    let mut outcome = match row {
+        Row::V1Single => run_v1(&run_session, layout, &segments, query),
+        Row::V1Tokio(_) => run_v1_tokio(runtime, &run_session, layout, &segments, query),
+        Row::Morsel(config) => run_morsel(&run_session, layout, &segments, query, config),
+    }?;
+    if let Some(counters) = counters {
+        outcome.source_io_requests = Some(counters.ranges.load(Ordering::Relaxed));
+        outcome.source_io_bytes = Some(counters.bytes.load(Ordering::Relaxed));
     }
+    Ok(outcome)
 }
 
 fn report(query: &Query, timings: &[Timing], total_rows: u64) {
@@ -470,8 +886,12 @@ fn report(query: &Query, timings: &[Timing], total_rows: u64) {
         selectivity
     );
     println!();
-    println!("| executor | wall | vs V1 | ttfb | morsels | reqs | decodes | reuses |");
-    println!("|---|--:|--:|--:|--:|--:|--:|--:|");
+    println!(
+        "| executor | wall | vs V1 | ttfb | morsels | named IO/morsel | new requests/morsel | IO \
+         batches/morsel | blocked/morsel | physical reads | physical bytes | segment bytes | \
+         nowait hit/miss/unsupported | pending polls | async wait | decodes | reuses |"
+    );
+    println!("|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|");
     for timing in timings {
         let ratio = if baseline.is_zero() {
             "—".to_string()
@@ -482,13 +902,45 @@ fn report(query: &Query, timings: &[Timing], total_rows: u64) {
             )
         };
         println!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             timing.label,
-            millis(timing.median),
+            timing_range(timing.median, timing.min, timing.max),
             ratio,
             timing.ttfb.map(millis).unwrap_or_else(|| "—".to_string()),
             opt(timing.morsels),
+            per_morsel(
+                timing.io_uses,
+                timing.morsels,
+                timing.io_uses_per_morsel_min,
+                timing.io_uses_per_morsel_max,
+            ),
+            per_morsel(
+                timing.logical_requests,
+                timing.morsels,
+                timing.io_requests_per_morsel_min,
+                timing.io_requests_per_morsel_max,
+            ),
+            per_morsel(
+                timing.io_batches,
+                timing.morsels,
+                timing.io_batches_per_morsel_min,
+                timing.io_batches_per_morsel_max,
+            ),
+            blocked_per_morsel(
+                timing.execute_io_blocks,
+                timing.morsels,
+                timing.morsels_blocked_for_io,
+                timing.io_blocks_per_morsel_max,
+            ),
             opt(timing.requests),
+            opt(timing.bytes),
+            opt(timing.segment_bytes),
+            nowait(timing),
+            opt(timing.waits),
+            timing
+                .wait_time
+                .map(millis)
+                .unwrap_or_else(|| "—".to_string()),
             opt(timing.decodes),
             opt(timing.reuses),
         );
@@ -496,10 +948,58 @@ fn report(query: &Query, timings: &[Timing], total_rows: u64) {
     println!();
 }
 
+fn nowait(timing: &Timing) -> String {
+    match (
+        timing.nowait_attempts,
+        timing.nowait_hits,
+        timing.nowait_misses,
+        timing.nowait_unsupported,
+    ) {
+        (Some(0), ..) | (None, ..) => "—".to_string(),
+        (Some(_), Some(hits), Some(misses), Some(unsupported)) => {
+            format!("{hits}/{misses}/{unsupported}")
+        }
+        _ => "—".to_string(),
+    }
+}
+
 fn millis(duration: Duration) -> String {
     format!("{:.3}ms", duration.as_secs_f64() * 1000.0)
 }
 
+fn timing_range(median: Duration, min: Duration, max: Duration) -> String {
+    format!("{} [{},{}]", millis(median), millis(min), millis(max))
+}
+
 fn opt(value: Option<u64>) -> String {
     value.map(|v| v.to_string()).unwrap_or_else(|| "—".into())
+}
+
+fn per_morsel(
+    total: Option<u64>,
+    morsels: Option<u64>,
+    min: Option<u64>,
+    max: Option<u64>,
+) -> String {
+    match (total, morsels, min, max) {
+        (Some(total), Some(morsels), Some(min), Some(max)) if morsels > 0 => {
+            format!("{:.2} [{min},{max}]", total as f64 / morsels as f64)
+        }
+        _ => "—".to_string(),
+    }
+}
+
+fn blocked_per_morsel(
+    total: Option<u64>,
+    morsels: Option<u64>,
+    blocked_morsels: Option<u64>,
+    max: Option<u64>,
+) -> String {
+    match (total, morsels, blocked_morsels, max) {
+        (Some(total), Some(morsels), Some(blocked), Some(max)) if morsels > 0 => format!(
+            "{:.2} ({blocked}/{morsels}, max {max})",
+            total as f64 / morsels as f64
+        ),
+        _ => "—".to_string(),
+    }
 }

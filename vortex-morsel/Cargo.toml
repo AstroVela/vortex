@@ -29,6 +29,7 @@ _test-harness = [
     "dep:tpchgen",
     "dep:tpchgen-arrow",
     "dep:vortex",
+    "dep:rustix",
 ]
 
 [dependencies]
@@ -41,6 +42,7 @@ vortex-session = { workspace = true }
 vortex-utils = { workspace = true }
 
 futures = { workspace = true }
+crossbeam-channel = { workspace = true }
 vortex-io = { workspace = true, optional = true }
 vortex-btrblocks = { workspace = true, optional = true }
 vortex-arrow = { workspace = true, optional = true }
@@ -52,6 +54,7 @@ vortex = { workspace = true, optional = true, features = ["files"] }
 itertools = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
+rustix = { workspace = true, features = ["fs"], optional = true }
 
 [dev-dependencies]
 vortex-array = { workspace = true, features = ["_test-harness"] }

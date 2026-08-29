@@ -3,9 +3,9 @@
 
 //! Building an [`ExecPlan`] from a layout tree and a query.
 //!
-//! The plan is the immutable half of the design's split: one blueprint per scan, shared by every
-//! thread. Each driving thread instantiates it into its own [`Arena`] of mutable node state, so
-//! nothing on the hot path is shared and nothing is allocated per morsel.
+//! The plan is the immutable half of the design's split: one blueprint per scan. Each worker
+//! instantiates one thread-local [`Arena`], whose node state survives IO suspension and is recycled
+//! across that worker's morsels without crossing a thread boundary.
 //!
 //! Only the layouts and expression shapes named in the P1 scope are accepted. Anything else is a
 //! build error rather than a silent fallback, so an unsupported query can never be timed as if
@@ -100,6 +100,16 @@ impl ExecPlan {
         self.row_count
     }
 
+    pub(crate) fn has_filter(&self) -> bool {
+        matches!(
+            &self.nodes[self.root as usize],
+            NodeSpec::Filter {
+                predicate: Some(_),
+                ..
+            }
+        )
+    }
+
     /// The union of every column's chunk boundaries, in root coordinates.
     pub fn natural_splits(&self) -> &[u64] {
         &self.natural_splits
@@ -124,6 +134,38 @@ impl ExecPlan {
         })
     }
 
+    /// Stored units to expose to the shared I/O service before workers start.
+    ///
+    /// An unfiltered scan can expose its complete exact set. A filtered scan exposes only the
+    /// initial one-morsel-per-worker window, matching the speculative depth that worker-local
+    /// planning would immediately submit anyway.
+    pub(crate) fn initial_lookahead_keys(
+        &self,
+        morsels: &[Range<u64>],
+        workers: usize,
+    ) -> Vec<IoKey> {
+        let NodeSpec::Filter { predicate, .. } = &self.nodes[self.root as usize] else {
+            unreachable!("the plan root is always a filter node")
+        };
+        let initial_range = if predicate.is_some() {
+            let active = &morsels[..morsels.len().min(workers)];
+            let Some((first, last)) = active.first().zip(active.last()) else {
+                return Vec::new();
+            };
+            Some(first.start..last.end)
+        } else {
+            None
+        };
+        self.flat_uses()
+            .filter(|(_, range)| {
+                initial_range
+                    .as_ref()
+                    .is_none_or(|initial| range.start < initial.end && initial.start < range.end)
+            })
+            .map(|(key, _)| key)
+            .collect()
+    }
+
     /// The number of nodes in the plan.
     pub fn len(&self) -> usize {
         self.nodes.len()
@@ -134,7 +176,7 @@ impl ExecPlan {
         self.nodes.is_empty()
     }
 
-    /// Instantiate one thread's mutable arena from this blueprint.
+    /// Instantiate one worker's mutable arena from this blueprint.
     pub fn instantiate(&self) -> Arena {
         let nodes: Vec<Box<dyn ExecNode>> = self
             .nodes

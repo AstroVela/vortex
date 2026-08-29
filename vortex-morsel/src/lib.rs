@@ -14,26 +14,29 @@
 //!
 //! * [`ExecNode::next_plan`] — planning. A node *names* the IO it will need by registering
 //!   [`IoUse`](io::IoUse)s against the [`IoPlane`](io::IoPlane), which hands back tickets. Nodes
-//!   never perform IO themselves. Planning is budget-bounded and resumable: a node that exhausts
+//!   do not read during planning. Planning is budget-bounded and resumable: a node that exhausts
 //!   its quantum yields [`PlanItem::Plan`] and resumes from its own cursor on the next call.
-//! * [`ExecNode::execute`] — value production. A node may only wait on tickets its own planning
-//!   stream already emitted; it consumes the cell behind a ticket and produces
-//!   [`ValueBatch`]es covering a dense range of input rows.
+//! * [`ExecNode::execute`] — value production. When a named required cell is still unissued,
+//!   [`ExecCx::ready`](node::ExecCx::ready) may attempt one source-provided read guaranteed not to
+//!   wait on storage (Linux files use `preadv2(RWF_NOWAIT)`). A hit is consumed inline. A miss
+//!   suspends on the exact ticket and the scheduler submits its batch to the shared urgent IO
+//!   queue. Execution never polls a background future or waits for IO on the worker thread.
 //!
 //! Compared to the V1 `LayoutReader` path this executor differs in two measurable ways:
 //!
-//! 1. There is no future per evaluation. A morsel is driven inline, depth-first, on one thread.
-//! 2. Morsels are self-scheduled off one atomic cursor; emission order is restored by index.
+//! 1. There is no async task per evaluation. Planning, IO polling, and execution continuations
+//!    share one bounded worker pool; pending IO never parks a worker.
+//! 2. Each worker owns one arena and one active morsel. Arenas never migrate, and emission order
+//!    is restored by morsel index.
 //!
-//! Retention is **derived from demand, never from a budget**. There is no decoded-array cache:
-//! the only cross-morsel state is the leased shared cell ([`cells::SharedCells`]), where a
-//! decoded chunk lives exactly while some not-yet-retired morsel holds a lease on it — counts
-//! computed from the morsel cut before the scan starts — and is dropped at the last release.
-//! With sharing disabled the executor holds nothing across evaluations at all, matching the V1
-//! `LayoutReader` state for state; that configuration is the fairness row of the eval.
+//! Raw request cells are shared for the lifetime of a scan, deduplicating both pending and
+//! completed segment reads. Decoded chunks use leased shared cells ([`cells::SharedCells`]): a
+//! decoded chunk lives exactly while some not-yet-retired morsel holds a lease computed from the
+//! morsel cut, and is dropped at the last release. Decoded sharing can be disabled independently
+//! as a differential-test and benchmark mode.
 //!
 //! Only the FLAT, CHUNKED and STRUCT layout nodes are supported, plus the FILTER and
-//! CONJUNCT_PARALLEL operators. Anything else is rejected at build time by [`build::build_plan`].
+//! CONJUNCT operators. Anything else is rejected at build time by [`build::build_plan`].
 
 pub mod build;
 pub mod cells;

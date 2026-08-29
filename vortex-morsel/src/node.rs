@@ -17,6 +17,7 @@ use crate::cells::SharedCells;
 use crate::io::IoBatch;
 use crate::io::IoKey;
 use crate::io::IoPlane;
+use crate::io::IoPriority;
 use crate::io::IoTicket;
 use crate::stats::ScanStats;
 
@@ -70,7 +71,7 @@ pub enum PlanItem {
 pub enum PlanPoll {
     /// An item was produced.
     Item(PlanItem),
-    /// Planning is parked on the given waits.
+    /// Planning is suspended on the given waits; no worker thread is parked.
     Blocked(WaitSet),
     /// Planning has finished. This forfeits any further refinement of this node's IO.
     Complete,
@@ -80,11 +81,21 @@ pub enum PlanPoll {
 pub enum ExecPoll {
     /// A value covering a dense input row range.
     Value(ValueBatch),
-    /// Execution is parked on the given waits.
+    /// Execution is suspended on the given waits; no worker thread is parked.
     Blocked(WaitSet),
     /// The node made progress but has not produced a value yet.
     Yield(Progress),
     /// The node has produced everything it will produce.
+    Done,
+}
+
+/// Result of advancing a child from inside its parent node.
+pub enum ChildPoll<T> {
+    /// The child produced the requested value.
+    Value(T),
+    /// The child is suspended on exact external dependencies.
+    Blocked(WaitSet),
+    /// The child has no more values.
     Done,
 }
 
@@ -136,8 +147,8 @@ impl FromIterator<Wait> for WaitSet {
 
 /// A stateful, per-morsel execution node.
 ///
-/// Nodes are arena-allocated once per driving thread and reset per morsel, so `&mut self` state
-/// survives a suspension without allocating a task.
+/// Nodes are arena-allocated once per worker and reset when that worker's arena is recycled to
+/// another morsel. `&mut self` state survives suspension and always resumes on its owning worker.
 pub trait ExecNode: Send {
     /// Reset this node for a new morsel covering `range` (in this node's local coordinates).
     fn reset(&mut self, range: Range<u64>);
@@ -149,6 +160,11 @@ pub trait ExecNode: Send {
     fn next_plan(&mut self, cx: &mut PlanCx<'_>) -> VortexResult<PlanPoll>;
 
     /// Advance this node's execution, producing values under the demand in `cx`.
+    ///
+    /// This method may use [`ExecCx::ready`] to attempt an inline read that the source guarantees
+    /// will not wait on storage. It must not perform blocking IO, poll background futures,
+    /// synchronously transfer device data, or wait for an external resource. A missing dependency
+    /// must return [`ExecPoll::Blocked`] so the scheduler can resume the continuation later.
     fn execute(&mut self, cx: &mut ExecCx<'_>) -> VortexResult<ExecPoll>;
 
     /// Release anything this node holds for the finished morsel.
@@ -158,7 +174,7 @@ pub trait ExecNode: Send {
     fn children(&self) -> &[NodeId];
 }
 
-/// An arena of nodes, owned by one driving thread and reused across morsels.
+/// An arena of nodes, owned by one worker and recycled across its morsels.
 pub struct Arena {
     nodes: Vec<Option<Box<dyn ExecNode>>>,
 }
@@ -212,6 +228,7 @@ pub struct PlanCx<'a> {
     stats: &'a mut ScanStats,
     /// Remaining IO uses this planning quantum may emit before the node should yield.
     budget: u32,
+    priority: IoPriority,
 }
 
 impl<'a> PlanCx<'a> {
@@ -239,7 +256,21 @@ impl<'a> PlanCx<'a> {
             .budget
             .saturating_sub(u32::try_from(batch.uses().len()).unwrap_or(u32::MAX));
         self.stats.io_uses += batch.uses().len() as u64;
-        self.io.register(batch, self.stats)
+        self.io.register(batch, self.priority, self.stats)
+    }
+
+    /// Drive one child with an explicit scheduler priority for reads it registers.
+    pub(crate) fn plan_child_with_priority(
+        &mut self,
+        id: NodeId,
+        range: Range<u64>,
+        fresh: bool,
+        priority: IoPriority,
+    ) -> VortexResult<bool> {
+        let previous = std::mem::replace(&mut self.priority, priority);
+        let result = self.plan_child(id, range, fresh);
+        self.priority = previous;
+        result
     }
 
     /// Drive a child's planning stream to completion, cutting it to `range` first.
@@ -288,19 +319,14 @@ impl<'a> ExecCx<'a> {
         &self.demand
     }
 
-    /// The IO plane, for consuming cells behind tickets this node's planning stream emitted.
-    pub fn io(&self) -> &IoPlane {
-        self.io
-    }
-
     /// The session, for creating expression execution contexts.
     pub fn session(&self) -> &VortexSession {
         self.session
     }
 
-    /// Consume the bytes behind a ticket this node's planning stream emitted.
-    pub fn consume(&mut self, ticket: IoTicket) -> VortexResult<BufferHandle> {
-        self.io.consume(ticket, self.stats)
+    /// Clone ready bytes, first attempting a source-provided non-blocking inline read if unissued.
+    pub fn ready(&mut self, ticket: IoTicket) -> VortexResult<Option<BufferHandle>> {
+        self.io.ready(ticket, self.stats)
     }
 
     /// Take a decoded value from the shared cell for a unit, if a morsel already published one.
@@ -324,20 +350,17 @@ impl<'a> ExecCx<'a> {
 
     /// Drive a child to a value under `demand`.
     ///
-    /// The child is polled until it yields a value or reports `Done`; `Blocked` is impossible in
-    /// P1 because every ticket a node parks on is already resolvable inline.
-    pub fn child_value(&mut self, id: NodeId, demand: Mask) -> VortexResult<Option<ValueBatch>> {
+    /// The child is polled until it yields a value, blocks on exact tickets, or reports `Done`.
+    pub fn child_value(&mut self, id: NodeId, demand: Mask) -> VortexResult<ChildPoll<ValueBatch>> {
         let mut node = self.arena.take(id);
         let saved = std::mem::replace(&mut self.demand, demand);
         let result = (|| {
             loop {
                 match node.execute(self)? {
-                    ExecPoll::Value(batch) => return Ok(Some(batch)),
+                    ExecPoll::Value(batch) => return Ok(ChildPoll::Value(batch)),
                     ExecPoll::Yield(_) => continue,
-                    ExecPoll::Blocked(waits) => {
-                        self.io.wait(waits.waits(), self.stats)?;
-                    }
-                    ExecPoll::Done => return Ok(None),
+                    ExecPoll::Blocked(waits) => return Ok(ChildPoll::Blocked(waits)),
+                    ExecPoll::Done => return Ok(ChildPoll::Done),
                 }
             }
         })();
@@ -347,19 +370,21 @@ impl<'a> ExecCx<'a> {
     }
 
     /// Drive a child to an array value, failing if it produced nothing.
-    pub fn child_array(&mut self, id: NodeId, demand: Mask) -> VortexResult<ArrayRef> {
-        self.child_value(id, demand)?
-            .ok_or_else(|| vortex_err!("child node {id} produced no value"))?
-            .value
-            .into_array()
+    pub fn child_array(&mut self, id: NodeId, demand: Mask) -> VortexResult<ChildPoll<ArrayRef>> {
+        match self.child_value(id, demand)? {
+            ChildPoll::Value(batch) => Ok(ChildPoll::Value(batch.value.into_array()?)),
+            ChildPoll::Blocked(waits) => Ok(ChildPoll::Blocked(waits)),
+            ChildPoll::Done => Ok(ChildPoll::Done),
+        }
     }
 
-    /// Drive a child to a mask value, failing if it produced nothing.
-    pub fn child_mask(&mut self, id: NodeId, demand: Mask) -> VortexResult<Mask> {
-        self.child_value(id, demand)?
-            .ok_or_else(|| vortex_err!("child node {id} produced no value"))?
-            .value
-            .into_mask()
+    /// Drive a child to a mask value.
+    pub fn child_mask(&mut self, id: NodeId, demand: Mask) -> VortexResult<ChildPoll<Mask>> {
+        match self.child_value(id, demand)? {
+            ChildPoll::Value(batch) => Ok(ChildPoll::Value(batch.value.into_mask()?)),
+            ChildPoll::Blocked(waits) => Ok(ChildPoll::Blocked(waits)),
+            ChildPoll::Done => Ok(ChildPoll::Done),
+        }
     }
 }
 
@@ -392,80 +417,70 @@ impl<'a> RetireCx<'a> {
 /// The number of IO uses one planning quantum may emit before a node should yield.
 pub const PLAN_BUDGET: u32 = 64;
 
-/// Drive one morsel through the arena: plan, execute, retire.
-pub fn drive_morsel(
+/// Reset an arena for one morsel before its planning continuation is queued.
+pub(crate) fn begin_morsel(arena: &mut Arena, root: NodeId, range: Range<u64>) {
+    arena.reset_subtree(root, range);
+}
+
+/// Advance one planning quantum for a morsel.
+pub(crate) fn poll_plan_morsel(
     arena: &mut Arena,
     root: NodeId,
-    range: Range<u64>,
+    io: &IoPlane,
+    cells: &SharedCells,
+    stats: &mut ScanStats,
+) -> VortexResult<PlanPoll> {
+    let mut cx = PlanCx {
+        arena,
+        io,
+        cells,
+        stats,
+        budget: PLAN_BUDGET,
+        priority: IoPriority::Required,
+    };
+    let mut node = cx.arena.take(root);
+    let poll = node.next_plan(&mut cx);
+    cx.arena.put(root, node);
+    poll
+}
+
+/// Advance one execution quantum for a morsel.
+pub(crate) fn poll_execute_morsel(
+    arena: &mut Arena,
+    root: NodeId,
+    range: &Range<u64>,
     io: &IoPlane,
     cells: &SharedCells,
     session: &VortexSession,
     stats: &mut ScanStats,
-) -> VortexResult<Option<ArrayRef>> {
-    arena.reset_subtree(root, range.clone());
-
-    // Planning: name every read this morsel will make, in budget-bounded quanta.
-    loop {
-        let mut cx = PlanCx {
-            arena,
-            io,
-            cells,
-            stats,
-            budget: PLAN_BUDGET,
-        };
-        let mut node = cx.arena.take(root);
-        let poll = node.next_plan(&mut cx);
-        cx.arena.put(root, node);
-        match poll? {
-            PlanPoll::Item(PlanItem::Io(_)) | PlanPoll::Item(PlanItem::Plan) => continue,
-            PlanPoll::Blocked(_) => break,
-            PlanPoll::Complete => break,
-        }
-    }
-    stats.morsels += 1;
-
-    // Execution.
+) -> VortexResult<ExecPoll> {
     let rows = usize::try_from(range.end - range.start)
         .map_err(|_| vortex_err!("morsel row count exceeds usize"))?;
-    let value = {
-        let mut cx = ExecCx {
-            arena,
-            io,
-            cells,
-            session,
-            stats,
-            demand: Mask::new_true(rows),
-        };
-        let mut node = cx.arena.take(root);
-        let out = loop {
-            match node.execute(&mut cx) {
-                Ok(ExecPoll::Value(batch)) => break Ok(Some(batch)),
-                Ok(ExecPoll::Yield(_)) => continue,
-                Ok(ExecPoll::Blocked(waits)) => {
-                    if let Err(err) = cx.io.wait(waits.waits(), cx.stats) {
-                        break Err(err);
-                    }
-                }
-                Ok(ExecPoll::Done) => break Ok(None),
-                Err(err) => break Err(err),
-            }
-        };
-        cx.arena.put(root, node);
-        out?
+    let mut cx = ExecCx {
+        arena,
+        io,
+        cells,
+        session,
+        stats,
+        demand: Mask::new_true(rows),
     };
+    let mut node = cx.arena.take(root);
+    let poll = node.execute(&mut cx);
+    cx.arena.put(root, node);
+    poll
+}
 
-    // Retirement. The morsel's IO cells are released with it: the executor retains no bytes
-    // and no decoded arrays across morsels, matching V1's per-evaluation state exactly.
-    {
-        let mut cx = RetireCx {
-            arena,
-            cells,
-            stats,
-        };
-        cx.retire_child(root);
-    }
-    io.clear();
-
-    let array = value.map(|batch| batch.value.into_array()).transpose()?;
-    Ok(array.and_then(|a| (!a.is_empty()).then_some(a)))
+/// Retire a completed morsel and release its decoded-cell leases.
+pub(crate) fn retire_morsel(
+    arena: &mut Arena,
+    root: NodeId,
+    cells: &SharedCells,
+    stats: &mut ScanStats,
+) {
+    let mut cx = RetireCx {
+        arena,
+        cells,
+        stats,
+    };
+    cx.retire_child(root);
 }

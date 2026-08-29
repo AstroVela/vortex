@@ -29,13 +29,15 @@ use crate::node::PlanPoll;
 use crate::node::RetireCx;
 use crate::node::Value;
 use crate::node::ValueBatch;
+use crate::node::Wait;
+use crate::node::WaitSet;
 
 /// The only node that touches the world: one stored segment, decoded and sliced.
 ///
 /// `next_plan` names the segment exactly once per morsel. If the shared cell for the segment
 /// already holds a decoded value, planning skips issuing the read — the morsel's own lease keeps
-/// that value alive until it retires. Otherwise `execute` waits on the one ticket, decodes,
-/// publishes into the cell, then slices to the morsel's local range and applies the demand mask.
+/// that value alive until it retires. Otherwise `execute` clones the scheduler-resolved ticket,
+/// decodes, publishes into the cell, then slices to the morsel's local range and applies demand.
 /// Retire releases the lease whether the value was used or not; the last release drops the cell.
 pub struct FlatExec {
     segment: SegmentId,
@@ -77,15 +79,17 @@ impl FlatExec {
         }
     }
 
-    fn decode(&self, cx: &mut ExecCx<'_>) -> VortexResult<ArrayRef> {
+    fn decode(&self, cx: &mut ExecCx<'_>) -> VortexResult<Option<ArrayRef>> {
         if let Some(shared) = cx.shared_decoded(IoKey::Segment(self.segment)) {
-            return Ok(shared);
+            return Ok(Some(shared));
         }
 
         let ticket = self
             .ticket
             .ok_or_else(|| crate::io::unplanned_ticket(self.producer))?;
-        let bytes = cx.consume(ticket)?;
+        let Some(bytes) = cx.ready(ticket)? else {
+            return Ok(None);
+        };
 
         let parts = match self.array_tree.as_ref() {
             Some(tree) => SerializedArray::from_flatbuffer_and_segment(tree.clone(), bytes)?,
@@ -97,7 +101,7 @@ impl FlatExec {
         let array = parts.decode(&self.dtype, rows, &self.read_ctx, &session)?;
         cx.stats().decodes += 1;
         cx.publish_decoded(IoKey::Segment(self.segment), &array);
-        Ok(array)
+        Ok(Some(array))
     }
 }
 
@@ -150,9 +154,14 @@ impl ExecNode for FlatExec {
         if self.done {
             return Ok(ExecPoll::Done);
         }
-        self.done = true;
-
-        let mut array = self.decode(cx)?;
+        let Some(mut array) = self.decode(cx)? else {
+            let ticket = self
+                .ticket
+                .ok_or_else(|| crate::io::unplanned_ticket(self.producer))?;
+            return Ok(ExecPoll::Blocked(
+                [Wait::Io(ticket)].into_iter().collect::<WaitSet>(),
+            ));
+        };
 
         let start = usize::try_from(self.range.start).vortex_expect("flat range start fits usize");
         let end = usize::try_from(self.range.end).vortex_expect("flat range end fits usize");
@@ -164,6 +173,7 @@ impl ExecNode for FlatExec {
         if !demand.all_true() {
             array = array.filter(demand.clone())?;
         }
+        self.done = true;
 
         Ok(ExecPoll::Value(ValueBatch {
             coverage: self.root_offset + self.range.start..self.root_offset + self.range.end,

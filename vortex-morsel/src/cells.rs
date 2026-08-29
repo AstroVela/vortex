@@ -53,8 +53,8 @@ pub struct SharedCells {
 impl SharedCells {
     /// A disabled cell layer: every lookup misses, publishes and releases are no-ops.
     ///
-    /// This is the configuration whose state exactly matches the V1 `LayoutReader` — nothing is
-    /// shared between evaluations — and it is what the fairness rows of the eval run.
+    /// This disables decoded-array reuse between morsels. The scan-wide raw IO service remains
+    /// enabled and is tested independently.
     pub fn disabled() -> Self {
         Self {
             shards: None,
@@ -84,10 +84,12 @@ impl SharedCells {
                 );
             }
         }
-        Self {
-            shards: Some(shards.into_iter().map(Mutex::new).collect()),
-            hasher,
-        }
+        let shards = if shards.iter().all(HashMap::is_empty) {
+            None
+        } else {
+            Some(shards.into_iter().map(Mutex::new).collect())
+        };
+        Self { shards, hasher }
     }
 
     /// Whether the cell layer is enabled.
@@ -151,5 +153,32 @@ impl SharedCells {
             .as_ref()
             .map(|shards| shards.iter().map(|shard| shard.lock().len()).sum())
             .unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vortex_layout::segments::SegmentId;
+
+    use super::*;
+
+    #[test]
+    fn unique_leases_disable_cell_layer() {
+        let mut counts = HashMap::default();
+        counts.insert(IoKey::Segment(SegmentId::from(0)), 1);
+
+        let cells = SharedCells::with_leases(counts);
+
+        assert!(!cells.is_enabled());
+    }
+
+    #[test]
+    fn shared_leases_enable_cell_layer() {
+        let mut counts = HashMap::default();
+        counts.insert(IoKey::Segment(SegmentId::from(0)), 2);
+
+        let cells = SharedCells::with_leases(counts);
+
+        assert!(cells.is_enabled());
     }
 }

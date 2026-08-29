@@ -11,8 +11,10 @@ use vortex_array::arrays::ChunkedArray;
 use vortex_array::dtype::DType;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_error::vortex_err;
 use vortex_mask::Mask;
 
+use crate::node::ChildPoll;
 use crate::node::ExecCx;
 use crate::node::ExecNode;
 use crate::node::ExecPoll;
@@ -51,6 +53,8 @@ pub struct ChunkedExec {
     plan_cursor: usize,
     /// Whether `plan_cursor`'s child has already been reset for this morsel.
     plan_started: bool,
+    exec_cursor: usize,
+    parts: Vec<ArrayRef>,
     done: bool,
 }
 
@@ -66,6 +70,8 @@ impl ChunkedExec {
             cuts: Vec::new(),
             plan_cursor: 0,
             plan_started: false,
+            exec_cursor: 0,
+            parts: Vec::new(),
             done: false,
         }
     }
@@ -109,6 +115,8 @@ impl ExecNode for ChunkedExec {
         self.range = range;
         self.plan_cursor = 0;
         self.plan_started = false;
+        self.exec_cursor = 0;
+        self.parts.clear();
         self.done = false;
         self.cut();
     }
@@ -135,9 +143,9 @@ impl ExecNode for ChunkedExec {
         if self.done {
             return Ok(ExecPoll::Done);
         }
-        self.done = true;
 
         if self.cuts.is_empty() {
+            self.done = true;
             return Ok(ExecPoll::Value(ValueBatch {
                 coverage: self.range.clone(),
                 value: Value::Array(Canonical::empty(&self.dtype).into_array()),
@@ -145,16 +153,29 @@ impl ExecNode for ChunkedExec {
         }
 
         let demand = cx.demand().clone();
-        let mut parts: Vec<ArrayRef> = Vec::with_capacity(self.cuts.len());
-        for idx in 0..self.cuts.len() {
-            let cut = self.cuts[idx].clone();
+        if self.parts.capacity() < self.cuts.len() {
+            self.parts
+                .reserve(self.cuts.len().saturating_sub(self.parts.len()));
+        }
+        while self.exec_cursor < self.cuts.len() {
+            let cut = self.cuts[self.exec_cursor].clone();
             let child_demand = slice_mask(&demand, cut.mask_range);
-            let array = cx.child_array(self.children[cut.chunk], child_demand)?;
-            if !array.is_empty() {
-                parts.push(array);
+            let child = self.children[cut.chunk];
+            match cx.child_array(child, child_demand)? {
+                ChildPoll::Value(array) => {
+                    if !array.is_empty() {
+                        self.parts.push(array);
+                    }
+                    self.exec_cursor += 1;
+                }
+                ChildPoll::Blocked(waits) => return Ok(ExecPoll::Blocked(waits)),
+                ChildPoll::Done => {
+                    return Err(vortex_err!("chunked child {child} produced no value"));
+                }
             }
         }
 
+        let parts = std::mem::take(&mut self.parts);
         let array = match parts.len() {
             0 => Canonical::empty(&self.dtype).into_array(),
             1 => parts.into_iter().next().vortex_expect("one part"),
@@ -163,6 +184,7 @@ impl ExecNode for ChunkedExec {
                 ChunkedArray::try_new(parts, dtype)?.into_array()
             }
         };
+        self.done = true;
 
         Ok(ExecPoll::Value(ValueBatch {
             coverage: self.range.clone(),

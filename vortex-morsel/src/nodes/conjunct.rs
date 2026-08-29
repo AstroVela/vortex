@@ -6,9 +6,12 @@ use std::ops::Range;
 
 use vortex_array::VortexSessionExecute;
 use vortex_array::expr::BoundExpression;
+use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_error::vortex_err;
 use vortex_mask::Mask;
 
+use crate::node::ChildPoll;
 use crate::node::ExecCx;
 use crate::node::ExecNode;
 use crate::node::ExecPoll;
@@ -52,6 +55,9 @@ pub struct ConjunctExec {
     range: Range<u64>,
     plan_cursor: usize,
     plan_started: bool,
+    exec_cursor: usize,
+    incoming: Option<Mask>,
+    mask: Option<Mask>,
     done: bool,
     children: Vec<NodeId>,
 }
@@ -66,13 +72,21 @@ impl ConjunctExec {
             range: 0..0,
             plan_cursor: 0,
             plan_started: false,
+            exec_cursor: 0,
+            incoming: None,
+            mask: None,
             done: false,
             children,
         }
     }
 
     /// Evaluate one conjunct under `incoming`, returning the refined mask.
-    fn eval(&self, idx: usize, incoming: &Mask, cx: &mut ExecCx<'_>) -> VortexResult<Mask> {
+    fn eval(
+        &self,
+        idx: usize,
+        incoming: &Mask,
+        cx: &mut ExecCx<'_>,
+    ) -> VortexResult<ChildPoll<Mask>> {
         let slot = &self.slots[idx];
 
         // The regime switch: over a sparse mask, filter first and correct by rank; over a dense
@@ -84,16 +98,25 @@ impl ConjunctExec {
             Mask::new_true(incoming.len())
         };
 
-        let array = cx.child_array(slot.input, child_demand)?;
+        let array = match cx.child_array(slot.input, child_demand)? {
+            ChildPoll::Value(array) => array,
+            ChildPoll::Blocked(waits) => return Ok(ChildPoll::Blocked(waits)),
+            ChildPoll::Done => {
+                return Err(vortex_err!(
+                    "conjunct input {} produced no value",
+                    slot.input
+                ));
+            }
+        };
         let array = array.apply_bound(&slot.predicate)?;
         let mut ctx = cx.session().create_execution_ctx();
         let predicate_mask = array.null_as_false().execute(&mut ctx)?;
 
-        Ok(if sparse {
+        Ok(ChildPoll::Value(if sparse {
             incoming.intersect_by_rank(&predicate_mask)
         } else {
             incoming.bitand(&predicate_mask)
-        })
+        }))
     }
 }
 
@@ -102,6 +125,9 @@ impl ExecNode for ConjunctExec {
         self.range = range;
         self.plan_cursor = 0;
         self.plan_started = false;
+        self.exec_cursor = 0;
+        self.incoming = None;
+        self.mask = None;
         self.done = false;
     }
 
@@ -134,30 +160,53 @@ impl ExecNode for ConjunctExec {
         if self.done {
             return Ok(ExecPoll::Done);
         }
-        self.done = true;
+        if self.incoming.is_none() {
+            let incoming = cx.demand().clone();
+            self.mask = Some(incoming.clone());
+            self.incoming = Some(incoming);
+        }
 
-        let incoming = cx.demand().clone();
-        let mask = match self.mode {
-            ConjunctMode::Cascade => {
-                let mut mask = incoming;
-                for idx in 0..self.slots.len() {
-                    if mask.all_false() {
-                        cx.stats().conjuncts_short_circuited += (self.slots.len() - idx) as u64;
-                        break;
+        while self.exec_cursor < self.slots.len() {
+            let eval_demand = match self.mode {
+                ConjunctMode::Cascade => self.mask.as_ref(),
+                ConjunctMode::Parallel => self.incoming.as_ref(),
+            }
+            .vortex_expect("execution masks initialized")
+            .clone();
+            if self.mode == ConjunctMode::Cascade && eval_demand.all_false() {
+                cx.stats().conjuncts_short_circuited +=
+                    (self.slots.len() - self.exec_cursor) as u64;
+                self.exec_cursor = self.slots.len();
+                break;
+            }
+
+            match self.eval(self.exec_cursor, &eval_demand, cx)? {
+                ChildPoll::Value(refined) => {
+                    if self.mode == ConjunctMode::Parallel {
+                        self.mask = Some(
+                            self.mask
+                                .take()
+                                .vortex_expect("execution mask initialized")
+                                .bitand(&refined),
+                        );
+                    } else {
+                        self.mask = Some(refined);
                     }
-                    mask = self.eval(idx, &mask, cx)?;
+                    self.exec_cursor += 1;
                 }
-                mask
-            }
-            ConjunctMode::Parallel => {
-                let mut mask = incoming.clone();
-                for idx in 0..self.slots.len() {
-                    let refined = self.eval(idx, &incoming, cx)?;
-                    mask = mask.bitand(&refined);
+                ChildPoll::Blocked(waits) => return Ok(ExecPoll::Blocked(waits)),
+                ChildPoll::Done => {
+                    return Err(vortex_err!(
+                        "conjunct {} produced no value",
+                        self.exec_cursor
+                    ));
                 }
-                mask
             }
-        };
+        }
+
+        let mask = self.mask.take().vortex_expect("execution mask initialized");
+        self.incoming = None;
+        self.done = true;
 
         Ok(ExecPoll::Value(ValueBatch {
             coverage: self.range.clone(),
