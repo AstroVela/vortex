@@ -60,6 +60,7 @@ use crate::fixtures::write_fixture;
 use crate::harness::MorselConfig;
 use crate::harness::Query;
 use crate::harness::assert_same_rows;
+use crate::harness::prepare_morsel;
 use crate::harness::run_layout_v27;
 use crate::harness::run_morsel;
 use crate::harness::run_v1;
@@ -254,6 +255,35 @@ fn matches_v1_oracle(#[values(1, 2, 4)] threads: usize) -> VortexResult<()> {
         assert_same_rows(&session, &v1_dtype(&fixture.layout, &query)?, &v1, &morsel)
             .map_err(|err| err.with_context(format!("query {}", query.name)))?;
     }
+    Ok(())
+}
+
+#[test]
+fn prepared_scan_reuses_workers_across_runs() -> VortexResult<()> {
+    let session = session();
+    let fixture = misaligned_fixture(&session, ROWS)?;
+    let segments: Arc<dyn SegmentSource> = Arc::clone(&fixture.segments);
+    let mut test_queries = queries();
+    let query = test_queries.remove(3);
+    let v1 = run_v1(&session, &fixture.layout, &segments, &query)?;
+    let prepared = prepare_morsel(
+        &session,
+        &fixture.layout,
+        &segments,
+        &query,
+        MorselConfig {
+            threads: 2,
+            morsel_rows: 100,
+            ..Default::default()
+        },
+    )?;
+
+    let first = prepared.run()?;
+    let second = prepared.run()?;
+    let dtype = v1_dtype(&fixture.layout, &query)?;
+    assert_same_rows(&session, &dtype, &v1, &first)?;
+    assert_same_rows(&session, &dtype, &v1, &second)?;
+    assert_eq!(first.rows, second.rows);
     Ok(())
 }
 

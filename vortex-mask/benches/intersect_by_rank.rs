@@ -57,6 +57,14 @@ const VERY_SPARSE_MASK_ARGS: &[(f64, f64, &str)] = &[
     (0.10, 0.01, "self_10pct_mask_1pct"),
 ];
 
+// A sparse base whose indices were materialized by an immediately preceding array filter,
+// followed by a bitmap-backed rank refinement. Q12's final conjunct is approximately the first
+// case: 12% enter the rank-space predicate and 16% of those survive (about 2% overall).
+const CACHED_BASE_ARGS: &[(f64, f64, &str)] = &[
+    (0.12, 0.16, "q12_shape"),
+    (0.50, 0.02, "dense_base_sparse_output"),
+];
+
 fn create_random_mask(len: usize, selectivity: f64) -> Mask {
     Mask::from_buffer(BitBuffer::from_iter((0..len).map(|i| {
         #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -121,6 +129,13 @@ fn create_rank_indices_fixture(size: usize, self_density: f64, mask_density: f64
     (base, rank)
 }
 
+fn create_cached_base_fixture(size: usize, self_density: f64, mask_density: f64) -> (Mask, Mask) {
+    let base = create_random_indices_mask(size, self_density);
+    let rank_len = base.true_count();
+    let rank = create_random_mask(rank_len, mask_density);
+    (base, rank)
+}
+
 /// Standard patterns (random / runs)
 #[divan::bench(args = BENCH_ARGS)]
 fn intersect_by_rank(bencher: Bencher, (size, pattern): (usize, &str)) {
@@ -152,6 +167,15 @@ fn density_matrix(bencher: Bencher, (self_density, mask_density, _name): (f64, f
 #[divan::bench(args = RANK_INDICES_ARGS)]
 fn rank_indices(bencher: Bencher, (self_density, mask_density, _name): (f64, f64, &str)) {
     let (base, rank) = create_rank_indices_fixture(100_000, self_density, mask_density);
+    bencher
+        .with_inputs(|| (&base, &rank))
+        .bench_refs(|(base, rank)| base.intersect_by_rank(rank));
+}
+
+/// Cached base indices with an uncached bitmap rank mask.
+#[divan::bench(args = CACHED_BASE_ARGS)]
+fn cached_base(bencher: Bencher, (self_density, mask_density, _name): (f64, f64, &str)) {
+    let (base, rank) = create_cached_base_fixture(131_072, self_density, mask_density);
     bencher
         .with_inputs(|| (&base, &rank))
         .bench_refs(|(base, rank)| base.intersect_by_rank(rank));

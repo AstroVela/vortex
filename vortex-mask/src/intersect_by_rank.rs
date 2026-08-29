@@ -485,6 +485,22 @@ impl Mask {
             (_, Self::AllTrue(_)) => self.clone(),
             (Self::AllFalse(_), _) | (_, Self::AllFalse(_)) => Self::new_false(self.len()),
             (Self::Values(self_values), Self::Values(mask_values)) => {
+                // Sparse array filtering commonly materializes the base indices immediately
+                // before refining that mask in rank space. When the refinement leaves less than
+                // one row per 32 input rows, preserve that representation: enumerate the much
+                // shorter rank mask and compose the two index vectors directly. Besides avoiding
+                // a full bit-buffer deposit pass, the result carries cached indices into the next
+                // filter operation.
+                if let Some(self_indices) = self_values.indices.get()
+                    && mask_values.true_count().saturating_mul(32) < self.len()
+                {
+                    return intersect_by_rank_indices(
+                        self.len(),
+                        self_indices,
+                        mask_values.indices(),
+                    );
+                }
+
                 // Four dispatch cases keyed by (self density, mask density):
                 //
                 //              | mask sparse | mask dense
@@ -656,6 +672,21 @@ mod tests {
         let result = m1.intersect_by_rank(&m2);
         let expected = Mask::from_iter([false, false, false, false, true, false, false, true]);
         assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn sparse_rank_refinement_preserves_cached_base_indices() {
+        let base = Mask::from_indices(128, (0..128).step_by(8));
+        let rank = Mask::from_buffer(BitBuffer::from_iter(
+            (0..16).map(|index| index == 1 || index == 10),
+        ));
+
+        let result = base.intersect_by_rank(&rank);
+        assert_eq!(result.indices(), crate::AllOr::Some(&[8, 80][..]));
+        assert_eq!(
+            result.values().and_then(|values| values.cached_indices()),
+            Some(&[8, 80][..])
+        );
     }
 
     #[test]

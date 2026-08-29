@@ -28,6 +28,8 @@ use crossbeam_channel::Sender;
 use crossbeam_channel::unbounded;
 use parking_lot::Mutex;
 use vortex_array::ArrayRef;
+use vortex_array::ExecutionCtx;
+use vortex_array::VortexSessionExecute;
 use vortex_error::VortexError;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
@@ -78,6 +80,7 @@ pub struct MorselScan {
     morsels: Arc<[Range<u64>]>,
     threads: usize,
     share_decodes: bool,
+    workers: Mutex<Option<MorselWorkerPool>>,
 }
 
 struct WorkerRun {
@@ -103,6 +106,7 @@ struct WaitToken {
 
 struct LocalMorsel<'a> {
     arena: &'a mut Arena,
+    execution: &'a mut ExecutionCtx,
     io: IoPlane,
     phase: TaskPhase,
     index: usize,
@@ -197,7 +201,13 @@ impl MorselWorkerPool {
                                 signals,
                                 done,
                             } => {
-                                let stats = scheduler.worker_loop(worker, &signals, &mut arena);
+                                let mut execution = scheduler.run.session.create_execution_ctx();
+                                let stats = scheduler.worker_loop(
+                                    worker,
+                                    &signals,
+                                    &mut arena,
+                                    &mut execution,
+                                );
                                 let _ = done.send(stats);
                             }
                             WorkerMessage::Shutdown => break,
@@ -546,8 +556,9 @@ impl Scheduler {
         worker: usize,
         signals: &Receiver<WorkerSignal>,
         arena: &mut Arena,
+        execution: &mut ExecutionCtx,
     ) -> ScanStats {
-        let mut morsel = LocalMorsel::new(&self.run, arena);
+        let mut morsel = LocalMorsel::new(&self.run, arena, execution);
         let mut runnable = morsel.assign_next(self);
 
         loop {
@@ -677,9 +688,10 @@ enum LocalPoll {
 }
 
 impl<'a> LocalMorsel<'a> {
-    fn new(run: &WorkerRun, arena: &'a mut Arena) -> Self {
+    fn new(run: &WorkerRun, arena: &'a mut Arena, execution: &'a mut ExecutionCtx) -> Self {
         Self {
             arena,
+            execution,
             io: IoPlane::new(Arc::clone(&run.io)),
             phase: TaskPhase::Plan,
             index: 0,
@@ -755,7 +767,7 @@ impl<'a> LocalMorsel<'a> {
                 &self.range,
                 &self.io,
                 &scheduler.run.cells,
-                &scheduler.run.session,
+                self.execution,
                 &mut self.stats,
             )? {
                 ExecPoll::Value(batch) => {
@@ -817,6 +829,7 @@ impl MorselScan {
             morsels,
             threads: 1,
             share_decodes: true,
+            workers: Mutex::new(None),
         }
     }
 
@@ -862,7 +875,12 @@ impl MorselScan {
 
     /// Run the scan with worker creation and shutdown outside the measured interval.
     pub(crate) fn run_timed(&self) -> VortexResult<(Vec<ArrayRef>, ScanStats, Duration)> {
-        let workers = MorselWorkerPool::new(self.threads, Arc::clone(&self.plan))?;
+        // Serialize runs over one scan: its affinity-owned arenas and workers are deliberately
+        // persistent, but a pool can only drive one scheduler at a time.
+        let mut workers = self.workers.lock();
+        if workers.is_none() {
+            *workers = Some(MorselWorkerPool::new(self.threads, Arc::clone(&self.plan))?);
+        }
         let lease_counts = self.share_decodes.then(|| self.lease_counts());
         let start = Instant::now();
         let cells = match lease_counts {
@@ -880,7 +898,10 @@ impl MorselScan {
 
         let (scheduler, signals) = Scheduler::new(Arc::clone(&run), self.threads);
         scheduler.submit_exact_lookahead();
-        let worker_stats = workers.run(Arc::clone(&scheduler), signals)?;
+        let worker_stats = workers
+            .as_ref()
+            .ok_or_else(|| vortex_err!("morsel worker pool was not initialized"))?
+            .run(Arc::clone(&scheduler), signals)?;
         let (batches, stats) = scheduler.finish(worker_stats)?;
 
         debug_assert_eq!(
@@ -890,7 +911,6 @@ impl MorselScan {
         );
 
         let wall = start.elapsed();
-        drop(workers);
         Ok((batches, stats, wall))
     }
 }

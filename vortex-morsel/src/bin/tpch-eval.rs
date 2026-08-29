@@ -59,9 +59,11 @@ use vortex_layout::segments::SegmentSource;
 use vortex_layout::segments::SharedSegmentSource;
 use vortex_morsel::fixtures::write_streaming_fixture_no_table;
 use vortex_morsel::harness::MorselConfig;
+use vortex_morsel::harness::PreparedMorsel;
 use vortex_morsel::harness::Query;
 use vortex_morsel::harness::RunOutcome;
 use vortex_morsel::harness::assert_same_rows;
+use vortex_morsel::harness::prepare_morsel;
 use vortex_morsel::harness::run_layout_v27;
 use vortex_morsel::harness::run_layout_v27_tokio;
 use vortex_morsel::harness::run_morsel;
@@ -236,17 +238,23 @@ enum SegmentBackend {
 type MeasuredSegmentSource = (Arc<dyn SegmentSource>, Option<Arc<PhysicalIoCounters>>);
 
 impl SegmentBackend {
+    fn before_run(&self) -> VortexResult<()> {
+        if let Self::Disk(disk) = self
+            && disk.evict_before_run
+        {
+            let file = File::open(&disk.path)?;
+            fadvise(&file, 0, None, Advice::DontNeed).map_err(|err| {
+                vortex_error::vortex_err!("failed to evict {}: {err}", disk.path.display())
+            })?;
+        }
+        Ok(())
+    }
+
     fn source(&self, session: &VortexSession) -> VortexResult<MeasuredSegmentSource> {
         match self {
             Self::Memory(source) => Ok((Arc::clone(source), None)),
             Self::Disk(disk) => {
-                if disk.evict_before_run {
-                    let file = File::open(&disk.path)?;
-                    fadvise(&file, 0, None, Advice::DontNeed).map_err(|err| {
-                        vortex_error::vortex_err!("failed to evict {}: {err}", disk.path.display())
-                    })?;
-                    drop(file);
-                }
+                self.before_run()?;
 
                 let read: Arc<dyn VortexReadAt> =
                     Arc::new(FileReadAt::open(&disk.path, session.handle())?);
@@ -267,6 +275,90 @@ impl SegmentBackend {
                 Ok((source, Some(counters)))
             }
         }
+    }
+}
+
+struct PreparedRun<'a> {
+    runtime: &'a tokio::runtime::Runtime,
+    session: VortexSession,
+    layout: &'a LayoutRef,
+    backend: &'a SegmentBackend,
+    query: &'a Query,
+    row: Row,
+    segments: Arc<dyn SegmentSource>,
+    counters: Option<Arc<PhysicalIoCounters>>,
+    morsel: Option<PreparedMorsel>,
+}
+
+impl<'a> PreparedRun<'a> {
+    fn new(
+        runtime: &'a tokio::runtime::Runtime,
+        session: &VortexSession,
+        layout: &'a LayoutRef,
+        backend: &'a SegmentBackend,
+        query: &'a Query,
+        row: Row,
+    ) -> VortexResult<Self> {
+        let session = match backend {
+            SegmentBackend::Memory(_) => session.clone(),
+            SegmentBackend::Disk(disk) => session.clone().with_handle(disk.runtime.clone()),
+        };
+        let (segments, counters) = backend.source(&session)?;
+        let morsel = match row {
+            Row::Morsel(config) => {
+                Some(prepare_morsel(&session, layout, &segments, query, config)?)
+            }
+            _ => None,
+        };
+        Ok(Self {
+            runtime,
+            session,
+            layout,
+            backend,
+            query,
+            row,
+            segments,
+            counters,
+            morsel,
+        })
+    }
+
+    fn run(&self) -> VortexResult<RunOutcome> {
+        self.backend.before_run()?;
+        if let Some(counters) = &self.counters {
+            counters.ranges.store(0, Ordering::Relaxed);
+            counters.bytes.store(0, Ordering::Relaxed);
+        }
+        let mut outcome = match self.row {
+            Row::V1Single => run_v1(&self.session, self.layout, &self.segments, self.query),
+            Row::V1Tokio(_) => run_v1_tokio(
+                self.runtime,
+                &self.session,
+                self.layout,
+                &self.segments,
+                self.query,
+            ),
+            Row::LayoutV27Single => {
+                run_layout_v27(&self.session, self.layout, &self.segments, self.query)
+            }
+            Row::LayoutV27Tokio(_) => run_layout_v27_tokio(
+                self.runtime,
+                &self.session,
+                self.layout,
+                &self.segments,
+                self.query,
+            ),
+            Row::Morsel(_) => self
+                .morsel
+                .as_ref()
+                .ok_or_else(|| vortex_error::vortex_err!("morsel run was not prepared"))?
+                .run(),
+        }?;
+        if let Some(counters) = &self.counters {
+            outcome.source_io_requests = Some(counters.ranges.load(Ordering::Relaxed));
+            outcome.source_io_bytes = Some(counters.bytes.load(Ordering::Relaxed));
+        }
+        Ok(outcome)
     }
 }
 
@@ -568,32 +660,27 @@ fn main() -> VortexResult<()> {
         }
 
         let validated = configs(threads);
+        let prepared = validated
+            .iter()
+            .map(|row| PreparedRun::new(&runtime, &session, &fixture.layout, &backend, query, *row))
+            .collect::<VortexResult<Vec<_>>>()?;
         let mut samples: Vec<Vec<RunOutcome>> = validated.iter().map(|_| Vec::new()).collect();
         if matches!(&backend, SegmentBackend::Memory(_)) {
-            for (idx, row) in validated.iter().enumerate() {
+            for (idx, run) in prepared.iter().enumerate() {
                 // A serial configuration otherwise leaves most cores idle immediately before the
                 // next parallel configuration. Warm and sample each in-memory executor as an
                 // independent steady-state compute benchmark.
-                drop(run_once(
-                    &runtime,
-                    &session,
-                    &fixture.layout,
-                    &backend,
-                    query,
-                    *row,
-                )?);
+                drop(run.run()?);
                 for _ in 0..iterations {
-                    let mut outcome =
-                        run_once(&runtime, &session, &fixture.layout, &backend, query, *row)?;
+                    let mut outcome = run.run()?;
                     outcome.batches.clear();
                     samples[idx].push(outcome);
                 }
             }
         } else {
             for _ in 0..iterations {
-                for (idx, row) in validated.iter().enumerate() {
-                    let mut outcome =
-                        run_once(&runtime, &session, &fixture.layout, &backend, query, *row)?;
+                for (idx, run) in prepared.iter().enumerate() {
+                    let mut outcome = run.run()?;
                     outcome.batches.clear();
                     samples[idx].push(outcome);
                 }
@@ -739,18 +826,17 @@ fn sweep(
     for query in queries {
         let mut walls = Vec::new();
         for &n in &thread_counts {
-            walls.push(median(iterations, || {
-                run_morsel(
-                    session,
-                    &fixture.layout,
-                    segments,
-                    query,
-                    MorselConfig {
-                        threads: n,
-                        ..Default::default()
-                    },
-                )
-            })?);
+            let prepared = prepare_morsel(
+                session,
+                &fixture.layout,
+                segments,
+                query,
+                MorselConfig {
+                    threads: n,
+                    ..Default::default()
+                },
+            )?;
+            walls.push(median(iterations, || prepared.run())?);
         }
         let at_available_cpus = walls[2];
         let best = walls
@@ -821,16 +907,16 @@ fn sweep(
                 morsel_rows: size,
                 ..Default::default()
             };
+            let prepared = prepare_morsel(session, &fixture.layout, segments, query, config)?;
             if size == 0 {
-                morsel_count = run_morsel(session, &fixture.layout, segments, query, config)?
+                morsel_count = prepared
+                    .run()?
                     .stats
                     .as_ref()
                     .map(|s| s.morsels)
                     .unwrap_or(0);
             }
-            let wall = median(iterations, || {
-                run_morsel(session, &fixture.layout, segments, query, config)
-            })?;
+            let wall = median(iterations, || prepared.run())?;
             cells.push(millis(wall));
         }
         println!(
