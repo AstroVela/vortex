@@ -18,29 +18,41 @@ use futures::pin_mut;
 use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
 use vortex_array::array_session;
-use vortex_array::dtype::session::DTypeSessionExt;
-use vortex_array::session::ArraySessionExt;
 use vortex_array::arrays::ChunkedArray;
 use vortex_array::arrays::StructArray;
+use vortex_array::dtype::session::DTypeSessionExt;
+use vortex_array::session::ArraySessionExt;
 use vortex_array::stream::ArrayStreamExt;
-use vortex_buffer::ByteBufferMut;
 use vortex_buffer::BufferMut;
-use vortex_file::OpenOptionsSessionExt;
-use vortex_file::WriteOptionsSessionExt;
-use vortex_io::session::RuntimeSession;
-use vortex_io::session::RuntimeSessionExt;
-use vortex_layout::session::LayoutSession;
+use vortex_buffer::ByteBufferMut;
 use vortex_edition::ComponentKind;
 use vortex_edition::Edition;
 use vortex_edition::EditionId;
 use vortex_edition::EditionInclusion;
 use vortex_edition::EditionSessionExt;
+use vortex_file::OpenOptionsSessionExt;
+use vortex_file::WriteOptionsSessionExt;
+use vortex_io::session::RuntimeSession;
+use vortex_io::session::RuntimeSessionExt;
+use vortex_layout::session::LayoutSession;
 use vortex_layout::session::LayoutSessionExt;
 use vortex_session::VortexSession;
 
 const NUM_RECORDS: usize = 2_000_000;
 const NUM_BATCHES: usize = 8;
 const KEY_RANGES: &[u64] = &[100, 100_000_000];
+
+/// Shape of the ten value fields.
+///
+/// `Random` matches the DBSP `list_merger` benchmark exactly: ten independent random `u64`s,
+/// which no columnar format can compress. `Realistic` approximates a Nexmark-style bid row,
+/// where most fields are low-cardinality, clustered, or monotonic, which is what production
+/// spilled batches actually look like.
+#[derive(Clone, Copy, Debug)]
+enum Profile {
+    Random,
+    Realistic,
+}
 const VALUE_FIELDS: usize = 10;
 
 /// Raw logical bytes per record: 1 key `u64` + 10 value `u64` + 1 `i64` weight.
@@ -166,19 +178,40 @@ fn records_in_batch(batch_index: usize) -> usize {
 }
 
 /// Builds one chunk per batch, sorted by key, mirroring how DBSP seals a spilled batch.
-fn generate_chunks(key_range: u64) -> Vec<ArrayRef> {
+/// Fills one row's value fields according to `profile`.
+fn fill_value(rng: &mut Xoshiro, profile: Profile, row: usize, value: &mut [u64; VALUE_FIELDS]) {
+    match profile {
+        Profile::Random => {
+            for slot in value.iter_mut() {
+                *slot = rng.next_u64();
+            }
+        }
+        Profile::Realistic => {
+            value[0] = rng.gen_range(8); // small enum, e.g. channel
+            value[1] = rng.gen_range(64); // small enum, e.g. category
+            value[2] = 1_700_000_000_000 + row as u64 * 7; // monotonic timestamp
+            value[3] = 1_700_000_000_000 + row as u64 * 7 + rng.gen_range(1_000); // near-copy
+            value[4] = rng.gen_range(10_000); // medium-cardinality id
+            value[5] = rng.gen_range(1_000_000); // high-cardinality id
+            value[6] = rng.gen_range(100); // price bucket
+            value[7] = u64::from(rng.gen_range(2) == 0); // boolean-ish flag
+            value[8] = rng.gen_range(256); // byte-ranged field
+            value[9] = rng.next_u64(); // one genuinely random field
+        }
+    }
+}
+
+fn generate_chunks(key_range: u64, profile: Profile) -> Vec<ArrayRef> {
     let mut rng = Xoshiro::from_seed(SEED);
 
     (0..NUM_BATCHES)
         .map(|batch_index| {
             let n = records_in_batch(batch_index);
             let mut records: Vec<(u64, [u64; VALUE_FIELDS])> = (0..n)
-                .map(|_| {
+                .map(|row| {
                     let key = rng.gen_range(key_range);
                     let mut value = [0u64; VALUE_FIELDS];
-                    for slot in &mut value {
-                        *slot = rng.next_u64();
-                    }
+                    fill_value(&mut rng, profile, row, &mut value);
                     (key, value)
                 })
                 .collect();
@@ -186,8 +219,9 @@ fn generate_chunks(key_range: u64) -> Vec<ArrayRef> {
             records.sort_unstable_by_key(|(key, _)| *key);
 
             let mut keys = BufferMut::with_capacity(n);
-            let mut values: Vec<BufferMut<u64>> =
-                (0..VALUE_FIELDS).map(|_| BufferMut::with_capacity(n)).collect();
+            let mut values: Vec<BufferMut<u64>> = (0..VALUE_FIELDS)
+                .map(|_| BufferMut::with_capacity(n))
+                .collect();
             let mut weights = BufferMut::with_capacity(n);
             for (key, value) in &records {
                 keys.push(*key);
@@ -213,9 +247,9 @@ fn generate_chunks(key_range: u64) -> Vec<ArrayRef> {
         .collect()
 }
 
-async fn run(key_range: u64) {
+async fn run(key_range: u64, profile: Profile) {
     let gen_start = Instant::now();
-    let chunks = generate_chunks(key_range);
+    let chunks = generate_chunks(key_range, profile);
     let gen_elapsed = gen_start.elapsed();
 
     let chunked = ChunkedArray::from_iter(chunks).into_array();
@@ -248,7 +282,7 @@ async fn run(key_range: u64) {
 
     let raw = (NUM_RECORDS * RAW_BYTES_PER_RECORD) as f64;
     println!(
-        "key_range={key_range:>9}  gen={:>7.2}s  write={:>7.2}s  write_bytes={bytes:>10}  \
+        "{profile:>9?}  key_range={key_range:>9}  gen={:>7.2}s  write={:>7.2}s  write_bytes={bytes:>10}  \
          ratio_vs_raw={:>5.2}x  scan={:>7.2}s ({:>5.2} M rec/s)  rows={rows}",
         gen_elapsed.as_secs_f64(),
         write_elapsed.as_secs_f64(),
@@ -264,7 +298,9 @@ fn main() {
          raw logical size = {:.1} MiB\n",
         (NUM_RECORDS * RAW_BYTES_PER_RECORD) as f64 / (1024.0 * 1024.0)
     );
-    for &key_range in KEY_RANGES {
-        RUNTIME.block_on(run(key_range));
+    for profile in [Profile::Random, Profile::Realistic] {
+        for &key_range in KEY_RANGES {
+            RUNTIME.block_on(run(key_range, profile));
+        }
     }
 }
