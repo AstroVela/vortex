@@ -12,7 +12,8 @@
 //! 3. Warm up and sample each in-memory executor independently. Report median and min/max so
 //!    scheduler noise remains visible.
 //!
-//! Run with: `cargo run --release -p vortex-morsel --features _test-harness --bin morsel-eval`
+//! Run with:
+//! `cargo run --release -p vortex-morsel-push --features _test-harness --bin morsel-push-eval`
 
 use std::sync::Arc;
 use std::time::Duration;

@@ -17,7 +17,7 @@
 //! 3. Only then are the alternating timing iterations run.
 //!
 //! Run with:
-//! `cargo run --release -p vortex-morsel --features _test-harness --bin tpch-eval -- [scale]`
+//! `cargo run --release -p vortex-morsel-push --features _test-harness --bin tpch-push-eval -- [scale]`
 
 use std::fs::File;
 use std::io::Seek;
