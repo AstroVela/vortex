@@ -9,6 +9,7 @@
 //! wakes only the worker whose continuation parked on that ticket. Output order is restored by
 //! morsel index after all workers finish.
 
+use std::cell::RefCell;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::Weak;
@@ -76,6 +77,7 @@ fn overlapping_morsels(morsels: &[Range<u64>], range: &Range<u64>) -> usize {
 pub struct MorselScan {
     plan: Arc<ExecPlan>,
     segments: Arc<dyn SegmentSource>,
+    io: Option<Arc<IoService>>,
     session: VortexSession,
     morsels: Arc<[Range<u64>]>,
     threads: usize,
@@ -83,9 +85,15 @@ pub struct MorselScan {
     workers: Mutex<Option<MorselWorkerPool>>,
     completion: Option<CompletionSink>,
     worker_pool: Option<Arc<SharedMorselWorkerPool>>,
+    external_driver: Option<ExternalDriver>,
 }
 
 type CompletionSink = Arc<dyn Fn(usize, Option<ArrayRef>) + Send + Sync>;
+type ExternalDriver = Arc<dyn Fn() + Send + Sync>;
+
+thread_local! {
+    static EXTERNAL_ARENA: RefCell<Option<(Arc<ExecPlan>, Arena)>> = const { RefCell::new(None) };
+}
 
 struct WorkerRun {
     plan: Arc<ExecPlan>,
@@ -95,6 +103,7 @@ struct WorkerRun {
     cells: SharedCells,
     start: Instant,
     completion: Option<CompletionSink>,
+    external_driver: Option<ExternalDriver>,
 }
 
 #[derive(Clone, Copy)]
@@ -641,6 +650,24 @@ impl Scheduler {
                 continue;
             }
 
+            if let Some(driver) = &self.run.external_driver {
+                driver();
+                match signals.try_recv() {
+                    Ok(WorkerSignal::Wake(token)) if morsel.waiting == Some(token) => {
+                        morsel.waiting = None;
+                        runnable = true;
+                    }
+                    Ok(WorkerSignal::Wake(_)) | Err(crossbeam_channel::TryRecvError::Empty) => {}
+                    Ok(WorkerSignal::Shutdown)
+                    | Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+                }
+                if let Err(err) = self.try_run_io() {
+                    self.fail(err);
+                    break;
+                }
+                continue;
+            }
+
             crossbeam_channel::select_biased! {
                 recv(signals) -> signal => match signal {
                     Ok(WorkerSignal::Wake(token)) if morsel.waiting == Some(token) => {
@@ -863,17 +890,28 @@ impl MorselScan {
         segments: Arc<dyn SegmentSource>,
         session: VortexSession,
     ) -> Self {
-        let morsels = Arc::from(morsels(&plan, 0));
+        let morsels = morsels(&plan, 0);
+        Self::new_with_morsels(plan, segments, session, morsels)
+    }
+
+    pub(crate) fn new_with_morsels(
+        plan: Arc<ExecPlan>,
+        segments: Arc<dyn SegmentSource>,
+        session: VortexSession,
+        morsels: Vec<Range<u64>>,
+    ) -> Self {
         Self {
             plan,
             segments,
+            io: None,
             session,
-            morsels,
+            morsels: Arc::from(morsels),
             threads: 1,
             share_decodes: true,
             workers: Mutex::new(None),
             completion: None,
             worker_pool: None,
+            external_driver: None,
         }
     }
 
@@ -892,6 +930,16 @@ impl MorselScan {
     /// Enable or disable the leased shared decoded cells.
     pub fn with_share_decodes(mut self, share: bool) -> Self {
         self.share_decodes = share;
+        self
+    }
+
+    pub(crate) fn with_io_service(mut self, io: Arc<IoService>) -> Self {
+        self.io = Some(io);
+        self
+    }
+
+    pub(crate) fn with_external_driver(mut self, driver: ExternalDriver) -> Self {
+        self.external_driver = Some(driver);
         self
     }
 
@@ -933,6 +981,60 @@ impl MorselScan {
         Ok((batches, stats))
     }
 
+    /// Drive every configured morsel on the calling thread.
+    ///
+    /// This is intended for execution engines such as DuckDB that already own and schedule their
+    /// scan threads. Segment futures remain asynchronous, but no additional CPU worker is spawned.
+    pub fn run_on_current_thread(&self) -> VortexResult<(Vec<ArrayRef>, ScanStats)> {
+        let lease_counts = self.share_decodes.then(|| self.lease_counts());
+        let start = Instant::now();
+        let cells = match lease_counts {
+            Some(lease_counts) => SharedCells::with_leases(lease_counts),
+            None => SharedCells::disabled(),
+        };
+        let run = Arc::new(WorkerRun {
+            plan: Arc::clone(&self.plan),
+            session: self.session.clone(),
+            morsels: Arc::clone(&self.morsels),
+            io: self
+                .io
+                .clone()
+                .unwrap_or_else(|| IoService::new(Arc::clone(&self.segments))),
+            cells,
+            start,
+            completion: self.completion.clone(),
+            external_driver: self.external_driver.clone(),
+        });
+
+        let (scheduler, signals) = Scheduler::new(Arc::clone(&run), 1);
+        scheduler.submit_exact_lookahead();
+        let signals = signals
+            .into_iter()
+            .next()
+            .ok_or_else(|| vortex_err!("external morsel worker signal channel is missing"))?;
+        let plan = Arc::clone(&self.plan);
+        let stats = EXTERNAL_ARENA.with_borrow_mut(|slot| {
+            if slot
+                .as_ref()
+                .is_none_or(|(cached, _)| !Arc::ptr_eq(cached, &plan))
+            {
+                *slot = Some((Arc::clone(&plan), plan.instantiate()));
+            }
+            let Some((_, arena)) = slot.as_mut() else {
+                unreachable!("external arena was initialized above")
+            };
+            let mut execution = self.session.create_execution_ctx();
+            scheduler.worker_loop(0, &signals, arena, &mut execution)
+        });
+        let result = scheduler.finish(vec![stats]);
+        debug_assert_eq!(
+            run.cells.live(),
+            0,
+            "every lease must be released by the end of the scan"
+        );
+        result
+    }
+
     /// Run the scan with worker creation and shutdown outside the measured interval.
     pub(crate) fn run_timed(&self) -> VortexResult<(Vec<ArrayRef>, ScanStats, Duration)> {
         // Serialize runs over one scan: its affinity-owned arenas and workers are deliberately
@@ -951,10 +1053,14 @@ impl MorselScan {
             plan: Arc::clone(&self.plan),
             session: self.session.clone(),
             morsels: Arc::clone(&self.morsels),
-            io: IoService::new(Arc::clone(&self.segments)),
+            io: self
+                .io
+                .clone()
+                .unwrap_or_else(|| IoService::new(Arc::clone(&self.segments))),
             cells,
             start,
             completion: self.completion.clone(),
+            external_driver: self.external_driver.clone(),
         });
 
         let (scheduler, signals) = Scheduler::new(Arc::clone(&run), self.threads);

@@ -61,6 +61,7 @@ pub fn scan_backend_from_env() -> VortexResult<ScanBackend> {
 pub struct ScanExecutorOptions {
     threads: usize,
     pull_worker_pool: Option<Arc<SharedMorselWorkerPool>>,
+    external_driver: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Default for ScanExecutorOptions {
@@ -68,6 +69,7 @@ impl Default for ScanExecutorOptions {
         Self {
             threads: DEFAULT_THREADS,
             pull_worker_pool: None,
+            external_driver: None,
         }
     }
 }
@@ -76,6 +78,15 @@ impl ScanExecutorOptions {
     /// Set the number of workers used by either morsel implementation.
     pub fn with_threads(mut self, threads: usize) -> Self {
         self.threads = threads.max(1);
+        self
+    }
+
+    /// Let the execution engine's calling threads drive returned morsel futures directly.
+    /// `driver` must advance the engine's async runtime by one cooperative turn while a morsel is
+    /// waiting for segment I/O.
+    pub fn with_external_threads(mut self, driver: impl Fn() + Send + Sync + 'static) -> Self {
+        self.external_driver = Some(Arc::new(driver));
+        self.pull_worker_pool = None;
         self
     }
 
@@ -113,16 +124,21 @@ where
             let (layout, segments) = source();
             let mut executor =
                 MorselScanExecutor::new(layout, segments).with_threads(options.threads);
-            if let Some(worker_pool) = &options.pull_worker_pool {
+            if let Some(driver) = &options.external_driver {
+                executor = executor.with_external_threads(Arc::clone(driver));
+            } else if let Some(worker_pool) = &options.pull_worker_pool {
                 executor = executor.with_worker_pool(Arc::clone(worker_pool));
             }
             Some(Arc::new(executor))
         }
         ScanBackend::Push => {
             let (layout, segments) = source();
-            Some(Arc::new(
-                PushMorselScanExecutor::new(layout, segments).with_threads(options.threads),
-            ))
+            let mut executor =
+                PushMorselScanExecutor::new(layout, segments).with_threads(options.threads);
+            if let Some(driver) = &options.external_driver {
+                executor = executor.with_external_threads(Arc::clone(driver));
+            }
+            Some(Arc::new(executor))
         }
     }
 }

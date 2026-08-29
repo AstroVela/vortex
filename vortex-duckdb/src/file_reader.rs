@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::task::Poll;
 
 use futures::FutureExt;
 use object_store::registry::ObjectStoreRegistry;
@@ -27,7 +28,6 @@ use vortex::layout::LayoutReaderRef;
 use vortex::layout::scan::scan_builder::ScanBuilder;
 use vortex::layout::scan::scan_builder::ScanExecutor;
 use vortex::mask::Mask;
-use vortex_morsel_scan::ScanBackend;
 use vortex_morsel_scan::ScanExecutorOptions;
 use vortex_morsel_scan::scan_backend_from_env;
 use vortex_morsel_scan::scan_executor;
@@ -74,12 +74,6 @@ use crate::table_function::convert_result;
 // separate thread.
 
 static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::new);
-static MORSEL_SCAN_OPTIONS: LazyLock<ScanExecutorOptions> = LazyLock::new(|| {
-    ScanExecutorOptions::default()
-        .with_persistent_pull_workers(4)
-        .vortex_expect("failed to start morsel worker pool")
-});
-
 fn resolve_filesystem(url: &Url) -> VortexResult<(FileSystemRef, String)> {
     // Compat makes us use tokio which is very bad for local reads on
     // high-core machines because reads go into blocking pool
@@ -101,6 +95,19 @@ fn resolve_filesystem(url: &Url) -> VortexResult<(FileSystemRef, String)> {
     ))
 }
 
+fn drive_runtime_once() {
+    let mut yielded = false;
+    RUNTIME.block_on(std::future::poll_fn(move |cx| {
+        if yielded {
+            Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }));
+}
+
 pub struct OpenFileReader {
     pub reader: LayoutReaderRef,
     morsel_executor: Option<Arc<dyn ScanExecutor>>,
@@ -112,21 +119,17 @@ pub struct OpenFileReader {
 
 impl OpenFileReader {
     async fn open(file_path: String) -> VortexResult<Self> {
+        let backend = scan_backend_from_env()?;
         let url = parse_uri_or_path(&file_path)?;
         let (fs, path) = resolve_filesystem(&url)?;
         let file = fs.open_read(&path).await?;
         let file = open_cached(&SESSION, file, &path, None, &|options| options).await?;
         let reader = file.layout_reader()?;
-        let backend = scan_backend_from_env()?;
-        let default_options = ScanExecutorOptions::default();
-        let options = match backend {
-            ScanBackend::Pull => &*MORSEL_SCAN_OPTIONS,
-            ScanBackend::V1 | ScanBackend::Push => &default_options,
-        };
+        let options = ScanExecutorOptions::default().with_external_threads(drive_runtime_once);
         let morsel_executor = scan_executor(
             backend,
             || (Arc::clone(file.footer().layout()), file.segment_source()),
-            options,
+            &options,
         );
         Ok(OpenFileReader {
             reader,

@@ -34,6 +34,7 @@ use crate::MorselScan;
 use crate::build::ExecPlan;
 use crate::build::build_plan;
 use crate::driver::morsels;
+use crate::io::IoService;
 use crate::node::ExecutionMode;
 use crate::nodes::ConjunctMode;
 
@@ -46,6 +47,7 @@ pub struct PushMorselScanExecutor {
     target_rows: u64,
     conjunct_mode: ConjunctMode,
     threads: usize,
+    external_driver: Option<Arc<dyn Fn() + Send + Sync>>,
     plan_cache: Mutex<HashMap<PlanCacheKey, Arc<ExecPlan>>>,
 }
 
@@ -58,6 +60,7 @@ impl PushMorselScanExecutor {
             target_rows: 128 * 1024,
             conjunct_mode: ConjunctMode::Cascade,
             threads: 4,
+            external_driver: None,
             plan_cache: Mutex::default(),
         }
     }
@@ -77,6 +80,12 @@ impl PushMorselScanExecutor {
     /// Set the number of affinity workers used by one shared scan run.
     pub fn with_threads(mut self, threads: usize) -> Self {
         self.threads = threads.max(1);
+        self
+    }
+
+    /// Run each returned morsel future on the thread that polls it.
+    pub fn with_external_threads(mut self, driver: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.external_driver = Some(driver);
         self
     }
 }
@@ -126,6 +135,16 @@ impl ScanExecutor for PushMorselScanExecutor {
             &full_range,
             &request.selection,
         );
+
+        if let Some(driver) = &self.external_driver {
+            return build_external_outputs(
+                request,
+                plan,
+                Arc::clone(&self.segments),
+                morsels,
+                Arc::clone(driver),
+            );
+        }
 
         let mut work = Vec::with_capacity(morsels.len());
         let mut outputs = Vec::with_capacity(morsels.len());
@@ -230,6 +249,67 @@ impl ScanExecutor for PushMorselScanExecutor {
             .detach();
 
         Ok(outputs)
+    }
+}
+
+fn build_external_outputs(
+    request: ScanRequest,
+    plan: Arc<ExecPlan>,
+    segments: Arc<dyn SegmentSource>,
+    morsels: Vec<SelectedMorsel>,
+    driver: Arc<dyn Fn() + Send + Sync>,
+) -> VortexResult<Vec<BoxFuture<'static, VortexResult<Option<ArrayRef>>>>> {
+    let io = IoService::new(Arc::clone(&segments));
+    let mut outputs = Vec::with_capacity(morsels.len());
+    for morsel in morsels {
+        let pruning = request
+            .filter
+            .as_ref()
+            .map(|filter| {
+                request.layout_reader.pruning_evaluation(
+                    &morsel.range,
+                    filter,
+                    morsel.selection_mask.clone(),
+                )
+            })
+            .transpose()?;
+        let plan = Arc::clone(&plan);
+        let segments = Arc::clone(&segments);
+        let io = Arc::clone(&io);
+        let driver = Arc::clone(&driver);
+        let session = request.session.clone();
+        outputs.push(Box::pin(async move {
+            let ranges = match pruning {
+                Some(pruning) => {
+                    pruned_ranges(&morsel.range, &morsel.selection_mask, pruning.await?)
+                }
+                None => morsel.selected_ranges,
+            };
+            if ranges.is_empty() {
+                return Ok(None);
+            }
+            let (batches, _) = MorselScan::new_with_morsels(plan, segments, session, ranges)
+                .with_io_service(io)
+                .with_external_driver(driver)
+                .with_share_decodes(false)
+                .with_sparse_morsels(true)
+                .with_execution_mode(ExecutionMode::Push)
+                .run_on_current_thread()?;
+            combine_batches(batches)
+        })
+            as BoxFuture<'static, VortexResult<Option<ArrayRef>>>);
+    }
+    Ok(outputs)
+}
+
+fn combine_batches(mut batches: Vec<ArrayRef>) -> VortexResult<Option<ArrayRef>> {
+    match batches.len() {
+        0 => Ok(None),
+        1 => Ok(batches.pop()),
+        _ => {
+            let dtype = batches[0].dtype().clone();
+            ChunkedArray::try_new(batches, dtype).map(|array| Some(array.into_array()))
+        }
     }
 }
 

@@ -9,6 +9,7 @@
 //! wakes only the worker whose continuation parked on that ticket. Output order is restored by
 //! morsel index after all workers finish.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::Arc;
@@ -35,6 +36,7 @@ use vortex_array::IntoArray;
 use vortex_array::arrays::ChunkedArray;
 use vortex_error::VortexError;
 use vortex_error::VortexResult;
+use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
 use vortex_layout::segments::SegmentSource;
 use vortex_session::VortexSession;
@@ -95,6 +97,7 @@ fn overlapping_morsels(morsels: &[Range<u64>], range: &Range<u64>) -> usize {
 pub struct MorselScan {
     plan: Arc<ExecPlan>,
     segments: Arc<dyn SegmentSource>,
+    io: Option<Arc<IoService>>,
     session: VortexSession,
     morsels: Arc<[Range<u64>]>,
     threads: usize,
@@ -106,9 +109,15 @@ pub struct MorselScan {
     demand_hints: DemandHintDelivery,
     completion: Option<CompletionSink>,
     sparse_morsels: bool,
+    external_driver: Option<ExternalDriver>,
 }
 
 type CompletionSink = Arc<dyn Fn(usize, VortexResult<Option<ArrayRef>>) + Send + Sync>;
+type ExternalDriver = Arc<dyn Fn() + Send + Sync>;
+
+thread_local! {
+    static EXTERNAL_ARENA: RefCell<Option<(Arc<ExecPlan>, Arena)>> = const { RefCell::new(None) };
+}
 
 /// Delivery policy for optional scheduler-only demand hints.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -217,6 +226,7 @@ struct WorkerRun {
     output_rows: usize,
     output_bytes: u64,
     demand_hints: DemandHintDelivery,
+    external_driver: Option<ExternalDriver>,
 }
 
 #[derive(Clone, Copy)]
@@ -2482,6 +2492,21 @@ impl Scheduler {
         drain_queued_io_limit(limit, || self.try_run_io())
     }
 
+    fn drive_external_idle(
+        self: &Arc<Self>,
+        driver: &ExternalDriver,
+        signals: &Receiver<WorkerSignal>,
+        morsel: &mut LocalMorsel<'_>,
+    ) -> Option<bool> {
+        driver();
+        let wake = morsel.handle_external_signal(signals.try_recv())?;
+        if let Err(err) = self.try_run_io() {
+            self.fail(err);
+            return None;
+        }
+        Some(wake)
+    }
+
     fn worker_loop(
         self: &Arc<Self>,
         worker: usize,
@@ -2601,6 +2626,14 @@ impl Scheduler {
                     self.fail(err);
                     break;
                 }
+                continue;
+            }
+
+            if let Some(driver) = &self.run.external_driver {
+                let Some(wake) = self.drive_external_idle(driver, signals, &mut morsel) else {
+                    break;
+                };
+                runnable = wake;
                 continue;
             }
 
@@ -2801,6 +2834,12 @@ impl Scheduler {
 
         Ok(stats)
     }
+
+    fn take_ordered_batches(&self) -> Vec<ArrayRef> {
+        let mut results = std::mem::take(&mut *self.results.lock());
+        results.sort_unstable_by_key(|(index, coverage_start, ..)| (*index, *coverage_start));
+        results.into_iter().map(|(_, _, array, _)| array).collect()
+    }
 }
 
 enum LocalPoll {
@@ -2819,6 +2858,29 @@ enum LocalPoll {
 }
 
 impl<'a> LocalMorsel<'a> {
+    fn handle_external_signal(
+        &mut self,
+        signal: Result<WorkerSignal, crossbeam_channel::TryRecvError>,
+    ) -> Option<bool> {
+        match signal {
+            Ok(WorkerSignal::Wake(token)) if self.waiting == Some(token) => {
+                self.waiting = None;
+                Some(true)
+            }
+            Ok(WorkerSignal::Wake(_)) | Err(crossbeam_channel::TryRecvError::Empty) => Some(false),
+            Ok(WorkerSignal::PushWake(token)) => Some(self.wake_pipeline(token)),
+            Ok(WorkerSignal::Credit(token)) if self.credit_waiting == Some(token) => {
+                self.credit_waiting = None;
+                Some(true)
+            }
+            Ok(WorkerSignal::Credit(_)) => {
+                self.stats.push_stale_wakes += 1;
+                Some(false)
+            }
+            Ok(WorkerSignal::Shutdown) | Err(crossbeam_channel::TryRecvError::Disconnected) => None,
+        }
+    }
+
     fn restore_physical(&mut self) {
         if let Some(physical) = self.physical.take() {
             self.arena.restore_push_sidebands(physical.into_sidebands());
@@ -3486,12 +3548,22 @@ impl MorselScan {
         segments: Arc<dyn SegmentSource>,
         session: VortexSession,
     ) -> Self {
-        let morsels = Arc::from(morsels(&plan, 0));
+        let morsels = morsels(&plan, 0);
+        Self::new_with_morsels(plan, segments, session, morsels)
+    }
+
+    pub(crate) fn new_with_morsels(
+        plan: Arc<ExecPlan>,
+        segments: Arc<dyn SegmentSource>,
+        session: VortexSession,
+        morsels: Vec<Range<u64>>,
+    ) -> Self {
         Self {
             plan,
             segments,
+            io: None,
             session,
-            morsels,
+            morsels: Arc::from(morsels),
             threads: 1,
             share_decodes: true,
             execution_mode: ExecutionMode::Pull,
@@ -3501,6 +3573,7 @@ impl MorselScan {
             demand_hints: DemandHintDelivery::Immediate,
             completion: None,
             sparse_morsels: false,
+            external_driver: None,
         }
     }
 
@@ -3558,6 +3631,16 @@ impl MorselScan {
     /// Enable or disable the leased shared decoded cells.
     pub fn with_share_decodes(mut self, share: bool) -> Self {
         self.share_decodes = share;
+        self
+    }
+
+    pub(crate) fn with_io_service(mut self, io: Arc<IoService>) -> Self {
+        self.io = Some(io);
+        self
+    }
+
+    pub(crate) fn with_external_driver(mut self, driver: ExternalDriver) -> Self {
+        self.external_driver = Some(driver);
         self
     }
 
@@ -3630,6 +3713,72 @@ impl MorselScan {
         Ok((batches, stats))
     }
 
+    /// Drive every configured morsel on the calling thread.
+    ///
+    /// This is intended for execution engines such as DuckDB that already own and schedule their
+    /// scan threads. Segment futures remain asynchronous; only ordered output coordination uses a
+    /// helper thread.
+    pub fn run_on_current_thread(&self) -> VortexResult<(Vec<ArrayRef>, ScanStats)> {
+        self.validate_morsels()?;
+        vortex_ensure!(
+            self.output_rows == usize::MAX && self.output_bytes == u64::MAX,
+            "caller-thread scans require unbounded output credit"
+        );
+
+        let start = Instant::now();
+        let cells = if self.share_decodes {
+            SharedCells::with_leases(self.lease_counts())
+        } else {
+            SharedCells::disabled()
+        };
+        let run = Arc::new(WorkerRun {
+            plan: Arc::clone(&self.plan),
+            session: self.session.clone(),
+            morsels: Arc::clone(&self.morsels),
+            io: self
+                .io
+                .clone()
+                .unwrap_or_else(|| IoService::new(Arc::clone(&self.segments))),
+            cells,
+            start,
+            execution_mode: self.execution_mode,
+            lookahead_morsels: self.lookahead_morsels,
+            output_rows: self.output_rows,
+            output_bytes: self.output_bytes,
+            demand_hints: self.demand_hints,
+            external_driver: self.external_driver.clone(),
+        });
+        let (scheduler, signals) = Scheduler::new(Arc::clone(&run), 1);
+        scheduler.submit_exact_lookahead();
+        let signals = signals
+            .into_iter()
+            .next()
+            .ok_or_else(|| vortex_err!("external morsel worker signal channel is missing"))?;
+        let plan = Arc::clone(&self.plan);
+        let worker_stats = EXTERNAL_ARENA.with_borrow_mut(|slot| {
+            if slot
+                .as_ref()
+                .is_none_or(|(cached, _)| !Arc::ptr_eq(cached, &plan))
+            {
+                *slot = Some((Arc::clone(&plan), plan.instantiate()));
+            }
+            let Some((_, arena)) = slot.as_mut() else {
+                unreachable!("external arena was initialized above")
+            };
+            scheduler.worker_loop(0, &signals, arena)
+        });
+        let stats = scheduler.finish(vec![worker_stats])?;
+        let batches = scheduler.take_ordered_batches();
+        if scheduler.remaining.load(Ordering::Acquire) == 0 {
+            debug_assert_eq!(
+                run.cells.live(),
+                0,
+                "every lease must be released by the end of the scan"
+            );
+        }
+        Ok((batches, stats))
+    }
+
     /// Start the scan and return an ordered blocking stream with the configured credited-output
     /// bound. Root-edge heads may add at most one parked batch per active worker.
     pub fn into_stream(self) -> VortexResult<MorselStream> {
@@ -3687,7 +3836,10 @@ impl MorselScan {
             plan: Arc::clone(&self.plan),
             session: self.session.clone(),
             morsels: Arc::clone(&self.morsels),
-            io: IoService::new(Arc::clone(&self.segments)),
+            io: self
+                .io
+                .clone()
+                .unwrap_or_else(|| IoService::new(Arc::clone(&self.segments))),
             cells,
             start,
             execution_mode: self.execution_mode,
@@ -3695,6 +3847,7 @@ impl MorselScan {
             output_rows: self.output_rows,
             output_bytes: self.output_bytes,
             demand_hints: self.demand_hints,
+            external_driver: self.external_driver.clone(),
         });
 
         let (scheduler, signals) = Scheduler::new(Arc::clone(&run), self.threads);
