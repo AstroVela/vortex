@@ -61,6 +61,19 @@ fn sample_input() -> VarBinArray {
     )
 }
 
+fn nullable_sample_input() -> VarBinArray {
+    VarBinArray::from_iter(
+        [
+            Some("https://www.example.com/page"),
+            None,
+            Some("https://www.test.org/page"),
+            None,
+            Some("https://www.example.com/page"),
+        ],
+        DType::Utf8(Nullability::Nullable),
+    )
+}
+
 #[test]
 fn test_direct_offset_builder() -> vortex_error::VortexResult<()> {
     let mut ctx = SESSION.create_execution_ctx();
@@ -178,6 +191,24 @@ fn test_onpair_roundtrip() -> vortex_error::VortexResult<()> {
     assert_eq!(
         got[3].as_deref(),
         Some(b"ftp://files.example.com/x".as_ref())
+    );
+    Ok(())
+}
+
+/// Any chunk whose valid rows total at most `u32::MAX` bytes — every chunk in
+/// practice — is encoded at `u32` byte offsets, so the row layer comes back at
+/// that width and becomes the `codes_offsets` child unchanged. Nullable inputs
+/// take the other gather branch and must land on the same width.
+#[cfg_attr(miri, ignore)]
+#[rstest::rstest]
+#[case::non_nullable(sample_input())]
+#[case::nullable(nullable_sample_input())]
+fn test_codes_offsets_width_is_u32(#[case] input: VarBinArray) -> vortex_error::VortexResult<()> {
+    let mut ctx = SESSION.create_execution_ctx();
+    let encoded = compress_onpair(&input.into_array(), &mut ctx)?;
+    assert_eq!(
+        encoded.as_view().codes_offsets().dtype().as_ptype(),
+        PType::U32
     );
     Ok(())
 }
