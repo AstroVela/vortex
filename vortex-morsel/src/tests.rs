@@ -551,6 +551,77 @@ fn same_column_conjuncts_share_one_predicate_input() -> VortexResult<()> {
     Ok(())
 }
 
+#[test]
+fn conjuncts_learn_orders_across_morsels() -> VortexResult<()> {
+    let session = session();
+    let fixture = misaligned_fixture(&session, ROWS)?;
+    let segments: Arc<dyn SegmentSource> = Arc::clone(&fixture.segments);
+    let projection = select(vec!["c"], root());
+    let config = MorselConfig {
+        threads: 1,
+        morsel_rows: 100,
+        share_decodes: false,
+        ..Default::default()
+    };
+
+    let between_groups = Query {
+        name: "reorder-between-groups",
+        projection: projection.clone(),
+        filter: Some(and(
+            gt(get_item("a", root()), lit(0i32)),
+            lt(get_item("b", root()), lit(10i32)),
+        )),
+    };
+    let between_v1 = run_v1(&session, &fixture.layout, &segments, &between_groups)?;
+    let between_morsel = run_morsel(
+        &session,
+        &fixture.layout,
+        &segments,
+        &between_groups,
+        config,
+    )?;
+    assert_same_rows(
+        &session,
+        &v1_dtype(&fixture.layout, &between_groups)?,
+        &between_v1,
+        &between_morsel,
+    )?;
+    assert!(
+        between_morsel
+            .stats
+            .as_ref()
+            .expect("morsel runs report stats")
+            .inter_group_reorders
+            > 0
+    );
+
+    let within_group = Query {
+        name: "reorder-within-group",
+        projection,
+        filter: Some(and(
+            gt(get_item("a", root()), lit(0i32)),
+            lt(get_item("a", root()), lit(10i32)),
+        )),
+    };
+    let within_v1 = run_v1(&session, &fixture.layout, &segments, &within_group)?;
+    let within_morsel = run_morsel(&session, &fixture.layout, &segments, &within_group, config)?;
+    assert_same_rows(
+        &session,
+        &v1_dtype(&fixture.layout, &within_group)?,
+        &within_v1,
+        &within_morsel,
+    )?;
+    assert!(
+        within_morsel
+            .stats
+            .as_ref()
+            .expect("morsel runs report stats")
+            .intra_group_reorders
+            > 0
+    );
+    Ok(())
+}
+
 struct CountingSegmentSource {
     inner: Arc<dyn SegmentSource>,
     requests: Arc<AtomicUsize>,

@@ -34,6 +34,12 @@ The accumulated morsel optimizations on this branch are:
 - bounded 64 KiB/4 MiB local-file coalescing avoids both tiny reads and excessive gap amplification;
 - top-level conjuncts referencing the same column now share one column input and one `PredicateExec`
   plan node. The column is decoded once and its predicates progressively refine one mask;
+- conjunct order is adaptive across morsels owned by the same worker. Independently decoded groups
+  learn active execution time per rejected row from their first complete morsel, while predicates
+  sharing one decoded column reorder only when the winner is selective enough to cross the existing
+  20% sparse-evaluation threshold. Parallel conjunct mode retains expression order;
+- learned orders reuse worker-arena vectors and stop collecting observations after the first sample,
+  so steady-state morsels allocate no ordering state and take no ordering clocks;
 - sparse same-column ranges can use a normalized fused expression, while dense ranges retain the
   original encoding-aware comparisons. This recovers Q6's range win without the decimal `Between`
   regression observed on Q19;
@@ -96,6 +102,27 @@ Two broader scheduler shortcuts were tested and rejected:
 The rule therefore remains deliberately narrower: conjuncts share one `PredicateExec` only when
 each conjunct's complete field set is the same single column.
 
+### Adaptive conjunct ordering
+
+Ordering observations are worker-local and survive `reset` when that worker advances to its next
+morsel. A morsel and its partial node state still never migrate. Cross-group timing covers only
+active `execute` calls and accumulates across suspension, so background I/O wait time is not charged
+as predicate CPU cost. A worker keeps expression order until every group has one observation; this
+avoids speculative exploration changing short-circuit/decode accounting when the original first
+group already empties the morsel.
+
+Two broader versions were rejected while implementing this:
+
+- scan-wide atomic observations caused cache-line contention between workers;
+- allocating and cloning new order vectors for every morsel regressed Q6 even when no order changed.
+
+The retained implementation uses persistent vectors in each worker arena and observes each
+predicate once. On 16 physical cores with 128k-row morsels, 101-iteration SF=1 medians were neutral:
+Q6 was 1.695 ms fixed versus 1.687 ms adaptive with no reorder, and Q12 was 1.702 versus 1.699 ms
+with cross-group reordering in 30 of 46 morsels. SF=10 gives learning more runway: Q12 improved from
+14.679 to 14.396 ms (1.9%) over 458 morsels, with identical 2,061 physical reads and 393,141,420
+segment bytes; 442 morsels used a learned group order.
+
 ## 1. Run it
 
 ```bash
@@ -139,7 +166,7 @@ not a complete Vortex file with a footer.
 ## 2. Fairness and correctness
 
 Before timing, every configuration is compared with V1 on dtype, row count, and ordered content.
-A mismatch aborts the run. The 29 `vortex-morsel` tests include differential coverage against the
+A mismatch aborts the run. The 32 `vortex-morsel` tests include differential coverage against the
 V1 `LayoutReader` and scheduler/I/O regressions.
 
 The executor rejects unsupported layouts at plan-build time. Timed runs prepare worker threads and

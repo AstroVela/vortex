@@ -3,6 +3,7 @@
 
 use std::ops::BitAnd;
 use std::ops::Range;
+use std::time::Duration;
 
 use vortex_array::expr::BoundExpression;
 use vortex_error::VortexResult;
@@ -21,6 +22,8 @@ use crate::node::RetireCx;
 use crate::node::Value;
 use crate::node::ValueBatch;
 use crate::nodes::EXPR_EVAL_THRESHOLD;
+use crate::nodes::ordering::AdaptiveOrdering;
+use crate::nodes::ordering::OrderingGoal;
 
 /// All conjuncts backed by one input column subtree.
 ///
@@ -31,11 +34,16 @@ pub struct PredicateExec {
     input: NodeId,
     predicates: Vec<BoundExpression>,
     sparse_predicates: Option<Vec<BoundExpression>>,
+    ordering: AdaptiveOrdering,
+    sparse_ordering: Option<AdaptiveOrdering>,
     children: [NodeId; 1],
 
     // Per-morsel state.
     range: Range<u64>,
     plan_started: bool,
+    predicate_order: Vec<usize>,
+    sparse_predicate_order: Option<Vec<usize>>,
+    order_recorded: bool,
     done: bool,
 }
 
@@ -47,13 +55,23 @@ impl PredicateExec {
         sparse_predicates: Option<Vec<BoundExpression>>,
     ) -> Self {
         debug_assert!(!predicates.is_empty());
+        let ordering = AdaptiveOrdering::new(predicates.len(), OrderingGoal::SparseEvaluation);
+        let sparse_ordering = sparse_predicates.as_ref().map(|predicates| {
+            AdaptiveOrdering::new(predicates.len(), OrderingGoal::SparseEvaluation)
+        });
+        let sparse_predicate_order = sparse_predicates.as_ref().map(|_| Vec::new());
         Self {
             input,
             predicates,
             sparse_predicates,
+            ordering,
+            sparse_ordering,
             children: [input],
             range: 0..0,
             plan_started: false,
+            predicate_order: Vec::new(),
+            sparse_predicate_order,
+            order_recorded: false,
             done: false,
         }
     }
@@ -72,6 +90,15 @@ impl ExecNode for PredicateExec {
     fn reset(&mut self, range: Range<u64>) {
         self.range = range;
         self.plan_started = false;
+        self.ordering.update_order(&mut self.predicate_order);
+        if let Some((ordering, predicate_order)) = self
+            .sparse_ordering
+            .as_ref()
+            .zip(self.sparse_predicate_order.as_mut())
+        {
+            ordering.update_order(predicate_order);
+        }
+        self.order_recorded = false;
         self.done = false;
     }
 
@@ -118,42 +145,88 @@ impl ExecNode for PredicateExec {
                 .sparse_predicates
                 .as_deref()
                 .unwrap_or(&self.predicates);
+            let predicate_order = self
+                .sparse_predicate_order
+                .as_deref()
+                .unwrap_or(&self.predicate_order);
+            if !self.order_recorded && !is_identity(predicate_order) {
+                cx.stats().intra_group_reorders += 1;
+            }
+            self.order_recorded = true;
             let mut relative = Mask::new_true(array.len());
-            for (index, predicate) in predicates.iter().enumerate() {
+            for position in 0..predicate_order.len() {
+                let predicate_index = predicate_order[position];
                 if relative.all_false() {
-                    cx.stats().conjuncts_short_circuited += (predicates.len() - index) as u64;
+                    cx.stats().conjuncts_short_circuited +=
+                        (predicate_order.len() - position) as u64;
                     break;
                 }
+                let observe = self
+                    .sparse_ordering
+                    .as_ref()
+                    .unwrap_or(&self.ordering)
+                    .needs_observation(predicate_index);
+                let input_rows = observe.then(|| relative.true_count());
                 let active = if relative.all_true() {
                     array.clone()
                 } else {
                     array.filter(relative.clone())?
                 };
-                let predicate_mask = Self::evaluate(active, predicate, cx)?;
+                let predicate_mask = Self::evaluate(active, &predicates[predicate_index], cx)?;
+                let output_rows = observe.then(|| predicate_mask.true_count());
                 relative = relative.intersect_by_rank(&predicate_mask);
+                if let (Some(input_rows), Some(output_rows)) = (input_rows, output_rows) {
+                    let ordering = self.sparse_ordering.as_mut().unwrap_or(&mut self.ordering);
+                    ordering.observe(predicate_index, input_rows, output_rows, Duration::ZERO);
+                }
             }
             incoming.intersect_by_rank(&relative)
         } else {
             // `array` covers the full range. Mirror the original cross-node cascade: evaluate
             // densely while the surviving mask is dense, then switch to filtered rank space.
             let mut refined = incoming;
-            for (index, predicate) in self.predicates.iter().enumerate() {
+            if !self.order_recorded && !is_identity(&self.predicate_order) {
+                cx.stats().intra_group_reorders += 1;
+            }
+            self.order_recorded = true;
+            for position in 0..self.predicate_order.len() {
+                let predicate_index = self.predicate_order[position];
                 if refined.all_false() {
-                    cx.stats().conjuncts_short_circuited += (self.predicates.len() - index) as u64;
+                    cx.stats().conjuncts_short_circuited +=
+                        (self.predicate_order.len() - position) as u64;
                     break;
                 }
+                let observe = self.ordering.needs_observation(predicate_index);
                 let sparse = refined.density() < EXPR_EVAL_THRESHOLD;
+                let observed_input_rows = observe.then(|| {
+                    if sparse {
+                        refined.true_count()
+                    } else {
+                        array.len()
+                    }
+                });
                 let active = if sparse {
                     array.filter(refined.clone())?
                 } else {
                     array.clone()
                 };
-                let predicate_mask = Self::evaluate(active, predicate, cx)?;
+                let predicate_mask = Self::evaluate(active, &self.predicates[predicate_index], cx)?;
+                let observed_output_rows = observe.then(|| predicate_mask.true_count());
                 refined = if sparse {
                     refined.intersect_by_rank(&predicate_mask)
                 } else {
                     refined.bitand(&predicate_mask)
                 };
+                if let (Some(observed_input_rows), Some(observed_output_rows)) =
+                    (observed_input_rows, observed_output_rows)
+                {
+                    self.ordering.observe(
+                        predicate_index,
+                        observed_input_rows,
+                        observed_output_rows,
+                        Duration::ZERO,
+                    );
+                }
             }
             refined
         };
@@ -171,4 +244,8 @@ impl ExecNode for PredicateExec {
     fn children(&self) -> &[NodeId] {
         &self.children
     }
+}
+
+fn is_identity(order: &[usize]) -> bool {
+    order.iter().copied().eq(0..order.len())
 }

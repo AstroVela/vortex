@@ -42,6 +42,10 @@ pub struct ScanStats {
     pub decode_reuses: u64,
     /// Conjuncts skipped because the mask was already all-false.
     pub conjuncts_short_circuited: u64,
+    /// Morsels that evaluated predicate groups in a learned order instead of expression order.
+    pub inter_group_reorders: u64,
+    /// Same-column predicate groups that evaluated expressions in a learned order.
+    pub intra_group_reorders: u64,
     /// Morsels whose filter selected no rows.
     pub morsels_empty: u64,
     /// Exact-ticket suspensions returned by execution nodes.
@@ -85,6 +89,8 @@ impl ScanStats {
         self.decodes += other.decodes;
         self.decode_reuses += other.decode_reuses;
         self.conjuncts_short_circuited += other.conjuncts_short_circuited;
+        self.inter_group_reorders += other.inter_group_reorders;
+        self.intra_group_reorders += other.intra_group_reorders;
         self.morsels_empty += other.morsels_empty;
         self.execute_io_blocks += other.execute_io_blocks;
         self.morsels_blocked_for_io += other.morsels_blocked_for_io;

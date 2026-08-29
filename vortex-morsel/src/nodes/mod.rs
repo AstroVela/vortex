@@ -7,6 +7,7 @@ mod chunked;
 mod conjunct;
 mod filter;
 mod flat;
+pub(crate) mod ordering;
 mod predicate;
 mod struct_;
 

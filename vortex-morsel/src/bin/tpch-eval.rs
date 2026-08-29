@@ -131,6 +131,8 @@ struct Timing {
     wait_time: Option<Duration>,
     decodes: Option<u64>,
     reuses: Option<u64>,
+    inter_group_reorders: Option<u64>,
+    intra_group_reorders: Option<u64>,
     morsels: Option<u64>,
     io_uses: Option<u64>,
     logical_requests: Option<u64>,
@@ -628,6 +630,8 @@ fn main() -> VortexResult<()> {
                     wait_time: median.stats.as_ref().map(|s| s.io_wait_time),
                     decodes: median.stats.as_ref().map(|s| s.decodes),
                     reuses: median.stats.as_ref().map(|s| s.decode_reuses),
+                    inter_group_reorders: median.stats.as_ref().map(|s| s.inter_group_reorders),
+                    intra_group_reorders: median.stats.as_ref().map(|s| s.intra_group_reorders),
                     morsels: median.stats.as_ref().map(|s| s.morsels),
                     io_uses: median.stats.as_ref().map(|s| s.io_uses),
                     logical_requests: median.stats.as_ref().map(|s| s.io_requests),
@@ -903,9 +907,10 @@ fn report(query: &Query, timings: &[Timing], total_rows: u64) {
     println!(
         "| executor | wall | vs V1 | ttfb | morsels | named IO/morsel | new requests/morsel | IO \
          batches/morsel | blocked/morsel | physical reads | physical bytes | segment bytes | \
-         nowait hit/miss/unsupported | pending polls | async wait | decodes | reuses |"
+         nowait hit/miss/unsupported | pending polls | async wait | decodes | reuses | reordered \
+         groups/within |"
     );
-    println!("|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|");
+    println!("|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|");
     for timing in timings {
         let ratio = if baseline.is_zero() {
             "—".to_string()
@@ -916,7 +921,7 @@ fn report(query: &Query, timings: &[Timing], total_rows: u64) {
             )
         };
         println!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {}/{} |",
             timing.label,
             timing_range(timing.median, timing.min, timing.max),
             ratio,
@@ -957,6 +962,8 @@ fn report(query: &Query, timings: &[Timing], total_rows: u64) {
                 .unwrap_or_else(|| "—".to_string()),
             opt(timing.decodes),
             opt(timing.reuses),
+            opt(timing.inter_group_reorders),
+            opt(timing.intra_group_reorders),
         );
     }
     println!();

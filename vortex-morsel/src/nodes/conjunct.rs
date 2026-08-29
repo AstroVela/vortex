@@ -3,6 +3,8 @@
 
 use std::ops::BitAnd;
 use std::ops::Range;
+use std::time::Duration;
+use std::time::Instant;
 
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
@@ -20,6 +22,9 @@ use crate::node::PlanPoll;
 use crate::node::RetireCx;
 use crate::node::Value;
 use crate::node::ValueBatch;
+use crate::nodes::ordering::AdaptiveOrdering;
+use crate::nodes::ordering::OrderingGoal;
+
 /// One independently schedulable group of same-column conjuncts.
 pub struct ConjunctGroup {
     /// The grouped predicate node.
@@ -46,12 +51,17 @@ pub enum ConjunctMode {
 pub struct ConjunctExec {
     groups: Vec<ConjunctGroup>,
     mode: ConjunctMode,
+    ordering: AdaptiveOrdering,
+    adaptive: bool,
 
     // Per-morsel state.
     range: Range<u64>,
+    group_order: Vec<usize>,
     plan_cursor: usize,
     plan_started: bool,
     exec_cursor: usize,
+    active_elapsed: Duration,
+    order_recorded: bool,
     incoming: Option<Mask>,
     mask: Option<Mask>,
     done: bool,
@@ -62,13 +72,20 @@ impl ConjunctExec {
     /// Build a conjunct node.
     pub fn new(groups: Vec<ConjunctGroup>, mode: ConjunctMode) -> Self {
         let children = groups.iter().map(|group| group.predicate).collect();
+        let ordering = AdaptiveOrdering::new(groups.len(), OrderingGoal::CostPerRejectedRow);
+        let adaptive = mode == ConjunctMode::Cascade && groups.len() > 1;
         Self {
             groups,
             mode,
+            ordering,
+            adaptive,
             range: 0..0,
+            group_order: Vec::new(),
             plan_cursor: 0,
             plan_started: false,
             exec_cursor: 0,
+            active_elapsed: Duration::ZERO,
+            order_recorded: false,
             incoming: None,
             mask: None,
             done: false,
@@ -77,9 +94,9 @@ impl ConjunctExec {
     }
 
     fn remaining_conjuncts(&self) -> usize {
-        self.groups[self.exec_cursor..]
+        self.group_order[self.exec_cursor..]
             .iter()
-            .map(|group| group.conjunct_count)
+            .map(|&index| self.groups[index].conjunct_count)
             .sum()
     }
 }
@@ -87,9 +104,17 @@ impl ConjunctExec {
 impl ExecNode for ConjunctExec {
     fn reset(&mut self, range: Range<u64>) {
         self.range = range;
+        if self.adaptive {
+            self.ordering.update_order(&mut self.group_order);
+        } else {
+            self.group_order.clear();
+            self.group_order.extend(0..self.groups.len());
+        }
         self.plan_cursor = 0;
         self.plan_started = false;
         self.exec_cursor = 0;
+        self.active_elapsed = Duration::ZERO;
+        self.order_recorded = false;
         self.incoming = None;
         self.mask = None;
         self.done = false;
@@ -106,8 +131,9 @@ impl ExecNode for ConjunctExec {
             }
             let fresh = !self.plan_started;
             self.plan_started = true;
+            let group_index = self.group_order[self.plan_cursor];
             if cx.plan_child(
-                self.groups[self.plan_cursor].predicate,
+                self.groups[group_index].predicate,
                 self.range.clone(),
                 fresh,
             )? {
@@ -128,6 +154,10 @@ impl ExecNode for ConjunctExec {
             let incoming = cx.demand().clone();
             self.mask = Some(incoming.clone());
             self.incoming = Some(incoming);
+            if !self.order_recorded && !is_identity(&self.group_order) {
+                cx.stats().inter_group_reorders += 1;
+            }
+            self.order_recorded = true;
         }
 
         while self.exec_cursor < self.groups.len() {
@@ -143,9 +173,26 @@ impl ExecNode for ConjunctExec {
                 break;
             }
 
-            let predicate = self.groups[self.exec_cursor].predicate;
-            match cx.child_mask(predicate, eval_demand)? {
+            let group_index = self.group_order[self.exec_cursor];
+            let predicate = self.groups[group_index].predicate;
+            let observe = self.adaptive && self.ordering.needs_observation(group_index);
+            let input_rows = observe.then(|| eval_demand.true_count());
+            let started = observe.then(Instant::now);
+            let poll = cx.child_mask(predicate, eval_demand);
+            if let Some(started) = started {
+                self.active_elapsed += started.elapsed();
+            }
+            match poll? {
                 ChildPoll::Value(refined) => {
+                    if let Some(input_rows) = input_rows {
+                        self.ordering.observe(
+                            group_index,
+                            input_rows,
+                            refined.true_count(),
+                            self.active_elapsed,
+                        );
+                    }
+                    self.active_elapsed = Duration::ZERO;
                     if self.mode == ConjunctMode::Parallel {
                         self.mask = Some(
                             self.mask
@@ -187,4 +234,8 @@ impl ExecNode for ConjunctExec {
     fn children(&self) -> &[NodeId] {
         &self.children
     }
+}
+
+fn is_identity(order: &[usize]) -> bool {
+    order.iter().copied().eq(0..order.len())
 }
