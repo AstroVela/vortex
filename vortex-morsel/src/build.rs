@@ -285,7 +285,7 @@ pub fn build_plan(
         splits: Vec::new(),
     };
 
-    // The filter: one subtree per conjunct, each over just that conjunct's fields.
+    // The filter: same-column conjuncts share one input subtree.
     let predicate = match filter {
         None => None,
         Some(filter) => {

@@ -863,11 +863,11 @@ impl MorselScan {
     /// Run the scan with worker creation and shutdown outside the measured interval.
     pub(crate) fn run_timed(&self) -> VortexResult<(Vec<ArrayRef>, ScanStats, Duration)> {
         let workers = MorselWorkerPool::new(self.threads, Arc::clone(&self.plan))?;
+        let lease_counts = self.share_decodes.then(|| self.lease_counts());
         let start = Instant::now();
-        let cells = if self.share_decodes {
-            SharedCells::with_leases(self.lease_counts())
-        } else {
-            SharedCells::disabled()
+        let cells = match lease_counts {
+            Some(lease_counts) => SharedCells::with_leases(lease_counts),
+            None => SharedCells::disabled(),
         };
         let run = Arc::new(WorkerRun {
             plan: Arc::clone(&self.plan),

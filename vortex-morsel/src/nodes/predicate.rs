@@ -4,7 +4,6 @@
 use std::ops::BitAnd;
 use std::ops::Range;
 
-use vortex_array::VortexSessionExecute;
 use vortex_array::expr::BoundExpression;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
@@ -65,8 +64,7 @@ impl PredicateExec {
         cx: &mut ExecCx<'_>,
     ) -> VortexResult<Mask> {
         let predicate = array.apply_bound(predicate)?;
-        let mut ctx = cx.session().create_execution_ctx();
-        predicate.null_as_false().execute(&mut ctx)
+        predicate.null_as_false().execute(cx.execution())
     }
 }
 

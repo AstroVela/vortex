@@ -15,6 +15,11 @@ over the same generated segments and verifies identical dtype, row count, and or
 reporting timings. Layout-v27 was ported only for study and benchmarking; the morsel implementation
 does not depend on its executor.
 
+The signed-off comparison checkpoint is commit `82bf78284` on
+`ji/morsel-layout27-comparison`. A push was attempted from the measurement host, but that host has
+neither HTTPS GitHub credentials nor the `gh` executable, so publication remains pending from an
+authenticated checkout.
+
 The accumulated morsel optimizations on this branch are:
 
 - worker threads and reusable thread-local arenas are created outside timed execution;
@@ -55,6 +60,41 @@ remained 161 reads and 34,559,892 segment bytes. Its single-worker median improv
 before same-column range fusion to 21.08 ms. Q19 remained on the dense encoding-aware path at
 13.09 ms on one worker and 1.62 ms at x32/128k instead of regressing to roughly 25 ms with
 unconditional decimal range fusion.
+
+### Follow-up profiling and rejected shortcuts
+
+Two small follow-up cleanups remain useful even though they are not headline speedups. Lease counts
+depend only on the immutable plan and morsel cut, so they are computed with the other scan preparation
+before timing. Operators in one morsel execution quantum also share one array `ExecutionCtx` instead
+of repeatedly snapshotting the same session kernel registry for each predicate.
+
+An exact comparison against `82bf78284` measured Q12 at 19.364 ms before and 19.247 ms after on one
+physical core. A bare six-column scan moved from 0.702 to 0.698 ms. Both differences are below 1%
+and are not measurable wins; treat these changes as orchestration cleanup, not throughput claims.
+
+The follow-up Q12/128k profile is `/tmp/q12-current-lazy-inline.profile.json.gz` on the measurement
+host. It was recorded while testing the subsequently rejected lazy-inline scheduler variant, so it
+is evidence for hotspot selection rather than a profile of the final branch byte-for-byte. Resolving
+its hottest worker addresses identifies FastLanes FOR/bitpacking decompression, vectorized `i32`
+comparisons, and mask-index construction as the remaining compute work. Open it with:
+
+```bash
+samply load /tmp/q12-current-lazy-inline.profile.json.gz
+```
+
+Two broader scheduler shortcuts were tested and rejected:
+
+- avoiding all scheduler work for immediately available in-memory tickets changed Q12 by less than
+  measurement noise and improved scan-6col by only 1.6%, while introducing a second fallback
+  submission path and less clear I/O-batch accounting;
+- moving Q12's grouped receipt-date range ahead of its two-column comparisons made no measurable
+  difference;
+- merging conjuncts merely because their field sets overlap reduced Q12 logical consumers from 460
+  to 368 but regressed x16/128k from roughly 1.72 to 2.11 ms, because one eager three-column input
+  destroyed the useful cascade boundary.
+
+The rule therefore remains deliberately narrower: conjuncts share one `PredicateExec` only when
+each conjunct's complete field set is the same single column.
 
 ## 1. Run it
 

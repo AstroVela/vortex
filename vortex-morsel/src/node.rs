@@ -6,6 +6,8 @@
 use std::ops::Range;
 
 use vortex_array::ArrayRef;
+use vortex_array::ExecutionCtx;
+use vortex_array::VortexSessionExecute;
 use vortex_array::buffer::BufferHandle;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
@@ -306,6 +308,7 @@ pub struct ExecCx<'a> {
     io: &'a IoPlane,
     cells: &'a SharedCells,
     session: &'a VortexSession,
+    execution: &'a mut ExecutionCtx,
     stats: &'a mut ScanStats,
     demand: Mask,
 }
@@ -322,6 +325,11 @@ impl<'a> ExecCx<'a> {
     /// The session, for creating expression execution contexts.
     pub fn session(&self) -> &VortexSession {
         self.session
+    }
+
+    /// The array execution context shared by operators in this execution quantum.
+    pub fn execution(&mut self) -> &mut ExecutionCtx {
+        self.execution
     }
 
     /// Clone ready bytes, first attempting a source-provided non-blocking inline read if unissued.
@@ -456,11 +464,13 @@ pub(crate) fn poll_execute_morsel(
 ) -> VortexResult<ExecPoll> {
     let rows = usize::try_from(range.end - range.start)
         .map_err(|_| vortex_err!("morsel row count exceeds usize"))?;
+    let mut execution = session.create_execution_ctx();
     let mut cx = ExecCx {
         arena,
         io,
         cells,
         session,
+        execution: &mut execution,
         stats,
         demand: Mask::new_true(rows),
     };
