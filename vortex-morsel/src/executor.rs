@@ -317,6 +317,15 @@ fn mask_ranges(range: &Range<u64>, mask: &Mask) -> Vec<Range<u64>> {
 }
 
 fn pruned_ranges(range: &Range<u64>, selection: &Mask, pruning: Mask) -> Vec<Range<u64>> {
+    if selection.all_true() {
+        return mask_ranges(range, &pruning);
+    }
+    if pruning.all_true() {
+        return mask_ranges(range, selection);
+    }
+    if selection.all_false() || pruning.all_false() {
+        return Vec::new();
+    }
     let mask = pruning & selection;
     mask_ranges(range, &mask)
 }
