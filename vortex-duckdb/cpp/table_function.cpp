@@ -360,10 +360,33 @@ bool aggregate_pushdown(ClientContext &, const TableFunctionUngroupedAggregateIn
     if (!input.get.table_filters.filters.empty()) {
         return false;
     }
-    // See projection_expression_pushdown: detached binds only contain the
-    // serialized scan recipe, not a connection-scoped optimizer reader.
-    if (!input.get.bind_data->Cast<VortexBindData>().ffi_data) {
-        return false;
+    auto &bind_data = input.get.bind_data->Cast<VortexBindData>();
+    if (!bind_data.ffi_data) {
+        duckdb_vx_error error_out = nullptr;
+        const auto ffi_input =
+            reinterpret_cast<duckdb_vx_agg_input>(const_cast<TableFunctionUngroupedAggregateInput *>(&input));
+        auto portable_data = duckdb_table_function_distributed_bind_pushdown_projection_aggregates(
+            reinterpret_cast<const uint8_t *>(bind_data.portable_bind.data()),
+            bind_data.portable_bind.size(),
+            ffi_input,
+            &error_out);
+        if (error_out) {
+            throw BinderException(IntoErrString(error_out));
+        }
+        if (!portable_data) {
+            return false;
+        }
+        auto portable = unique_ptr<CData>(reinterpret_cast<CData *>(portable_data));
+        size_t portable_size = 0;
+        const auto portable_bytes =
+            duckdb_table_function_distributed_bind_bytes(portable->DataPtr(), &portable_size);
+        if (!portable_bytes || portable_size == 0 ||
+            !duckdb_table_function_distributed_is_aggregate(portable->DataPtr())) {
+            throw SerializationException("Vortex produced invalid aggregate bind state");
+        }
+        bind_data.portable_bind.assign(reinterpret_cast<const char *>(portable_bytes), portable_size);
+        bind_data.aggregate_scan = true;
+        return true;
     }
 #endif
     void *const ffi_bind = get_ffi_bind(input.get.bind_data.get());

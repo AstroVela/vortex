@@ -25,6 +25,7 @@ use vortex_utils::aliases::hash_set::HashSet;
 
 use crate::SESSION;
 use crate::convert::PushedAggregate;
+use crate::duckdb::AggregatePushdownInputRef;
 use crate::multi_file::BoundFile;
 use crate::multi_file::build_bound_file_scan;
 use crate::multi_file::validate_bound_file;
@@ -33,6 +34,7 @@ use crate::projection::extract_schema_from_dtype;
 use crate::table_function::ColumnAggregate;
 use crate::table_function::TableFunctionBind;
 use crate::table_function::TableFunctionGlobal;
+use crate::table_function::pushdown_projection_aggregates;
 
 const PORTABLE_BIND_VERSION: u32 = 2;
 
@@ -320,6 +322,33 @@ pub fn deserialize_bind(bytes: &[u8]) -> VortexResult<PortableDistributedBind> {
         files: decoded.files,
         column_fields: decoded.column_fields,
     })
+}
+
+/// Apply aggregate pushdown to an owned coordinator bind without opening its files.
+///
+/// Vane serializes a bound logical plan before optimization, so the optimizer sees
+/// portable bind data rather than the connection-scoped reader. Aggregate eligibility
+/// only depends on the bound schema, and an empty deferred data source preserves that
+/// schema while keeping planning free of worker I/O.
+pub fn pushdown_serialized_projection_aggregates(
+    bytes: &[u8],
+    input: &AggregatePushdownInputRef,
+) -> VortexResult<Option<PortableDistributedBind>> {
+    let decoded = decode_bind(bytes)?;
+    let data_source = build_bound_file_scan(&[], Some(decoded.dtype))?;
+    let mut bind_data = TableFunctionBind {
+        data_source: Arc::new(data_source),
+        files: decoded.files,
+        file_indexes: Vec::new(),
+        filter_exprs: decoded.filter_exprs,
+        column_fields: decoded.column_fields,
+        has_non_optional_filter: AtomicBool::new(decoded.has_non_optional_filter),
+        aggregates: decoded.aggregates,
+    };
+    if !pushdown_projection_aggregates(&mut bind_data, input)? {
+        return Ok(None);
+    }
+    Ok(Some(serialize_bind(&bind_data)?))
 }
 
 pub fn deserialize_runtime_bind(
