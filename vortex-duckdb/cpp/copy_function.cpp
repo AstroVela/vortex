@@ -12,28 +12,102 @@
 #include "duckdb/parser/parsed_data/create_copy_function_info.hpp"
 
 #ifdef VORTEX_VANE_DISTRIBUTED
+#include "duckdb/common/file_system.hpp"
+#include "duckdb/common/limits.hpp"
+#include "duckdb/common/mutex.hpp"
+#include "duckdb/common/serializer/deserializer.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #endif
 
 using namespace duckdb;
 
 struct CopyBindData final : TableFunctionData {
+#ifdef VORTEX_VANE_DISTRIBUTED
+    CopyBindData(unique_ptr<CData> ffi_data, vector<string> column_names, vector<LogicalType> column_types)
+        : ffi_data(std::move(ffi_data)), column_names(std::move(column_names)),
+          column_types(std::move(column_types)) {
+    }
+
+    unique_ptr<FunctionData> Copy() const override;
+#else
     CopyBindData(unique_ptr<CData> ffi_data) : ffi_data(std::move(ffi_data)) {
     }
+#endif
+
     unique_ptr<CData> ffi_data;
+#ifdef VORTEX_VANE_DISTRIBUTED
+    vector<string> column_names;
+    vector<LogicalType> column_types;
+#endif
 };
 
 struct CopyGlobalData final : GlobalFunctionData {
+#ifdef VORTEX_VANE_DISTRIBUTED
+    CopyGlobalData(unique_ptr<CData> ffi_data, string file_path)
+        : ffi_data(std::move(ffi_data)), file_path(std::move(file_path)) {
+    }
+#else
     CopyGlobalData(unique_ptr<CData> ffi_data) : ffi_data(std::move(ffi_data)) {
     }
+#endif
 
     unique_ptr<CData> ffi_data;
+#ifdef VORTEX_VANE_DISTRIBUTED
+    string file_path;
+    mutex statistics_lock;
+    idx_t row_count = 0;
+    optional_ptr<CopyFunctionFileStatistics> written_statistics;
+#endif
 };
+
+#ifdef VORTEX_VANE_DISTRIBUTED
+static unique_ptr<CData> CreateVaneCopyBindFFIData(const vector<string> &column_names,
+                                                   const vector<LogicalType> &column_types) {
+    if (column_names.size() != column_types.size()) {
+        throw SerializationException(
+            "Distributed Vortex COPY bind has %llu column names but %llu column types",
+            static_cast<unsigned long long>(column_names.size()),
+            static_cast<unsigned long long>(column_types.size()));
+    }
+
+    vector<const char *> ffi_column_names(column_names.size());
+    for (size_t i = 0; i < column_names.size(); ++i) {
+        ffi_column_names[i] = column_names[i].c_str();
+    }
+
+    vector<duckdb_logical_type> ffi_column_types(column_types.size());
+    for (size_t i = 0; i < column_types.size(); ++i) {
+        ffi_column_types[i] =
+            reinterpret_cast<duckdb_logical_type>(const_cast<LogicalType *>(&column_types[i]));
+    }
+
+    duckdb_vx_error error_out = nullptr;
+    const duckdb_vx_data ffi_bind_data = duckdb_copy_function_copy_to_bind(ffi_column_names.data(),
+                                                                           ffi_column_names.size(),
+                                                                           ffi_column_types.data(),
+                                                                           ffi_column_types.size(),
+                                                                           &error_out);
+    if (error_out) {
+        throw SerializationException(IntoErrString(error_out));
+    }
+    return unique_ptr<CData>(reinterpret_cast<CData *>(ffi_bind_data));
+}
+
+unique_ptr<FunctionData> CopyBindData::Copy() const {
+    auto copied_ffi_data = CreateVaneCopyBindFFIData(column_names, column_types);
+    return make_uniq<CopyBindData>(std::move(copied_ffi_data), column_names, column_types);
+}
+#endif
 
 unique_ptr<FunctionData> copy_to_bind(ClientContext &,
                                       CopyFunctionBindInput &,
                                       const vector<string> &column_names,
                                       const vector<LogicalType> &column_types) {
+#ifdef VORTEX_VANE_DISTRIBUTED
+    auto ffi_bind_data = CreateVaneCopyBindFFIData(column_names, column_types);
+    return make_uniq<CopyBindData>(std::move(ffi_bind_data), column_names, column_types);
+#else
     vector<const char *> ffi_column_names(column_names.size());
     for (size_t i = 0; i < column_names.size(); ++i) {
         ffi_column_names[i] = column_names[i].c_str();
@@ -58,6 +132,7 @@ unique_ptr<FunctionData> copy_to_bind(ClientContext &,
     }
     auto cdata = unique_ptr<CData>(reinterpret_cast<CData *>(ffi_bind_data));
     return make_uniq<CopyBindData>(std::move(cdata));
+#endif
 }
 
 unique_ptr<GlobalFunctionData>
@@ -72,7 +147,11 @@ copy_to_initialize_global(ClientContext &, FunctionData &bind_data, const string
     }
 
     auto cdata = unique_ptr<CData>(reinterpret_cast<CData *>(ffi_global));
+#ifdef VORTEX_VANE_DISTRIBUTED
+    return make_uniq<CopyGlobalData>(std::move(cdata), file_path);
+#else
     return make_uniq<CopyGlobalData>(std::move(cdata));
+#endif
 }
 
 void copy_to_sink(ExecutionContext &,
@@ -88,8 +167,41 @@ void copy_to_sink(ExecutionContext &,
     if (error_out) {
         throw ExecutorException(IntoErrString(error_out));
     }
+#ifdef VORTEX_VANE_DISTRIBUTED
+    auto &global_data = gstate.Cast<CopyGlobalData>();
+    lock_guard<mutex> guard(global_data.statistics_lock);
+    if (input.size() > NumericLimits<idx_t>::Maximum() - global_data.row_count) {
+        throw OutOfRangeException("Distributed Vortex COPY row count exceeds idx_t");
+    }
+    global_data.row_count += input.size();
+    if (global_data.written_statistics) {
+        global_data.written_statistics->row_count = global_data.row_count;
+    }
+#endif
 }
 
+#ifdef VORTEX_VANE_DISTRIBUTED
+void copy_to_finalize(ClientContext &context, FunctionData &, GlobalFunctionData &gstate) {
+    auto &global_data = gstate.Cast<CopyGlobalData>();
+    void *const ffi_global = global_data.ffi_data->DataPtr();
+    duckdb_vx_error error_out = nullptr;
+    duckdb_copy_function_copy_to_finalize(ffi_global, &error_out);
+    if (error_out) {
+        throw ExecutorException(IntoErrString(error_out));
+    }
+    {
+        lock_guard<mutex> guard(global_data.statistics_lock);
+        if (!global_data.written_statistics) {
+            return;
+        }
+        auto &statistics = *global_data.written_statistics;
+        statistics.row_count = global_data.row_count;
+        auto &file_system = FileSystem::GetFileSystem(context);
+        auto handle = file_system.OpenFile(global_data.file_path, FileFlags::FILE_FLAGS_READ);
+        statistics.file_size_bytes = handle->GetFileSize();
+    }
+}
+#else
 void copy_to_finalize(ClientContext &, FunctionData &, GlobalFunctionData &gstate) {
     void *const ffi_global = gstate.Cast<CopyGlobalData>().ffi_data->DataPtr();
     duckdb_vx_error error_out = nullptr;
@@ -98,8 +210,34 @@ void copy_to_finalize(ClientContext &, FunctionData &, GlobalFunctionData &gstat
         throw ExecutorException(IntoErrString(error_out));
     }
 }
+#endif
 
 #ifdef VORTEX_VANE_DISTRIBUTED
+void copy_to_get_written_statistics(ClientContext &,
+                                    FunctionData &,
+                                    GlobalFunctionData &gstate,
+                                    CopyFunctionFileStatistics &statistics) {
+    auto &global_data = gstate.Cast<CopyGlobalData>();
+    lock_guard<mutex> guard(global_data.statistics_lock);
+    global_data.written_statistics = statistics;
+    statistics.row_count = global_data.row_count;
+}
+
+void copy_to_serialize(Serializer &serializer, const FunctionData &bind_data, const CopyFunction &) {
+    const auto &copy_bind = bind_data.Cast<CopyBindData>();
+    serializer.WriteProperty(1, "column_names", copy_bind.column_names);
+    serializer.WriteProperty(2, "column_types", copy_bind.column_types);
+}
+
+unique_ptr<FunctionData> copy_to_deserialize(Deserializer &deserializer, CopyFunction &) {
+    auto column_names = deserializer.ReadProperty<vector<string>>(1, "column_names");
+    auto column_types = deserializer.ReadProperty<vector<LogicalType>>(2, "column_types");
+    auto ffi_bind_data = CreateVaneCopyBindFFIData(column_names, column_types);
+    return make_uniq<CopyBindData>(std::move(ffi_bind_data),
+                                   std::move(column_names),
+                                   std::move(column_types));
+}
+
 void RegisterVortexCopyFunction(ExtensionLoader &loader) {
     CopyFunction fn("vortex");
     fn.copy_to_bind = copy_to_bind;
@@ -107,8 +245,11 @@ void RegisterVortexCopyFunction(ExtensionLoader &loader) {
     fn.copy_to_initialize_local = [](auto &, auto &) {
         return make_uniq<LocalFunctionData>();
     };
+    fn.copy_to_get_written_statistics = copy_to_get_written_statistics;
     fn.copy_to_sink = copy_to_sink;
     fn.copy_to_finalize = copy_to_finalize;
+    fn.serialize = copy_to_serialize;
+    fn.deserialize = copy_to_deserialize;
     fn.extension = "vortex";
     fn.execution_mode = [](bool, bool) {
         return CopyFunctionExecutionMode::REGULAR_COPY_TO_FILE;
@@ -128,8 +269,15 @@ extern "C" duckdb_state duckdb_vx_register_copy_function(duckdb_database ffi_db)
     fn.copy_to_initialize_local = [](auto &, auto &) {
         return make_uniq<LocalFunctionData>();
     };
+#ifdef VORTEX_VANE_DISTRIBUTED
+    fn.copy_to_get_written_statistics = copy_to_get_written_statistics;
+#endif
     fn.copy_to_sink = copy_to_sink;
     fn.copy_to_finalize = copy_to_finalize;
+#ifdef VORTEX_VANE_DISTRIBUTED
+    fn.serialize = copy_to_serialize;
+    fn.deserialize = copy_to_deserialize;
+#endif
     fn.extension = "vortex";
 
     // TODO(joe): expose this via c our api
