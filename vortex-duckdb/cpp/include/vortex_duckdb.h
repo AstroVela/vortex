@@ -45,6 +45,12 @@ duckdb_state duckdb_vx_register_scan_replacement(duckdb_database duckdb_database
 
 duckdb_state duckdb_vx_optimizer_extension_register(duckdb_database ffi_db);
 
+#ifdef VORTEX_VANE_DISTRIBUTED
+/// Register the Vane-specific Vortex extension functions through an opaque
+/// duckdb::ExtensionLoader pointer.
+void duckdb_vx_vane_init(void *loader);
+#endif
+
 /// Creates a new reusable dictionary from a logical type and size.
 duckdb_vx_reusable_dict duckdb_vx_reusable_dict_create(duckdb_logical_type logical_type, idx_t size);
 

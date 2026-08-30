@@ -310,7 +310,9 @@ extern "C" duckdb_state duckdb_vx_optimizer_extension_register(duckdb_database f
 }
 
 #ifdef VORTEX_VANE_DISTRIBUTED
-void vortex_vane_init(ExtensionLoader &loader) {
+extern "C" void duckdb_vx_vane_init(void *loader_ptr) {
+    D_ASSERT(loader_ptr);
+    auto &loader = *static_cast<ExtensionLoader *>(loader_ptr);
     auto &db = loader.GetDatabaseInstance();
     DBConfig::GetConfig(db).replacement_scans.emplace_back(VortexScanReplacement);
     RegisterVortexTableFunctions(loader);

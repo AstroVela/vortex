@@ -78,11 +78,16 @@ fn init_tracing() {
     });
 }
 
-/// Initialize process-wide runtime support without registering against a
-/// DuckDB C API handle. Vane's C++ loader adapter owns catalog registration.
+/// Initialize runtime support and register Vortex through Vane's extension loader.
+///
+/// # Safety
+///
+/// `loader` must point to a live `duckdb::ExtensionLoader` from the exact DuckDB
+/// source tree used to build this crate.
 #[cfg(vortex_vane_distributed)]
-pub fn initialize_runtime() {
+pub unsafe fn initialize_vane(loader: *mut c_void) {
     init_tracing();
+    unsafe { cpp::duckdb_vx_vane_init(loader) };
 }
 
 /// Initialize the Vortex extension by registering the extension functions.
