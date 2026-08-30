@@ -77,23 +77,85 @@ use crate::duckdb::TableInitInput;
 use crate::duckdb::Value;
 use crate::exporter::ArrayExporter;
 use crate::exporter::ConversionCache;
+#[cfg(vortex_vane_distributed)]
+use crate::multi_file::BoundFile;
 use crate::multi_file::bind_multi_file_scan;
 use crate::projection::DuckdbField;
 use crate::projection::Filter;
 use crate::projection::Projection;
+#[cfg(vortex_vane_distributed)]
+use crate::projection::distributed_local_file_selection;
 use crate::projection::extract_schema_from_dtype;
+
+#[cfg(vortex_vane_distributed)]
+struct ThreadLabelSetGuard(*mut custom_labels::sys::Labelset);
+
+#[cfg(vortex_vane_distributed)]
+impl ThreadLabelSetGuard {
+    fn install() -> Self {
+        unsafe {
+            if custom_labels::sys::current().is_null() {
+                let labels = custom_labels::sys::new(0);
+                custom_labels::sys::replace(labels);
+                Self(labels)
+            } else {
+                Self(std::ptr::null_mut())
+            }
+        }
+    }
+}
+
+#[cfg(vortex_vane_distributed)]
+impl Drop for ThreadLabelSetGuard {
+    fn drop(&mut self) {
+        if self.0.is_null() {
+            return;
+        }
+        unsafe {
+            if custom_labels::sys::current() == self.0 {
+                custom_labels::sys::replace(std::ptr::null_mut());
+            }
+            custom_labels::sys::free(self.0);
+        }
+    }
+}
+
+#[cfg(vortex_vane_distributed)]
+thread_local! {
+    static THREAD_LABEL_SET: ThreadLabelSetGuard = ThreadLabelSetGuard::install();
+}
 
 // Aggregate projection index for count(*). See cpp/aggregate_fn_pushdown.cpp
 pub const COUNT_STAR_PROJ_IDX: u64 = u64::MAX;
 
 pub struct TableFunctionBind {
+    #[cfg(vortex_vane_distributed)]
+    pub(crate) data_source: Arc<MultiLayoutDataSource>,
+    #[cfg(not(vortex_vane_distributed))]
     data_source: Arc<MultiLayoutDataSource>,
+    #[cfg(vortex_vane_distributed)]
+    pub(crate) files: Vec<BoundFile>,
+    /// Maps each child of `data_source` to its stable coordinator file index.
+    #[cfg(vortex_vane_distributed)]
+    pub(crate) file_indexes: Vec<usize>,
+    #[cfg(vortex_vane_distributed)]
+    pub(crate) filter_exprs: Vec<Expression>,
+    #[cfg(not(vortex_vane_distributed))]
     filter_exprs: Vec<Expression>,
+    #[cfg(vortex_vane_distributed)]
+    pub(crate) column_fields: Vec<DuckdbField>,
+    #[cfg(not(vortex_vane_distributed))]
     column_fields: Vec<DuckdbField>,
     // There exists at least one non-optional table filter or at least one
     // complex filter is pushed down.
+    #[cfg(vortex_vane_distributed)]
+    pub(crate) has_non_optional_filter: AtomicBool,
+    #[cfg(not(vortex_vane_distributed))]
     has_non_optional_filter: AtomicBool,
     // Non-empty iff this scan is aggregate
+    #[cfg(vortex_vane_distributed)]
+    pub(crate) aggregates: Vec<ColumnAggregate>,
+    #[cfg(not(vortex_vane_distributed))]
     aggregates: Vec<ColumnAggregate>,
 }
 assert_impl_all!(TableFunctionBind: Send, Clone);
@@ -102,7 +164,16 @@ impl Clone for TableFunctionBind {
     fn clone(&self) -> Self {
         Self {
             data_source: Arc::clone(&self.data_source),
-            // filter_exprs are consumed once in `init_global`.
+            #[cfg(vortex_vane_distributed)]
+            files: self.files.clone(),
+            #[cfg(vortex_vane_distributed)]
+            file_indexes: self.file_indexes.clone(),
+            #[cfg(vortex_vane_distributed)]
+            filter_exprs: self.filter_exprs.clone(),
+            // The original Vortex path treats pushed expressions as
+            // single-use init state. Distributed worker plans must instead
+            // preserve them across physical-plan clones and retries.
+            #[cfg(not(vortex_vane_distributed))]
             filter_exprs: vec![],
             column_fields: self.column_fields.clone(),
             has_non_optional_filter: AtomicBool::new(
@@ -197,6 +268,12 @@ pub enum Cardinality {
 // and after a query another file is added matching the glob, for second query
 // bind() will be called again.
 pub fn bind(input: &BindInputRef, result: &mut BindResultRef) -> VortexResult<TableFunctionBind> {
+    #[cfg(vortex_vane_distributed)]
+    let (data_source, files) = {
+        let bound_scan = bind_multi_file_scan(input)?;
+        (bound_scan.data_source, bound_scan.files)
+    };
+    #[cfg(not(vortex_vane_distributed))]
     let data_source = bind_multi_file_scan(input)?;
     let column_fields = extract_schema_from_dtype(data_source.dtype())?;
     for fields in &column_fields {
@@ -204,6 +281,10 @@ pub fn bind(input: &BindInputRef, result: &mut BindResultRef) -> VortexResult<Ta
     }
     Ok(TableFunctionBind {
         data_source: Arc::new(data_source),
+        #[cfg(vortex_vane_distributed)]
+        file_indexes: (0..files.len()).collect(),
+        #[cfg(vortex_vane_distributed)]
+        files,
         filter_exprs: vec![],
         column_fields,
         has_non_optional_filter: AtomicBool::new(false),
@@ -228,6 +309,24 @@ pub fn init_global(init_input: &TableInitInput) -> VortexResult<TableFunctionGlo
         Projection::new_aggregate(&bind_data.aggregates, &bind_data.column_fields)
     };
 
+    #[cfg(vortex_vane_distributed)]
+    let filter = Filter::new(
+        init_input.table_filter_set(),
+        column_ids,
+        &bind_data.column_fields,
+        &bind_data.filter_exprs,
+        bind_data.data_source.dtype(),
+        init_input.ignore_optional_filters(),
+    )?;
+    #[cfg(not(vortex_vane_distributed))]
+    let filter = Filter::new(
+        init_input.table_filter_set(),
+        column_ids,
+        &bind_data.column_fields,
+        &bind_data.filter_exprs,
+        bind_data.data_source.dtype(),
+    )?;
+
     let Filter {
         filter,
         row_selection,
@@ -235,13 +334,7 @@ pub fn init_global(init_input: &TableInitInput) -> VortexResult<TableFunctionGlo
         file_selection,
         file_range,
         has_non_optional_filter,
-    } = Filter::new(
-        init_input.table_filter_set(),
-        column_ids,
-        &bind_data.column_fields,
-        &bind_data.filter_exprs,
-        bind_data.data_source.dtype(),
-    )?;
+    } = filter;
 
     if has_non_optional_filter {
         init_input
@@ -262,10 +355,28 @@ pub fn init_global(init_input: &TableInitInput) -> VortexResult<TableFunctionGlo
         "table function scan input"
     );
 
+    #[cfg(vortex_vane_distributed)]
+    // SAFETY: TableInitInput borrows this ClientContext from DuckDB for the
+    // complete init_global call.
+    let file_selection = unsafe {
+        distributed_local_file_selection(
+            init_input.table_filter_set(),
+            column_ids,
+            &bind_data.file_indexes,
+            init_input.input.client_context,
+        )
+    }?;
+    #[cfg(vortex_vane_distributed)]
+    let ordered = true;
+    #[cfg(not(vortex_vane_distributed))]
+    let ordered = file_row_number_column_pos.is_some();
+
     let request = ScanRequest {
         projection,
         filter,
-        ordered: file_row_number_column_pos.is_some(),
+        // Vane keeps deferred-reader order stable so file_index filters and
+        // distributed file-split identities never depend on I/O races.
+        ordered,
         selection: row_selection,
         row_range,
         partition_selection: file_selection,
@@ -283,6 +394,8 @@ pub fn init_global(init_input: &TableInitInput) -> VortexResult<TableFunctionGlo
 
     let pending = Arc::new(AtomicU64::new(0));
     let pending_producer = Arc::clone(&pending);
+    #[cfg(vortex_vane_distributed)]
+    let file_indexes = Arc::new(bind_data.file_indexes.clone());
 
     // We drive one partition per worker thread. Each partition is driven as a spawned task
     // that pushes array chunks into the shared channel as they are produced. This spawning
@@ -293,6 +406,8 @@ pub fn init_global(init_input: &TableInitInput) -> VortexResult<TableFunctionGlo
         .map(move |partition| {
             let tx = tx.clone();
             let pending = Arc::clone(&pending_producer);
+            #[cfg(vortex_vane_distributed)]
+            let file_indexes = Arc::clone(&file_indexes);
             RUNTIME.handle().spawn(async move {
                 let partition = match partition {
                     Ok(partition) => partition,
@@ -302,8 +417,12 @@ pub fn init_global(init_input: &TableInitInput) -> VortexResult<TableFunctionGlo
                     }
                 };
 
+                #[cfg(vortex_vane_distributed)]
+                let file_index = file_indexes[partition.index()];
+                #[cfg(not(vortex_vane_distributed))]
+                let file_index = partition.index();
                 let cache = Arc::new(ConversionCache {
-                    file_index: partition.index(),
+                    file_index,
                     ..Default::default()
                 });
 
@@ -421,6 +540,9 @@ pub fn init_local(
     bind_data: &TableFunctionBind,
     global: &TableFunctionGlobal,
 ) -> TableFunctionLocal {
+    #[cfg(vortex_vane_distributed)]
+    THREAD_LABEL_SET.with(|_| {});
+    #[cfg(not(vortex_vane_distributed))]
     unsafe {
         use custom_labels::sys;
 

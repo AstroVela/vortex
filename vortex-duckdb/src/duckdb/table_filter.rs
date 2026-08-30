@@ -9,6 +9,10 @@ use std::ptr;
 
 use cpp::duckdb_vx_table_filter;
 use num_traits::AsPrimitive;
+#[cfg(vortex_vane_distributed)]
+use vortex::error::VortexResult;
+#[cfg(vortex_vane_distributed)]
+use vortex::error::vortex_err;
 use vortex::error::vortex_panic;
 
 use crate::cpp;
@@ -66,6 +70,41 @@ impl Debug for TableFilterSetRef {
 lifetime_wrapper!(TableFilter, duckdb_vx_table_filter, |_| {});
 
 impl TableFilterRef {
+    #[cfg(vortex_vane_distributed)]
+    /// # Safety
+    ///
+    /// `client_context` must be null or point to a live DuckDB `ClientContext`
+    /// for the duration of this call.
+    pub(crate) unsafe fn matches_ubigint(
+        &self,
+        client_context: cpp::duckdb_client_context,
+        value: u64,
+    ) -> VortexResult<Option<bool>> {
+        let mut error = ptr::null_mut();
+        let result = unsafe {
+            cpp::duckdb_vx_table_filter_matches_ubigint(
+                self.as_ptr(),
+                client_context,
+                value,
+                &raw mut error,
+            )
+        };
+        if !error.is_null() {
+            let message = unsafe { CStr::from_ptr(cpp::duckdb_vx_error_value(error)) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { cpp::duckdb_vx_error_free(error) };
+            return Err(vortex_err!(
+                "Failed to evaluate Vortex virtual-column filter: {message}"
+            ));
+        }
+        Ok(match result {
+            cpp::DUCKDB_VX_TABLE_FILTER_MATCH::DUCKDB_VX_TABLE_FILTER_MATCH_FALSE => Some(false),
+            cpp::DUCKDB_VX_TABLE_FILTER_MATCH::DUCKDB_VX_TABLE_FILTER_MATCH_TRUE => Some(true),
+            cpp::DUCKDB_VX_TABLE_FILTER_MATCH::DUCKDB_VX_TABLE_FILTER_MATCH_UNKNOWN => None,
+        })
+    }
+
     pub fn as_class(&self) -> TableFilterClass<'_> {
         match unsafe { cpp::duckdb_vx_table_filter_get_type(self.as_ptr()) } {
             cpp::DUCKDB_VX_TABLE_FILTER_TYPE::DUCKDB_VX_TABLE_FILTER_TYPE_CONSTANT_COMPARISON => {
@@ -162,8 +201,14 @@ impl TableFilterRef {
                 };
                 unsafe { cpp::duckdb_vx_table_filter_get_dynamic(self.as_ptr(), &raw mut out) };
 
+                #[cfg(vortex_vane_distributed)]
+                let data =
+                    (!out.data.is_null()).then(|| unsafe { DynamicFilterData::own(out.data) });
+                #[cfg(not(vortex_vane_distributed))]
+                let data = unsafe { DynamicFilterData::own(out.data) };
+
                 TableFilterClass::Dynamic(DynamicFilter {
-                    data: unsafe { DynamicFilterData::own(out.data) },
+                    data,
                     operator: out.comparison_type,
                 })
             }
@@ -262,6 +307,9 @@ impl<'a> Values<'a> {
 }
 
 pub struct DynamicFilter {
+    #[cfg(vortex_vane_distributed)]
+    pub data: Option<DynamicFilterData>,
+    #[cfg(not(vortex_vane_distributed))]
     pub data: DynamicFilterData,
     pub operator: cpp::DUCKDB_VX_EXPR_TYPE,
 }

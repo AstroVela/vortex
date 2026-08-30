@@ -26,6 +26,31 @@ Opt into DuckDB debug build: `VX_DUCKDB_DEBUG=1`.
 VX_DUCKDB_DEBUG=1 cargo build -p vortex-duckdb
 ```
 
+### Vane Distributed Scan Build
+
+The explicit `VORTEX_VANE_DISTRIBUTED=1` build mode adds Vane's distributed
+table-scan protocol. It requires an exact Vane DuckDB source tree containing
+`duckdb/function/distributed_table_function.hpp`; it never substitutes or
+downloads another DuckDB implementation.
+
+```bash
+VORTEX_VANE_DISTRIBUTED=1 \
+DUCKDB_SOURCE_DIR=/path/to/vane/external/duckdb \
+DUCKDB_VERSION=v1.5.5-vane.64ed91c7e7 \
+cargo build -p vortex-duckdb
+```
+
+Without that explicit mode, including under Cargo's `--all-features`, the
+normal precompiled and source-build paths above are unchanged.
+
+The distributed bind protocol records each object's size plus its storage
+version and/or ETag. Worker metadata checks and every subsequent range read are
+pinned to that identity, so execution cannot silently switch to different
+same-length contents after planning: versioned stores read the selected version
+and ETag-protected stores reject an identity mismatch. A backend that provides
+neither a version nor an ETag is rejected during bind; there is no path-and-size
+fallback. Protocol version 2 intentionally does not decode older bind payloads.
+
 ### AddressSanitizer & ThreadSanitizer
 
 Enable both ASAN & TSAN: `VX_DUCKDB_SAN=1`.

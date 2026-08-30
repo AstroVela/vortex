@@ -5,6 +5,9 @@
 
 #include "duckdb.h"
 #include "expr.h"
+#ifdef VORTEX_VANE_DISTRIBUTED
+#include "vortex_duckdb.h"
+#endif
 
 #ifdef __cplusplus /* If compiled as C++, use C ABI */
 extern "C" {
@@ -102,6 +105,22 @@ typedef struct {
 
 void duckdb_vx_table_filter_get_in_filter(duckdb_vx_table_filter ffi_filter,
                                           duckdb_vx_table_filter_in_filter *out);
+
+#ifdef VORTEX_VANE_DISTRIBUTED
+typedef enum DUCKDB_VX_TABLE_FILTER_MATCH {
+    DUCKDB_VX_TABLE_FILTER_MATCH_FALSE = 0,
+    DUCKDB_VX_TABLE_FILTER_MATCH_TRUE = 1,
+    DUCKDB_VX_TABLE_FILTER_MATCH_UNKNOWN = 2,
+} duckdb_vx_table_filter_match;
+
+/// Evaluate a table filter against one non-null UBIGINT value. A null client
+/// context is valid during distributed split planning; expression filters that
+/// require execution then return UNKNOWN so planning remains conservative.
+duckdb_vx_table_filter_match duckdb_vx_table_filter_matches_ubigint(duckdb_vx_table_filter ffi_filter,
+                                                                    duckdb_client_context client_context,
+                                                                    uint64_t value,
+                                                                    duckdb_vx_error *error_out);
+#endif
 
 #ifdef __cplusplus /* End C ABI */
 }

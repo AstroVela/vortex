@@ -13,6 +13,24 @@
 
 #define COUNT_STAR_PROJ_IDX UINT64_MAX
 
+#if defined(VORTEX_VANE_DISTRIBUTED)
+typedef struct {
+  const uint8_t *name;
+  size_t name_len;
+  duckdb_logical_type logical_type;
+} VortexDistributedFieldView;
+#endif
+
+#if defined(VORTEX_VANE_DISTRIBUTED)
+typedef struct {
+  const uint8_t *source_url;
+  size_t source_url_len;
+  const uint8_t *path;
+  size_t path_len;
+  uint64_t size;
+} VortexDistributedFileView;
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -73,6 +91,79 @@ duckdb_vx_data duckdb_table_function_bind(duckdb_vx_tfunc_bind_input bind_input,
                                           duckdb_vx_error *error_out);
 
 extern duckdb_vx_data duckdb_table_function_bind_data_clone(const void *bind_data);
+
+#if defined(VORTEX_VANE_DISTRIBUTED)
+extern
+duckdb_vx_data duckdb_table_function_distributed_bind_serialize(const void *bind_data,
+                                                                duckdb_vx_error *error_out);
+#endif
+
+#if defined(VORTEX_VANE_DISTRIBUTED)
+extern
+duckdb_vx_data duckdb_table_function_distributed_bind_deserialize(const uint8_t *bytes,
+                                                                  size_t size,
+                                                                  duckdb_vx_error *error_out);
+#endif
+
+#if defined(VORTEX_VANE_DISTRIBUTED)
+extern
+const uint8_t *duckdb_table_function_distributed_bind_bytes(const void *portable_bind,
+                                                            size_t *size_out);
+#endif
+
+#if defined(VORTEX_VANE_DISTRIBUTED)
+extern size_t duckdb_table_function_distributed_file_count(const void *portable_bind);
+#endif
+
+#if defined(VORTEX_VANE_DISTRIBUTED)
+extern bool duckdb_table_function_distributed_is_aggregate(const void *portable_bind);
+#endif
+
+#if defined(VORTEX_VANE_DISTRIBUTED)
+extern size_t duckdb_table_function_distributed_field_count(const void *portable_bind);
+#endif
+
+#if defined(VORTEX_VANE_DISTRIBUTED)
+extern
+bool duckdb_table_function_distributed_field_at(const void *portable_bind,
+                                                size_t index,
+                                                VortexDistributedFieldView *field_out);
+#endif
+
+#if defined(VORTEX_VANE_DISTRIBUTED)
+extern
+bool duckdb_table_function_distributed_file_at(const void *portable_bind,
+                                               size_t index,
+                                               VortexDistributedFileView *file_out);
+#endif
+
+#if defined(VORTEX_VANE_DISTRIBUTED)
+extern
+bool duckdb_table_function_distributed_file_is_selected(duckdb_vx_table_filter_set filters,
+                                                        const uint64_t *column_ids,
+                                                        size_t column_ids_count,
+                                                        uint64_t file_index,
+                                                        duckdb_vx_error *error_out);
+#endif
+
+#if defined(VORTEX_VANE_DISTRIBUTED)
+extern
+duckdb_vx_data duckdb_table_function_init_global_distributed(const uint8_t *portable_bind,
+                                                             size_t portable_bind_size,
+                                                             const uint64_t *assigned_file_indexes,
+                                                             size_t assigned_file_count,
+                                                             bool ignore_optional_filters,
+                                                             const duckdb_vx_tfunc_init_input *init_input,
+                                                             duckdb_vx_error *error_out);
+#endif
+
+#if defined(VORTEX_VANE_DISTRIBUTED)
+extern const void *duckdb_table_function_distributed_bind_data(void *global_data);
+#endif
+
+#if defined(VORTEX_VANE_DISTRIBUTED)
+extern void *duckdb_table_function_distributed_global_data(void *global_data);
+#endif
 
 extern
 duckdb_vx_data duckdb_copy_function_copy_to_bind(const char *const *column_names,
