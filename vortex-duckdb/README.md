@@ -43,6 +43,10 @@ cargo build -p vortex-duckdb
 Without that explicit mode, including under Cargo's `--all-features`, the
 normal precompiled and source-build paths above are unchanged.
 
+Vane registration crosses the Rust library boundary through one public Rust
+entry point. The underlying C++ registrar remains internal, so both staticlib
+and cdylib consumers use the same exported symbol.
+
 The distributed bind protocol records each object's size plus its storage
 version and/or ETag. Worker metadata checks and every subsequent range read are
 pinned to that identity, so execution cannot silently switch to different
