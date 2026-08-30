@@ -34,7 +34,7 @@ use crate::table_function::ColumnAggregate;
 use crate::table_function::TableFunctionBind;
 use crate::table_function::TableFunctionGlobal;
 
-const PORTABLE_BIND_VERSION: u32 = 1;
+const PORTABLE_BIND_VERSION: u32 = 2;
 
 #[derive(Clone, PartialEq, Message)]
 struct ProjectionProto {
@@ -60,6 +60,10 @@ struct FileProto {
     path: String,
     #[prost(uint64, optional, tag = "3")]
     size: Option<u64>,
+    #[prost(string, optional, tag = "4")]
+    e_tag: Option<String>,
+    #[prost(string, optional, tag = "5")]
+    version: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -204,6 +208,8 @@ pub fn serialize_bind(bind_data: &TableFunctionBind) -> VortexResult<PortableDis
                 source_url: file.source_url.clone(),
                 path: file.path.clone(),
                 size: Some(file.size),
+                e_tag: file.e_tag.clone(),
+                version: file.version.clone(),
             })
             .collect(),
     };
@@ -285,6 +291,8 @@ fn decode_bind(bytes: &[u8]) -> VortexResult<DecodedPortableBind> {
                 source_url: file.source_url,
                 path: file.path,
                 size,
+                e_tag: file.e_tag,
+                version: file.version,
             };
             validate_bound_file(&file)?;
             Ok(file)

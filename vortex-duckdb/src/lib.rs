@@ -25,6 +25,8 @@ use vortex::session::VortexSession;
 use crate::duckdb::Database;
 use crate::duckdb::DatabaseRef;
 
+#[cfg(vortex_vane_distributed)]
+mod bound_object_store;
 mod column_statistics;
 mod convert;
 pub mod duckdb;
