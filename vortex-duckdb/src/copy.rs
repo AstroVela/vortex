@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use async_fs::OpenOptions;
 use futures::SinkExt;
 use futures::TryStreamExt;
 use futures::channel::mpsc;
@@ -20,6 +19,7 @@ use vortex::error::VortexResult;
 use vortex::error::vortex_err;
 use vortex::file::WriteOptionsSessionExt;
 use vortex::file::WriteSummary;
+use vortex::io::VortexWrite;
 use vortex::io::runtime::BlockingRuntime;
 use vortex::io::runtime::Task;
 use vortex::io::runtime::current::CurrentThreadWorkerPool;
@@ -30,6 +30,7 @@ use crate::SESSION;
 use crate::convert::FromLogicalType;
 use crate::convert::data_chunk_to_vortex;
 use crate::duckdb::DataChunkRef;
+use crate::duckdb::DuckDBFileWriter;
 use crate::duckdb::LogicalTypeRef;
 
 #[derive(Clone)]
@@ -109,8 +110,14 @@ pub fn copy_to_finalize(init_global: &mut CopyFunctionGlobal) -> VortexResult<()
     })
 }
 
-pub fn copy_to_initialize_global(
+/// Initialize a COPY writer through the DuckDB client context's file system.
+///
+/// # Safety
+///
+/// `client_context` must point to the live `duckdb::ClientContext` that owns the COPY query.
+pub unsafe fn copy_to_initialize_global(
     bind_data: &CopyFunctionBind,
+    client_context: *mut std::ffi::c_void,
     file_path: String,
 ) -> VortexResult<CopyFunctionGlobal> {
     // The channel size 32 was chosen arbitrarily.
@@ -119,14 +126,14 @@ pub fn copy_to_initialize_global(
 
     let handle = SESSION.handle();
 
+    let mut writer = unsafe { DuckDBFileWriter::open(client_context, &file_path) }?;
     let write_task = handle.spawn(async move {
-        let writer = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .create(true)
-            .open(file_path)
+        let summary = SESSION
+            .write_options()
+            .write(&mut writer, array_stream)
             .await?;
-        SESSION.write_options().write(writer, array_stream).await
+        writer.shutdown().await?;
+        Ok(summary)
     });
 
     let worker_pool = RUNTIME.new_pool();

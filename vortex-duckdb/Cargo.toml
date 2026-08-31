@@ -24,7 +24,6 @@ path = "src/lib.rs"
 crate-type = ["rlib"]
 
 [dependencies]
-async-fs = { workspace = true }
 async-trait = { workspace = true }
 bitvec = { workspace = true }
 custom-labels = { workspace = true }
@@ -54,6 +53,7 @@ vortex-utils = { workspace = true, features = ["dashmap"] }
 opendal = ["vortex/opendal"]
 
 [dev-dependencies]
+async-fs = { workspace = true }
 anyhow = { workspace = true }
 divan = { workspace = true }
 geo-types = { workspace = true }

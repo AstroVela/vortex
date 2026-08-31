@@ -14,6 +14,7 @@ extern "C" {
 typedef struct duckdb_vx_error_ *duckdb_vx_error;
 typedef struct duckdb_vx_data_ *duckdb_vx_data;
 typedef struct duckdb_vx_reusable_dict_ *duckdb_vx_reusable_dict;
+typedef struct duckdb_vx_file_writer_ *duckdb_vx_file_writer;
 
 //! Create a DuckDB vortex error.
 duckdb_vx_error duckdb_vx_error_create(const char *message, size_t message_length);
@@ -22,6 +23,28 @@ duckdb_vx_error duckdb_vx_error_create(const char *message, size_t message_lengt
 const char *duckdb_vx_error_value(duckdb_vx_error err);
 
 void duckdb_vx_error_free(duckdb_vx_error err);
+
+/// Open a writer through the file system associated with a DuckDB client context.
+duckdb_vx_file_writer
+duckdb_vx_file_writer_create(void *client_context, const char *file_path, duckdb_vx_error *error_out);
+
+/// Write all bytes to a DuckDB-backed file writer.
+duckdb_state duckdb_vx_file_writer_write(duckdb_vx_file_writer writer,
+                                         const uint8_t *data,
+                                         size_t size,
+                                         duckdb_vx_error *error_out);
+
+/// Flush buffered bytes without closing the file.
+duckdb_state duckdb_vx_file_writer_flush(duckdb_vx_file_writer writer, duckdb_vx_error *error_out);
+
+/// Flush and close the file, finalizing remote multipart uploads.
+duckdb_state duckdb_vx_file_writer_close(duckdb_vx_file_writer writer, duckdb_vx_error *error_out);
+
+/// Destroy a DuckDB-backed file writer.
+void duckdb_vx_file_writer_destroy(duckdb_vx_file_writer writer);
+
+/// Destroy an unclosed writer without committing scheme-specific buffered output.
+void duckdb_vx_file_writer_abort(duckdb_vx_file_writer writer);
 
 // Create an opaque data object with a delete callback.
 duckdb_vx_data duckdb_vx_data_create(void *data_ptr, duckdb_delete_callback_t delete_callback);

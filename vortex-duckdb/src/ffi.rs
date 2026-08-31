@@ -579,6 +579,7 @@ pub unsafe extern "C-unwind" fn duckdb_copy_function_copy_to_bind(
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn duckdb_copy_function_copy_to_initialize_global(
     bind_data: *const c_void,
+    client_context: *mut c_void,
     file_path: *const c_char,
     error_out: *mut cpp::duckdb_vx_error,
 ) -> cpp::duckdb_vx_data {
@@ -588,7 +589,7 @@ pub unsafe extern "C-unwind" fn duckdb_copy_function_copy_to_initialize_global(
     let bind_data = unsafe { bind_data.cast::<CopyFunctionBind>().as_ref() }
         .vortex_expect("bind_data null pointer");
     try_or_null(error_out, || {
-        let bind_data = copy_to_initialize_global(bind_data, file_path)?;
+        let bind_data = unsafe { copy_to_initialize_global(bind_data, client_context, file_path) }?;
         Ok(Data::from(Box::new(bind_data)).as_ptr())
     })
 }
