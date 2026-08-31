@@ -182,6 +182,7 @@ duckdb_vx_data duckdb_copy_function_copy_to_bind(const char *const *column_names
 
 extern
 duckdb_vx_data duckdb_copy_function_copy_to_initialize_global(const void *bind_data,
+                                                              void *client_context,
                                                               const char *file_path,
                                                               duckdb_vx_error *error_out);
 

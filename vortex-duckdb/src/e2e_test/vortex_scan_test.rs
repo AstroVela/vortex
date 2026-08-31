@@ -397,10 +397,11 @@ fn test_vortex_scan_multiple_globs() {
 }
 
 #[test]
-fn test_write_file() {
+fn test_write_file_through_duckdb_filesystem() {
     let conn = database_connection();
     let tempdir = tempfile::tempdir().unwrap();
     let file_path = format!("{}/test.vortex", tempdir.path().to_string_lossy());
+    std::fs::write(&file_path, b"stale output").unwrap();
 
     conn.query(&format!(
         "copy (select * as number from generate_series(10)) to '{file_path}' (FORMAT VORTEX);",
