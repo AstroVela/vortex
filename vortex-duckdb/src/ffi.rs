@@ -28,6 +28,8 @@ use crate::distributed::deserialize_bind;
 #[cfg(vortex_vane_distributed)]
 use crate::distributed::deserialize_runtime_bind;
 #[cfg(vortex_vane_distributed)]
+use crate::distributed::pushdown_serialized_projection_aggregates;
+#[cfg(vortex_vane_distributed)]
 use crate::distributed::serialize_bind;
 use crate::duckdb::AggregatePushdownInput;
 use crate::duckdb::BindInput;
@@ -325,6 +327,31 @@ pub unsafe extern "C-unwind" fn duckdb_table_function_distributed_bind_deseriali
             unsafe { std::slice::from_raw_parts(bytes, size) }
         };
         let portable = deserialize_bind(bytes)?;
+        Ok(Data::from(Box::new(portable)).as_ptr())
+    })
+}
+
+#[cfg(vortex_vane_distributed)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn duckdb_table_function_distributed_bind_pushdown_projection_aggregates(
+    bytes: *const u8,
+    size: usize,
+    input: cpp::duckdb_vx_agg_input,
+    error_out: *mut cpp::duckdb_vx_error,
+) -> cpp::duckdb_vx_data {
+    let input = unsafe { AggregatePushdownInput::borrow(input) };
+    try_or_null(error_out, || {
+        if bytes.is_null() && size != 0 {
+            return Err(vortex_err!("Distributed Vortex bind bytes are null"));
+        }
+        let bytes = if size == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(bytes, size) }
+        };
+        let Some(portable) = pushdown_serialized_projection_aggregates(bytes, input)? else {
+            return Ok(ptr::null_mut());
+        };
         Ok(Data::from(Box::new(portable)).as_ptr())
     })
 }

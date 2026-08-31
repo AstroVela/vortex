@@ -244,10 +244,13 @@ MatchUBigInt(TableFilter &filter, optional_ptr<ClientContext> context, const Val
         }
         return unknown ? DUCKDB_VX_TABLE_FILTER_MATCH_UNKNOWN : DUCKDB_VX_TABLE_FILTER_MATCH_FALSE;
     }
-    case TableFilterType::OPTIONAL_FILTER:
-        // Optional filters are pruning hints and are not required for query
-        // correctness. Treating them as a match cannot remove real rows.
-        return DUCKDB_VX_TABLE_FILTER_MATCH_TRUE;
+    case TableFilterType::OPTIONAL_FILTER: {
+        // DuckDB keeps the original predicate above the scan, so an optional
+        // filter is safe to use as a split-pruning hint when its child can be
+        // evaluated exactly. Unknown children still retain the file.
+        auto &child = filter.Cast<OptionalFilter>().child_filter;
+        return child ? MatchUBigInt(*child, context, value) : DUCKDB_VX_TABLE_FILTER_MATCH_TRUE;
+    }
     case TableFilterType::IN_FILTER:
         for (const auto &candidate : filter.Cast<InFilter>().values) {
             if (ValueOperations::Equals(value, candidate)) {

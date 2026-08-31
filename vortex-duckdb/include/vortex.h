@@ -107,6 +107,14 @@ duckdb_vx_data duckdb_table_function_distributed_bind_deserialize(const uint8_t 
 
 #if defined(VORTEX_VANE_DISTRIBUTED)
 extern
+duckdb_vx_data duckdb_table_function_distributed_bind_pushdown_projection_aggregates(const uint8_t *bytes,
+                                                                                     size_t size,
+                                                                                     duckdb_vx_agg_input input,
+                                                                                     duckdb_vx_error *error_out);
+#endif
+
+#if defined(VORTEX_VANE_DISTRIBUTED)
+extern
 const uint8_t *duckdb_table_function_distributed_bind_bytes(const void *portable_bind,
                                                             size_t *size_out);
 #endif
