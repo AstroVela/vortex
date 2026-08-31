@@ -47,6 +47,8 @@ duckdb_vx_file_writer_create(void *client_context, const char *file_path, duckdb
 
     try {
         auto &context = *reinterpret_cast<ClientContext *>(client_context);
+        // The client file-system wrapper forwards this connection's FileOpener,
+        // including connection-scoped secrets and remote file-system settings.
         auto &file_system = FileSystem::GetFileSystem(context);
         auto handle =
             file_system.OpenFile(file_path,
