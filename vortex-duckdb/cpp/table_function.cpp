@@ -360,6 +360,15 @@ bool aggregate_pushdown(ClientContext &, const TableFunctionUngroupedAggregateIn
     if (!input.get.table_filters.filters.empty()) {
         return false;
     }
+    // Rust aggregate pushdown indexes physical bind fields. Virtual columns
+    // have no valid physical projection index and must stay in the upper
+    // aggregate for both live and detached Vane binds.
+    for (const auto &projection : input.projections) {
+        const auto scan_index = projection.first;
+        if (scan_index != COUNT_STAR_PROJ_IDX && input.get.GetColumnIds()[scan_index].IsVirtualColumn()) {
+            return false;
+        }
+    }
     auto &bind_data = input.get.bind_data->Cast<VortexBindData>();
     if (!bind_data.ffi_data) {
         duckdb_vx_error error_out = nullptr;
