@@ -1,0 +1,73 @@
+name: AstroVela DuckDB
+
+on:
+  push:
+    branches:
+      - develop
+      - "duckdb/**"
+    paths:
+      - ".github/actions/setup-rust/**"
+      - ".github/workflows/astrovela-duckdb.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "vortex-duckdb/**"
+  pull_request:
+    paths:
+      - ".github/actions/setup-rust/**"
+      - ".github/workflows/astrovela-duckdb.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "vortex-duckdb/**"
+  workflow_dispatch: { }
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: Vortex DuckDB (native)
+    if: github.repository == 'AstroVela/vortex'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: 4
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      - uses: ./.github/actions/setup-rust
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          cache-on-failure: true
+
+      - name: Install native build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes clang-format libclang-dev
+          echo "BINDGEN_EXTRA_CLANG_ARGS=-isystem $(gcc -print-file-name=include)" >> "$GITHUB_ENV"
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check C++ formatting
+        shell: bash
+        run: |
+          mapfile -t files < <(git ls-files \
+            'vortex-duckdb/cpp/*.cpp' \
+            'vortex-duckdb/cpp/include/*.h' \
+            'vortex-duckdb/cpp/include/*.hpp' \
+            'vortex-duckdb/include/*.h')
+          clang-format --dry-run --Werror "${files[@]}"
+
+      - name: Run Clippy
+        run: cargo clippy --locked -p vortex-duckdb --all-targets --all-features -- -D warnings
+
+      - name: Run Vortex DuckDB tests
+        run: cargo test --locked -p vortex-duckdb --all-features
