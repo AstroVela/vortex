@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+#[cfg(vortex_vane_distributed)]
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::LazyLock;
 
@@ -328,7 +330,7 @@ async fn verify_file(
 }
 
 #[cfg(vortex_vane_distributed)]
-async fn open_bound_file(file: &BoundFile) -> VortexResult<VortexFile> {
+pub(crate) async fn open_bound_file(file: &BoundFile) -> VortexResult<VortexFile> {
     let source_url = Url::parse(&file.source_url).map_err(|error| {
         vortex_err!(
             "Invalid bound Vortex source URL '{}': {error}",
@@ -359,6 +361,35 @@ impl LayoutReaderFactory for BoundFileReaderFactory {
     async fn open(&self) -> VortexResult<Option<LayoutReaderRef>> {
         Ok(Some(open_bound_file(&self.file).await?.layout_reader()?))
     }
+}
+
+/// Build a reader over immutable file fragments selected by a distributed worker assignment.
+#[cfg(vortex_vane_distributed)]
+pub fn build_bound_fragment_scan(
+    files: &[BoundFile],
+    row_ranges: &[Range<u64>],
+    empty_dtype: Option<DType>,
+) -> VortexResult<MultiLayoutDataSource> {
+    if files.len() != row_ranges.len() {
+        vortex_bail!(
+            "Distributed Vortex fragment file count {} differs from row-range count {}",
+            files.len(),
+            row_ranges.len()
+        );
+    }
+    let dtype = empty_dtype.ok_or_else(|| vortex_err!("Distributed fragment schema is missing"))?;
+    let factories = files
+        .iter()
+        .cloned()
+        .map(|file| Arc::new(BoundFileReaderFactory { file }) as Arc<dyn LayoutReaderFactory>)
+        .collect();
+    MultiLayoutDataSource::new_deferred_ranges(
+        dtype,
+        factories,
+        row_ranges.to_vec(),
+        Vec::new(),
+        &SESSION,
+    )
 }
 
 /// Build a reader over an already selected file set. No glob is evaluated
