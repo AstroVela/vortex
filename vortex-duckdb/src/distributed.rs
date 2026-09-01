@@ -274,6 +274,8 @@ fn coalesce_ranges(
     fragment_count: usize,
 ) -> Vec<std::ops::Range<u64>> {
     if ranges.is_empty() {
+        // Keep one identity-bearing zero-row fragment so every eligible immutable file remains
+        // represented in normal and aggregate complete-set plans.
         return vec![0..0];
     }
     debug_assert!(fragment_count > 0 && fragment_count <= ranges.len());
@@ -616,6 +618,10 @@ pub fn deserialize_runtime_bind(
 
 #[cfg(test)]
 mod tests {
+    use vortex::dtype::Nullability;
+    use vortex::dtype::PType;
+    use vortex::dtype::StructFields;
+
     use super::*;
 
     fn natural_file(
@@ -629,6 +635,57 @@ mod tests {
             row_count,
             ranges,
         }
+    }
+
+    fn runtime_bind_bytes(file_sizes: &[u64]) -> VortexResult<Vec<u8>> {
+        let dtype = DType::Struct(
+            StructFields::from_iter([(
+                "value",
+                DType::Primitive(PType::I64, Nullability::NonNullable),
+            )]),
+            Nullability::NonNullable,
+        );
+        Ok(PortableBindProto {
+            version: PORTABLE_BIND_VERSION,
+            dtype: pb_dtype::DType::try_from(&dtype)?.encode_to_vec(),
+            projections: Vec::new(),
+            filters: Vec::new(),
+            aggregates: Vec::new(),
+            has_non_optional_filter: false,
+            files: file_sizes
+                .iter()
+                .enumerate()
+                .map(|(file_index, &size)| FileProto {
+                    source_url: "file:///".to_string(),
+                    path: format!("runtime-{file_index}.vortex"),
+                    size: Some(size),
+                    e_tag: Some(format!("etag-{file_index}")),
+                    version: None,
+                })
+                .collect(),
+        }
+        .encode_to_vec())
+    }
+
+    fn fragment(
+        file_index: usize,
+        row_start: u64,
+        row_end: u64,
+        estimated_bytes: u64,
+    ) -> DistributedFragment {
+        DistributedFragment {
+            file_index,
+            row_start,
+            row_end,
+            estimated_bytes,
+        }
+    }
+
+    fn runtime_bind_error(bytes: &[u8], fragments: &[DistributedFragment]) -> String {
+        deserialize_runtime_bind(bytes, fragments)
+            .err()
+            .vortex_expect("invalid fragments must fail")
+            .to_string()
     }
 
     #[test]
@@ -675,5 +732,41 @@ mod tests {
         assert!(validate_natural_ranges("valid.vortex", 10, &[0..4, 4..10]).is_ok());
         assert!(validate_natural_ranges("empty.vortex", 0, &[]).is_ok());
         assert!(validate_natural_ranges("invalid-empty.vortex", 0, &[0..0]).is_err());
+    }
+
+    #[test]
+    fn runtime_bind_rejects_out_of_order_fragments() -> VortexResult<()> {
+        let bytes = runtime_bind_bytes(&[10, 10])?;
+        let error = runtime_bind_error(&bytes, &[fragment(1, 0, 10, 10), fragment(0, 0, 10, 10)]);
+
+        assert!(error.contains("not in canonical order"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_bind_rejects_overlapping_fragments() -> VortexResult<()> {
+        let bytes = runtime_bind_bytes(&[10])?;
+        let error = runtime_bind_error(&bytes, &[fragment(0, 0, 6, 6), fragment(0, 5, 10, 5)]);
+
+        assert!(error.contains("overlap within file index 0"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_bind_rejects_estimate_larger_than_file() -> VortexResult<()> {
+        let bytes = runtime_bind_bytes(&[10])?;
+        let error = runtime_bind_error(&bytes, &[fragment(0, 0, 10, 11)]);
+
+        assert!(error.contains("byte estimate 11 exceeds file size 10"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_bind_rejects_unknown_file_index() -> VortexResult<()> {
+        let bytes = runtime_bind_bytes(&[10])?;
+        let error = runtime_bind_error(&bytes, &[fragment(1, 0, 10, 10)]);
+
+        assert!(error.contains("Unknown distributed Vortex file index: 1"));
+        Ok(())
     }
 }

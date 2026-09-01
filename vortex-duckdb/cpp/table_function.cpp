@@ -750,6 +750,7 @@ namespace {
 
 static constexpr uint8_t VORTEX_SPLIT_PAYLOAD_VERSION = 1;
 static constexpr uint8_t VORTEX_BIND_SERDE_VERSION = 1;
+static constexpr idx_t VORTEX_MIN_FRAGMENT_PAYLOAD_BYTES = sizeof(uint64_t) * 7;
 static constexpr const char *VORTEX_SPLIT_CODEC = "vane.vortex-file-fragment-split";
 
 static bool IsCanonicalVortexScanId(const string &scan_split_set_id) {
@@ -812,10 +813,12 @@ static string EncodeVortexSplit(const vector<VortexBindData::DistributedFragment
     AppendSplitString(result, scan_split_set_id);
     AppendSplitU64(result, fragments.size());
     for (const auto &fragment : fragments) {
-        if (fragment.file_index >= distributed_files.size() || fragment.row_start > fragment.row_end ||
-            fragment.estimated_bytes == DConstants::INVALID_INDEX) {
+        if (fragment.file_index >= distributed_files.size()) {
             throw InternalException("Cannot encode unknown distributed Vortex file index %llu",
                                     static_cast<unsigned long long>(fragment.file_index));
+        }
+        if (fragment.row_start > fragment.row_end || fragment.estimated_bytes == DConstants::INVALID_INDEX) {
+            throw InternalException("Cannot encode an invalid distributed Vortex fragment range or estimate");
         }
         const auto &file = distributed_files[fragment.file_index];
         if (fragment.estimated_bytes > file.size) {
@@ -868,6 +871,10 @@ public:
         }
     }
 
+    idx_t RemainingBytes() const {
+        return payload.size() - offset;
+    }
+
 private:
     const string &payload;
     idx_t offset = 0;
@@ -904,7 +911,8 @@ static DecodedVortexSplit DecodeVortexSplit(const string &payload) {
         throw InvalidInputException("Distributed Vortex split contains an invalid scan identity");
     }
     auto fragment_count = decoder.ReadU64();
-    if (fragment_count == 0 || fragment_count > payload.size()) {
+    if (fragment_count == 0 ||
+        fragment_count > decoder.RemainingBytes() / VORTEX_MIN_FRAGMENT_PAYLOAD_BYTES) {
         throw InvalidInputException("Invalid fragment count in distributed Vortex split payload");
     }
     result.fragments.reserve(fragment_count);
