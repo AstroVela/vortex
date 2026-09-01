@@ -353,21 +353,36 @@ pub(crate) async fn open_bound_file(file: &BoundFile) -> VortexResult<VortexFile
 #[cfg(vortex_vane_distributed)]
 struct BoundFileReaderFactory {
     file: BoundFile,
+    required_row_count: Option<u64>,
 }
 
 #[cfg(vortex_vane_distributed)]
 #[async_trait]
 impl LayoutReaderFactory for BoundFileReaderFactory {
     async fn open(&self) -> VortexResult<Option<LayoutReaderRef>> {
-        Ok(Some(open_bound_file(&self.file).await?.layout_reader()?))
+        let vortex_file = open_bound_file(&self.file).await?;
+        if let Some(required_row_count) = self.required_row_count
+            && vortex_file.row_count() != required_row_count
+        {
+            vortex_bail!(
+                "Distributed aggregate Vortex fragment for '{}' does not cover the complete file: expected row count {}, got {}",
+                self.file.path,
+                required_row_count,
+                vortex_file.row_count()
+            );
+        }
+        Ok(Some(vortex_file.layout_reader()?))
     }
 }
 
 /// Build a reader over immutable file fragments selected by a distributed worker assignment.
+/// When `require_complete_files` is set, each range must start at zero and its end is checked
+/// against the immutable file's actual row count when the deferred reader opens.
 #[cfg(vortex_vane_distributed)]
 pub fn build_bound_fragment_scan(
     files: &[BoundFile],
     row_ranges: &[Range<u64>],
+    require_complete_files: bool,
     empty_dtype: Option<DType>,
 ) -> VortexResult<MultiLayoutDataSource> {
     if files.len() != row_ranges.len() {
@@ -377,11 +392,22 @@ pub fn build_bound_fragment_scan(
             row_ranges.len()
         );
     }
+    if require_complete_files
+        && let Some(row_range) = row_ranges.iter().find(|row_range| row_range.start != 0)
+    {
+        vortex_bail!("Complete Vortex file range must start at row zero: {row_range:?}");
+    }
     let dtype = empty_dtype.ok_or_else(|| vortex_err!("Distributed fragment schema is missing"))?;
     let factories = files
         .iter()
         .cloned()
-        .map(|file| Arc::new(BoundFileReaderFactory { file }) as Arc<dyn LayoutReaderFactory>)
+        .zip(row_ranges)
+        .map(|(file, row_range)| {
+            Arc::new(BoundFileReaderFactory {
+                file,
+                required_row_count: require_complete_files.then_some(row_range.end),
+            }) as Arc<dyn LayoutReaderFactory>
+        })
         .collect();
     MultiLayoutDataSource::new_deferred_ranges(
         dtype,
@@ -415,7 +441,12 @@ pub fn build_bound_file_scan(
         let remaining = files[1..]
             .iter()
             .cloned()
-            .map(|file| Arc::new(BoundFileReaderFactory { file }) as Arc<dyn LayoutReaderFactory>)
+            .map(|file| {
+                Arc::new(BoundFileReaderFactory {
+                    file,
+                    required_row_count: None,
+                }) as Arc<dyn LayoutReaderFactory>
+            })
             .collect();
         let byte_sizes = files.iter().map(|file| Some(file.size)).collect();
         Ok(MultiLayoutDataSource::new_with_first(

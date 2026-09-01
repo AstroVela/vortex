@@ -553,6 +553,7 @@ pub fn deserialize_runtime_bind(
     assigned_fragments: &[DistributedFragment],
 ) -> VortexResult<TableFunctionBind> {
     let decoded = decode_bind(bytes)?;
+    let aggregate_scan = !decoded.aggregates.is_empty();
 
     let mut selected_files = Vec::with_capacity(assigned_fragments.len());
     let mut row_ranges = Vec::with_capacity(assigned_fragments.len());
@@ -590,14 +591,23 @@ pub fn deserialize_runtime_bind(
                 file.size
             );
         }
+        if aggregate_scan && (fragment.row_start != 0 || fragment.estimated_bytes != file.size) {
+            vortex_bail!(
+                "Distributed aggregate Vortex fragment for file index {index} must start at row zero and estimate the complete file size"
+            );
+        }
         selected_files.push(file.clone());
         row_ranges.push(fragment.row_start..fragment.row_end);
         file_indexes.push(index);
         previous_fragment = Some(fragment);
     }
 
-    let data_source =
-        build_bound_fragment_scan(&selected_files, &row_ranges, Some(decoded.dtype.clone()))?;
+    let data_source = build_bound_fragment_scan(
+        &selected_files,
+        &row_ranges,
+        aggregate_scan,
+        Some(decoded.dtype.clone()),
+    )?;
     if data_source.dtype() != &decoded.dtype {
         vortex_bail!(
             "Distributed Vortex file schema differs from the coordinator bind: expected {}, got {}",
@@ -637,7 +647,10 @@ mod tests {
         }
     }
 
-    fn runtime_bind_bytes(file_sizes: &[u64]) -> VortexResult<Vec<u8>> {
+    fn runtime_bind_bytes_with_aggregates(
+        file_sizes: &[u64],
+        aggregates: Vec<AggregateProto>,
+    ) -> VortexResult<Vec<u8>> {
         let dtype = DType::Struct(
             StructFields::from_iter([(
                 "value",
@@ -650,7 +663,7 @@ mod tests {
             dtype: pb_dtype::DType::try_from(&dtype)?.encode_to_vec(),
             projections: Vec::new(),
             filters: Vec::new(),
-            aggregates: Vec::new(),
+            aggregates,
             has_non_optional_filter: false,
             files: file_sizes
                 .iter()
@@ -665,6 +678,20 @@ mod tests {
                 .collect(),
         }
         .encode_to_vec())
+    }
+
+    fn runtime_bind_bytes(file_sizes: &[u64]) -> VortexResult<Vec<u8>> {
+        runtime_bind_bytes_with_aggregates(file_sizes, Vec::new())
+    }
+
+    fn aggregate_runtime_bind_bytes(file_sizes: &[u64]) -> VortexResult<Vec<u8>> {
+        runtime_bind_bytes_with_aggregates(
+            file_sizes,
+            vec![AggregateProto {
+                projection_id: 0,
+                kind: 7,
+            }],
+        )
     }
 
     fn fragment(
@@ -767,6 +794,25 @@ mod tests {
         let error = runtime_bind_error(&bytes, &[fragment(1, 0, 10, 10)]);
 
         assert!(error.contains("Unknown distributed Vortex file index: 1"));
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_runtime_bind_defers_complete_file_open() -> VortexResult<()> {
+        let bytes = aggregate_runtime_bind_bytes(&[10])?;
+
+        assert!(deserialize_runtime_bind(&bytes, &[fragment(0, 0, 42, 10)]).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_runtime_bind_rejects_partial_file_metadata() -> VortexResult<()> {
+        let bytes = aggregate_runtime_bind_bytes(&[10])?;
+        let start_error = runtime_bind_error(&bytes, &[fragment(0, 1, 42, 10)]);
+        let estimate_error = runtime_bind_error(&bytes, &[fragment(0, 0, 42, 9)]);
+
+        assert!(start_error.contains("must start at row zero"));
+        assert!(estimate_error.contains("estimate the complete file size"));
         Ok(())
     }
 }

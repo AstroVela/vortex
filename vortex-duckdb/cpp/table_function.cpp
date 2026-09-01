@@ -967,6 +967,26 @@ static bool SameDistributedFile(const VortexBindData::DistributedFile &left,
     return left.source_url == right.source_url && left.path == right.path && left.size == right.size;
 }
 
+static bool IsCompleteAggregateVortexAssignment(const vector<VortexBindData::DistributedFragment> &fragments,
+                                                const vector<idx_t> &eligible_file_indexes,
+                                                const vector<VortexBindData::DistributedFile> &files) {
+    if (fragments.size() != eligible_file_indexes.size()) {
+        return false;
+    }
+    for (idx_t fragment_index = 0; fragment_index < fragments.size(); fragment_index++) {
+        const auto file_index = eligible_file_indexes[fragment_index];
+        const auto &fragment = fragments[fragment_index];
+        if (file_index >= files.size() || fragment.file_index != file_index || fragment.row_start != 0 ||
+            fragment.estimated_bytes != files[file_index].size) {
+            return false;
+        }
+    }
+    // The worker checks row_end against the immutable file's actual row count when it opens the
+    // reader. Keeping that storage-dependent check there avoids reopening every aggregate file
+    // while applying or deserializing owned split state.
+    return true;
+}
+
 static void ValidatePortableVortexBind(const string &portable_bind,
                                        const vector<VortexBindData::DistributedFile> &files,
                                        bool aggregate_scan,
@@ -1165,13 +1185,10 @@ static unique_ptr<FunctionData> VortexScanDeserialize(Deserializer &deserializer
         throw SerializationException(
             "Detached Vortex bind contains assigned fragments without an applied split batch");
     }
-    if (aggregate_scan && splits_applied && !assigned_fragments.empty()) {
-        const auto expected =
-            PlanVortexFragments(portable_bind, eligible_file_indexes, eligible_file_indexes.size());
-        if (assigned_fragments != expected) {
-            throw SerializationException(
-                "Distributed aggregate Vortex bind contains an incomplete file assignment");
-        }
+    if (aggregate_scan && splits_applied && !assigned_fragments.empty() &&
+        !IsCompleteAggregateVortexAssignment(assigned_fragments, eligible_file_indexes, files)) {
+        throw SerializationException(
+            "Distributed aggregate Vortex bind contains an incomplete file assignment");
     }
 
     auto result = make_uniq<VortexBindData>(nullptr, types, names);
@@ -1388,15 +1405,14 @@ static void VortexApplyDistributedSplits(optional_ptr<FunctionData> worker_bind_
         }
     }
     if (bind_data.aggregate_scan && !splits.empty()) {
-        const auto expected = PlanVortexFragments(bind_data.portable_bind,
-                                                  bind_data.eligible_file_indexes,
-                                                  bind_data.eligible_file_indexes.size());
-        if (assigned != expected) {
+        if (!IsCompleteAggregateVortexAssignment(assigned,
+                                                 bind_data.eligible_file_indexes,
+                                                 bind_data.distributed_files)) {
             throw InvalidInputException(
                 "Distributed aggregate Vortex split does not contain the complete planned file set");
         }
         idx_t expected_bytes = 0;
-        for (const auto &fragment : expected) {
+        for (const auto &fragment : assigned) {
             expected_bytes = SaturatingVortexSplitEstimate(expected_bytes, fragment.estimated_bytes);
         }
         if (!splits[0].estimated_cardinality.IsValid() || !splits[0].estimated_bytes.IsValid() ||
