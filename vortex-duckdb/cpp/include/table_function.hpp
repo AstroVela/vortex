@@ -64,6 +64,18 @@ struct VortexBindData final : FunctionData {
         }
     };
 
+    struct DistributedFragment {
+        idx_t file_index;
+        idx_t row_start;
+        idx_t row_end;
+        idx_t estimated_bytes;
+
+        bool operator==(const DistributedFragment &other) const {
+            return file_index == other.file_index && row_start == other.row_start &&
+                   row_end == other.row_end && estimated_bytes == other.estimated_bytes;
+        }
+    };
+
     struct PortableSnapshot {
         string portable_bind;
         vector<DistributedFile> distributed_files;
@@ -78,7 +90,7 @@ struct VortexBindData final : FunctionData {
     bool explicit_split_mode = false;
     bool splits_applied = false;
     vector<idx_t> eligible_file_indexes;
-    vector<idx_t> assigned_file_indexes;
+    vector<DistributedFragment> assigned_fragments;
 #endif
 };
 

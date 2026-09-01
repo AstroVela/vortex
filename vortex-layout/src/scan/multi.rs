@@ -6,8 +6,8 @@
 //! Readers may be pre-opened or deferred via [`LayoutReaderFactory`]. Deferred readers are opened
 //! concurrently during scanning using `buffer_unordered`: up to `concurrency` file opens run in
 //! parallel as spawned tasks on the session runtime. Once opened, each reader yields a single
-//! partition covering its full row range; internal I/O pipelining and chunking are handled by
-//! [`ScanBuilder`].
+//! partition covering either its full row range or an explicitly assigned child row range;
+//! internal I/O pipelining and chunking are handled by [`ScanBuilder`].
 //!
 //! # Schema Resolution
 //!
@@ -82,8 +82,9 @@ pub trait LayoutReaderFactory: 'static + Send + Sync {
 /// Readers may be pre-opened or deferred via [`LayoutReaderFactory`]. Deferred readers are opened
 /// concurrently during scanning using `buffer_unordered`, mirroring the DuckDB scan pattern: up
 /// to `concurrency` file opens run in parallel as spawned tasks on the session runtime. Once
-/// opened, each reader yields a single partition covering its full row range; internal I/O
-/// pipelining and chunking are handled by [`ScanBuilder`].
+/// opened, each reader yields a single partition covering either its full row range or an
+/// explicitly assigned child row range; internal I/O pipelining and chunking are handled by
+/// [`ScanBuilder`].
 #[derive(Clone)]
 pub struct MultiLayoutDataSource {
     dtype: DType,
@@ -97,11 +98,15 @@ pub enum MultiLayoutChild {
         reader: LayoutReaderRef,
         /// On-storage file size in bytes, if known from the listing metadata.
         byte_size: Option<u64>,
+        /// Root-coordinate row range assigned to this child, or the complete reader when absent.
+        row_range: Option<Range<u64>>,
     },
     Deferred {
         factory: Arc<dyn LayoutReaderFactory>,
         /// On-storage file size in bytes, if known from the listing metadata.
         byte_size: Option<u64>,
+        /// Root-coordinate row range assigned to this child, or the complete reader when absent.
+        row_range: Option<Range<u64>>,
     },
 }
 
@@ -111,6 +116,24 @@ impl MultiLayoutChild {
         match self {
             MultiLayoutChild::Opened { byte_size, .. } => *byte_size,
             MultiLayoutChild::Deferred { byte_size, .. } => *byte_size,
+        }
+    }
+
+    /// Root-coordinate row range assigned to this child, if any.
+    pub fn row_range(&self) -> Option<&Range<u64>> {
+        match self {
+            MultiLayoutChild::Opened { row_range, .. }
+            | MultiLayoutChild::Deferred { row_range, .. } => row_range.as_ref(),
+        }
+    }
+
+    fn known_row_count(&self) -> Option<u64> {
+        if let Some(row_range) = self.row_range() {
+            return Some(row_range.end.saturating_sub(row_range.start));
+        }
+        match self {
+            MultiLayoutChild::Opened { reader, .. } => Some(reader.row_count()),
+            MultiLayoutChild::Deferred { .. } => None,
         }
     }
 }
@@ -148,12 +171,17 @@ impl MultiLayoutDataSource {
         children.push(MultiLayoutChild::Opened {
             reader: first,
             byte_size: first_size,
+            row_range: None,
         });
         children.extend(
             remaining
                 .into_iter()
                 .zip_eq(sizes_iter)
-                .map(|(factory, byte_size)| MultiLayoutChild::Deferred { factory, byte_size }),
+                .map(|(factory, byte_size)| MultiLayoutChild::Deferred {
+                    factory,
+                    byte_size,
+                    row_range: None,
+                }),
         );
 
         Self {
@@ -195,10 +223,75 @@ impl MultiLayoutDataSource {
             children: factories
                 .into_iter()
                 .zip_eq(sizes)
-                .map(|(factory, byte_size)| MultiLayoutChild::Deferred { factory, byte_size })
+                .map(|(factory, byte_size)| MultiLayoutChild::Deferred {
+                    factory,
+                    byte_size,
+                    row_range: None,
+                })
                 .collect(),
             concurrency,
         }
+    }
+
+    /// Creates a multi-layout data source from deferred readers with independently assigned row
+    /// ranges.
+    ///
+    /// Each range uses the corresponding reader's root coordinate space. Ranges may be empty only
+    /// for an empty reader and must not be reversed. Reader bounds are checked after the deferred
+    /// reader is opened.
+    pub fn new_deferred_ranges(
+        dtype: DType,
+        factories: Vec<Arc<dyn LayoutReaderFactory>>,
+        row_ranges: Vec<Range<u64>>,
+        byte_sizes: Vec<Option<u64>>,
+        session: &VortexSession,
+    ) -> VortexResult<Self> {
+        if factories.len() != row_ranges.len() {
+            vortex_bail!(
+                "row_ranges length {} must match the number of factories {}",
+                row_ranges.len(),
+                factories.len()
+            );
+        }
+        if !byte_sizes.is_empty() && byte_sizes.len() != factories.len() {
+            vortex_bail!(
+                "byte_sizes length {} must match the number of factories {}",
+                byte_sizes.len(),
+                factories.len()
+            );
+        }
+        if let Some(row_range) = row_ranges
+            .iter()
+            .find(|row_range| row_range.start > row_range.end)
+        {
+            vortex_bail!("Assigned child row range is reversed: {row_range:?}");
+        }
+
+        let concurrency = get_available_parallelism().unwrap_or(DEFAULT_CONCURRENCY);
+        let sizes = if byte_sizes.is_empty() {
+            vec![None; factories.len()]
+        } else {
+            byte_sizes
+        };
+        let children = factories
+            .into_iter()
+            .zip_eq(row_ranges)
+            .zip_eq(sizes)
+            .map(
+                |((factory, row_range), byte_size)| MultiLayoutChild::Deferred {
+                    factory,
+                    byte_size,
+                    row_range: Some(row_range),
+                },
+            )
+            .collect();
+
+        Ok(Self {
+            dtype,
+            session: session.clone(),
+            children,
+            concurrency,
+        })
     }
 
     pub fn children(&self) -> &[MultiLayoutChild] {
@@ -223,30 +316,27 @@ impl DataSource for MultiLayoutDataSource {
 
     fn row_count(&self) -> Precision<u64> {
         let mut sum: u64 = 0;
-        let mut opened_count: u64 = 0;
-        let mut deferred_count: u64 = 0;
+        let mut known_count: u64 = 0;
+        let mut unknown_count: u64 = 0;
 
         for child in self.children.iter() {
-            match child {
-                MultiLayoutChild::Opened { reader, .. } => {
-                    opened_count += 1;
-                    sum = sum.saturating_add(reader.row_count());
-                }
-                MultiLayoutChild::Deferred { .. } => {
-                    deferred_count += 1;
-                }
+            if let Some(row_count) = child.known_row_count() {
+                known_count += 1;
+                sum = sum.saturating_add(row_count);
+            } else {
+                unknown_count += 1;
             }
         }
 
-        let total_count = opened_count + deferred_count;
+        let total_count = known_count + unknown_count;
         if total_count == 0 {
             return Precision::exact(0u64);
         }
 
-        if deferred_count == 0 {
+        if unknown_count == 0 {
             Precision::exact(sum)
-        } else if opened_count > 0 {
-            let avg = sum / opened_count;
+        } else if known_count > 0 {
+            let avg = sum / known_count;
             let extrapolated = avg.saturating_mul(total_count);
             Precision::inexact(extrapolated)
         } else {
@@ -296,10 +386,12 @@ impl DataSource for MultiLayoutDataSource {
 
         for child in self.children.iter() {
             match child {
-                MultiLayoutChild::Opened { reader, .. } => ready.push_back(Arc::clone(reader)),
-                MultiLayoutChild::Deferred { factory, .. } => {
-                    deferred.push_back(Arc::clone(factory))
-                }
+                MultiLayoutChild::Opened {
+                    reader, row_range, ..
+                } => ready.push_back((Arc::clone(reader), row_range.clone())),
+                MultiLayoutChild::Deferred {
+                    factory, row_range, ..
+                } => deferred.push_back((Arc::clone(factory), row_range.clone())),
             }
         }
 
@@ -364,13 +456,16 @@ impl BoundScanRequest {
     }
 }
 
+type RangedLayoutReader = (LayoutReaderRef, Option<Range<u64>>);
+type RangedLayoutReaderFactory = (Arc<dyn LayoutReaderFactory>, Option<Range<u64>>);
+
 struct MultiLayoutScan {
     session: VortexSession,
     source_dtype: DType,
     dtype: DType,
     request: BoundScanRequest,
-    ready: VecDeque<LayoutReaderRef>,
-    deferred: VecDeque<Arc<dyn LayoutReaderFactory>>,
+    ready: VecDeque<RangedLayoutReader>,
+    deferred: VecDeque<RangedLayoutReaderFactory>,
     handle: vortex_io::runtime::Handle,
     concurrency: usize,
 }
@@ -409,12 +504,13 @@ impl DataSourceScan for MultiLayoutScan {
         // Deferred readers are opened concurrently via spawned tasks.
         // When ordered, we use `buffered` to preserve the original partition order.
         // When unordered, we use `buffer_unordered` to yield partitions as they open.
-        let spawned = stream::iter(deferred).map(move |factory| {
+        let spawned = stream::iter(deferred).map(move |(factory, row_range)| {
             handle.spawn(async move {
-                factory
+                let reader = factory
                     .open()
                     .instrument(tracing::info_span!("LayoutReaderFactory::open"))
-                    .await
+                    .await?;
+                Ok(reader.map(|reader| (reader, row_range)))
             })
         });
 
@@ -449,23 +545,53 @@ impl DataSourceScan for MultiLayoutScan {
             .chain(deferred_stream)
             .enumerate()
             .flat_map(move |(i, reader_result)| match reader_result {
-                Ok(reader) => {
-                    reader_partition(i, reader, session.clone(), &source_dtype, request.clone())
-                }
+                Ok((reader, child_row_range)) => reader_partition(
+                    i,
+                    reader,
+                    child_row_range,
+                    session.clone(),
+                    &source_dtype,
+                    request.clone(),
+                ),
                 Err(e) => stream::once(async move { Err(e) }).boxed(),
             })
             .boxed()
     }
 }
 
+fn assigned_reader_row_range(
+    child_row_range: Range<u64>,
+    request_row_range: Option<&Range<u64>>,
+    row_count: u64,
+) -> VortexResult<Option<Range<u64>>> {
+    if child_row_range.start > child_row_range.end
+        || child_row_range.end > row_count
+        || (child_row_range.is_empty() && row_count != 0)
+    {
+        vortex_bail!(
+            "Assigned child row range {:?} is out of bounds for row count {}",
+            child_row_range,
+            row_count
+        );
+    }
+    let row_range = if let Some(request_row_range) = request_row_range {
+        child_row_range.start.max(request_row_range.start)
+            ..child_row_range.end.min(request_row_range.end)
+    } else {
+        child_row_range
+    };
+    Ok((!row_range.is_empty()).then_some(row_range))
+}
+
 /// Generates a partition stream for a single layout reader.
 ///
 /// Checks file-level pruning first (via `pruning_evaluation`). If the filter proves no rows
 /// can match, returns an empty stream. Otherwise, yields a single partition covering the
-/// reader's full row range.
+/// reader's assigned row range.
 fn reader_partition(
     partition_idx: usize,
     reader: LayoutReaderRef,
+    child_row_range: Option<Range<u64>>,
     session: VortexSession,
     source_dtype: &DType,
     request: BoundScanRequest,
@@ -480,7 +606,18 @@ fn reader_partition(
     }
 
     let row_count = reader.row_count();
-    let row_range = request.row_range.clone().unwrap_or(0..row_count);
+    let row_range = if let Some(child_row_range) = child_row_range {
+        match assigned_reader_row_range(child_row_range, request.row_range.as_ref(), row_count) {
+            Ok(Some(row_range)) => row_range,
+            Ok(None) => return stream::empty().boxed(),
+            Err(error) => return stream::once(async move { Err(error) }).boxed(),
+        }
+    } else {
+        request.row_range.clone().unwrap_or(0..row_count)
+    };
+    if row_range.is_empty() {
+        return stream::empty().boxed();
+    }
 
     let partition_idx_u64: u64 = partition_idx as u64;
     if let Some(range) = &request.partition_range
@@ -632,6 +769,20 @@ mod tests {
         )
     }
 
+    fn ranged_deferred_source(row_ranges: Vec<Range<u64>>) -> VortexResult<MultiLayoutDataSource> {
+        let factories: Vec<Arc<dyn LayoutReaderFactory>> = row_ranges
+            .iter()
+            .map(|_| Arc::new(NeverOpened) as _)
+            .collect();
+        MultiLayoutDataSource::new_deferred_ranges(
+            DType::Bool(Nullability::NonNullable),
+            factories,
+            row_ranges,
+            Vec::new(),
+            &new_session(),
+        )
+    }
+
     #[rstest]
     #[case::all_known(vec![Some(10), Some(20), Some(30)], Precision::exact(60u64))]
     #[case::some_known_extrapolates(vec![Some(10), None, Some(30)], Precision::inexact(60u64))]
@@ -639,6 +790,48 @@ mod tests {
     #[case::no_children(vec![], Precision::exact(0u64))]
     fn byte_size_precision(#[case] sizes: Vec<Option<u64>>, #[case] expected: Precision<u64>) {
         assert_eq!(deferred_source(sizes).byte_size(), expected);
+    }
+
+    #[test]
+    fn deferred_ranges_have_exact_row_count() -> VortexResult<()> {
+        let source = ranged_deferred_source(vec![0..4, 4..9, 20..20])?;
+
+        assert_eq!(source.row_count(), Precision::exact(9u64));
+        assert_eq!(source.children()[0].row_range(), Some(&(0..4)));
+        assert_eq!(source.children()[1].row_range(), Some(&(4..9)));
+        assert_eq!(source.children()[2].row_range(), Some(&(20..20)));
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_ranges_reject_reversed_range() {
+        let error = ranged_deferred_source(std::iter::once(Range { start: 5, end: 4 }).collect())
+            .err()
+            .map(|error| error.to_string());
+
+        assert!(
+            error.as_deref().is_some_and(
+                |message| message.contains("Assigned child row range is reversed: 5..4")
+            )
+        );
+    }
+
+    #[test]
+    fn assigned_range_intersects_requested_root_range() -> VortexResult<()> {
+        assert_eq!(
+            assigned_reader_row_range(2..8, Some(&(5..12)), 10)?,
+            Some(5..8)
+        );
+        assert_eq!(assigned_reader_row_range(2..8, Some(&(8..12)), 10)?, None);
+        assert_eq!(assigned_reader_row_range(0..0, None, 0)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn assigned_range_rejects_invalid_empty_and_bounds() {
+        assert!(assigned_reader_row_range(4..4, None, 10).is_err());
+        assert!(assigned_reader_row_range(Range { start: 4, end: 3 }, None, 10).is_err());
+        assert!(assigned_reader_row_range(0..11, None, 10).is_err());
     }
 
     #[test]

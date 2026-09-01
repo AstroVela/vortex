@@ -11,23 +11,31 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
+use futures::StreamExt;
+use futures::TryStreamExt;
 use prost::Message;
 use vortex::dtype::DType;
 use vortex::dtype::proto::dtype as pb_dtype;
+use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
 use vortex::error::vortex_err;
 use vortex::expr::Expression;
 use vortex::expr::proto::ExprSerializeProtoExt;
+use vortex::io::runtime::BlockingRuntime as _;
 use vortex::proto::expr as pb_expr;
 use vortex::scan::DataSource;
 use vortex_utils::aliases::hash_set::HashSet;
+use vortex_utils::parallelism::get_available_parallelism;
 
+use crate::RUNTIME;
 use crate::SESSION;
 use crate::convert::PushedAggregate;
 use crate::duckdb::AggregatePushdownInputRef;
 use crate::multi_file::BoundFile;
 use crate::multi_file::build_bound_file_scan;
+use crate::multi_file::build_bound_fragment_scan;
+use crate::multi_file::open_bound_file;
 use crate::multi_file::validate_bound_file;
 use crate::projection::DuckdbField;
 use crate::projection::extract_schema_from_dtype;
@@ -96,6 +104,32 @@ pub struct PortableDistributedBind {
 pub struct DistributedRuntimeGlobal {
     pub bind_data: TableFunctionBind,
     pub global_data: TableFunctionGlobal,
+}
+
+/// One independently reopenable row range within an immutable bound Vortex file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DistributedFragment {
+    /// Stable coordinator index of the bound file.
+    pub file_index: usize,
+    /// Inclusive root-coordinate row offset.
+    pub row_start: u64,
+    /// Exclusive root-coordinate row offset.
+    pub row_end: u64,
+    /// Proportional on-storage byte estimate for scheduling.
+    pub estimated_bytes: u64,
+}
+
+/// Owned result of deterministic distributed fragment planning.
+pub struct DistributedFragmentPlan {
+    /// Canonically ordered fragments grouped by file index.
+    pub fragments: Vec<DistributedFragment>,
+}
+
+struct NaturalFileFragments {
+    file_index: usize,
+    file_size: u64,
+    row_count: u64,
+    ranges: Vec<std::ops::Range<u64>>,
 }
 
 fn encode_expression(expression: &Expression) -> VortexResult<Vec<u8>> {
@@ -171,6 +205,169 @@ fn decode_proto(bytes: &[u8]) -> VortexResult<PortableBindProto> {
         vortex_bail!("Distributed Vortex bind data is not canonically encoded");
     }
     Ok(proto)
+}
+
+fn validate_natural_ranges(
+    path: &str,
+    row_count: u64,
+    ranges: &[std::ops::Range<u64>],
+) -> VortexResult<()> {
+    if row_count == 0 {
+        if !ranges.is_empty() {
+            vortex_bail!("Empty Vortex file '{path}' produced non-empty scan fragments");
+        }
+        return Ok(());
+    }
+    if ranges.is_empty()
+        || ranges[0].start != 0
+        || ranges.last().is_none_or(|range| range.end != row_count)
+        || ranges
+            .iter()
+            .any(|range| range.start >= range.end || range.end > row_count)
+        || ranges.windows(2).any(|pair| pair[0].end != pair[1].start)
+    {
+        vortex_bail!(
+            "Vortex file '{path}' produced scan fragments with a gap, overlap, or invalid bound"
+        );
+    }
+    Ok(())
+}
+
+fn allocate_fragment_counts(files: &[NaturalFileFragments], target_count: usize) -> Vec<usize> {
+    if files.is_empty() {
+        return Vec::new();
+    }
+    let capacities = files
+        .iter()
+        .map(|file| file.ranges.len().max(1))
+        .collect::<Vec<_>>();
+    let maximum_count = capacities.iter().sum::<usize>();
+    let desired_count = target_count.max(files.len()).min(maximum_count);
+    let remaining = desired_count - files.len();
+    let total_extra_capacity = maximum_count - files.len();
+    let mut counts = vec![1; files.len()];
+    if remaining == 0 || total_extra_capacity == 0 {
+        return counts;
+    }
+
+    let mut remainders = Vec::with_capacity(files.len());
+    let mut allocated = 0;
+    for (file_index, &capacity) in capacities.iter().enumerate() {
+        let extra_capacity = capacity - 1;
+        let scaled = (remaining as u128) * (extra_capacity as u128);
+        let extra = usize::try_from(scaled / (total_extra_capacity as u128))
+            .vortex_expect("proportional fragment allocation must fit in usize");
+        counts[file_index] += extra;
+        allocated += extra;
+        remainders.push((scaled % (total_extra_capacity as u128), file_index));
+    }
+    remainders
+        .sort_unstable_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    for (_, file_index) in remainders.into_iter().take(remaining - allocated) {
+        counts[file_index] += 1;
+    }
+    counts
+}
+
+fn coalesce_ranges(
+    ranges: &[std::ops::Range<u64>],
+    fragment_count: usize,
+) -> Vec<std::ops::Range<u64>> {
+    if ranges.is_empty() {
+        // Keep one identity-bearing zero-row fragment so every eligible immutable file remains
+        // represented in normal and aggregate complete-set plans.
+        return vec![0..0];
+    }
+    debug_assert!(fragment_count > 0 && fragment_count <= ranges.len());
+    (0..fragment_count)
+        .map(|fragment_index| {
+            let start_index = usize::try_from(
+                (fragment_index as u128) * (ranges.len() as u128) / (fragment_count as u128),
+            )
+            .vortex_expect("coalesced fragment start must fit in usize");
+            let end_index = usize::try_from(
+                ((fragment_index + 1) as u128) * (ranges.len() as u128) / (fragment_count as u128),
+            )
+            .vortex_expect("coalesced fragment end must fit in usize");
+            ranges[start_index].start..ranges[end_index - 1].end
+        })
+        .collect()
+}
+
+fn estimate_fragment_bytes(
+    file_size: u64,
+    row_count: u64,
+    row_range: &std::ops::Range<u64>,
+) -> u64 {
+    if row_count == 0 {
+        return file_size;
+    }
+    let scaled_start = u128::from(file_size) * u128::from(row_range.start) / u128::from(row_count);
+    let scaled_end = u128::from(file_size) * u128::from(row_range.end) / u128::from(row_count);
+    u64::try_from(scaled_end - scaled_start)
+        .vortex_expect("a proportional fragment estimate cannot exceed its u64 file size")
+}
+
+/// Reopen selected immutable files and plan canonical row-range fragments.
+pub fn plan_fragments(
+    bytes: &[u8],
+    selected_file_indexes: &[u64],
+    target_count: usize,
+) -> VortexResult<DistributedFragmentPlan> {
+    let decoded = decode_bind(bytes)?;
+    let mut previous_file_index = None;
+    let mut selected_files = Vec::with_capacity(selected_file_indexes.len());
+    for &file_index in selected_file_indexes {
+        let file_index = usize::try_from(file_index)?;
+        if previous_file_index.is_some_and(|previous| previous >= file_index) {
+            vortex_bail!("Distributed Vortex fragment files are not in canonical order");
+        }
+        previous_file_index = Some(file_index);
+        let file = decoded.files.get(file_index).ok_or_else(|| {
+            vortex_err!("Unknown distributed Vortex fragment file index: {file_index}")
+        })?;
+        selected_files.push((file_index, file.clone()));
+    }
+    let concurrency = get_available_parallelism()
+        .unwrap_or(1)
+        .min(selected_files.len().max(1));
+    let files = RUNTIME.block_on(async move {
+        futures::stream::iter(selected_files)
+            .map(|(file_index, file)| async move {
+                let vortex_file = open_bound_file(&file).await?;
+                let row_count = vortex_file.row_count();
+                let ranges = vortex_file.splits()?;
+                validate_natural_ranges(&file.path, row_count, &ranges)?;
+                Ok::<_, vortex::error::VortexError>(NaturalFileFragments {
+                    file_index,
+                    file_size: file.size,
+                    row_count,
+                    ranges,
+                })
+            })
+            // `buffered` opens files concurrently while preserving canonical input order.
+            .buffered(concurrency)
+            .try_collect::<Vec<_>>()
+            .await
+    })?;
+
+    let fragment_counts = allocate_fragment_counts(&files, target_count.max(1));
+    let mut fragments = Vec::with_capacity(fragment_counts.iter().sum());
+    for (file, fragment_count) in files.iter().zip(fragment_counts) {
+        for row_range in coalesce_ranges(&file.ranges, fragment_count) {
+            fragments.push(DistributedFragment {
+                file_index: file.file_index,
+                row_start: row_range.start,
+                row_end: row_range.end,
+                estimated_bytes: estimate_fragment_bytes(
+                    file.file_size,
+                    file.row_count,
+                    &row_range,
+                ),
+            });
+        }
+    }
+    Ok(DistributedFragmentPlan { fragments })
 }
 
 pub fn serialize_bind(bind_data: &TableFunctionBind) -> VortexResult<PortableDistributedBind> {
@@ -353,29 +550,64 @@ pub fn pushdown_serialized_projection_aggregates(
 
 pub fn deserialize_runtime_bind(
     bytes: &[u8],
-    assigned_file_indexes: &[u64],
+    assigned_fragments: &[DistributedFragment],
 ) -> VortexResult<TableFunctionBind> {
     let decoded = decode_bind(bytes)?;
+    let aggregate_scan = !decoded.aggregates.is_empty();
 
-    let mut seen = HashSet::new();
-    let mut selected_files = Vec::with_capacity(assigned_file_indexes.len());
-    let mut file_indexes = Vec::with_capacity(assigned_file_indexes.len());
-    for &file_index in assigned_file_indexes {
-        let index = usize::try_from(file_index)?;
-        if !seen.insert(index) {
-            vortex_bail!("Duplicate distributed Vortex file index: {index}");
+    let mut selected_files = Vec::with_capacity(assigned_fragments.len());
+    let mut row_ranges = Vec::with_capacity(assigned_fragments.len());
+    let mut file_indexes = Vec::with_capacity(assigned_fragments.len());
+    let mut previous_fragment: Option<&DistributedFragment> = None;
+    for fragment in assigned_fragments {
+        if fragment.row_start > fragment.row_end || fragment.estimated_bytes == u64::MAX {
+            vortex_bail!(
+                "Distributed Vortex fragment has an invalid row range or byte estimate: {}..{}",
+                fragment.row_start,
+                fragment.row_end
+            );
         }
-        selected_files.push(
-            decoded
-                .files
-                .get(index)
-                .ok_or_else(|| vortex_err!("Unknown distributed Vortex file index: {index}"))?
-                .clone(),
-        );
+        let index = fragment.file_index;
+        if let Some(previous) = previous_fragment
+            && (previous.file_index > index
+                || (previous.file_index == index && previous.row_start >= fragment.row_start))
+        {
+            vortex_bail!("Distributed Vortex fragments are not in canonical order");
+        }
+        if let Some(previous) = previous_fragment
+            && previous.file_index == index
+            && previous.row_end > fragment.row_start
+        {
+            vortex_bail!("Distributed Vortex fragments overlap within file index {index}");
+        }
+        let file = decoded
+            .files
+            .get(index)
+            .ok_or_else(|| vortex_err!("Unknown distributed Vortex file index: {index}"))?;
+        if fragment.estimated_bytes > file.size {
+            vortex_bail!(
+                "Distributed Vortex fragment byte estimate {} exceeds file size {}",
+                fragment.estimated_bytes,
+                file.size
+            );
+        }
+        if aggregate_scan && (fragment.row_start != 0 || fragment.estimated_bytes != file.size) {
+            vortex_bail!(
+                "Distributed aggregate Vortex fragment for file index {index} must start at row zero and estimate the complete file size"
+            );
+        }
+        selected_files.push(file.clone());
+        row_ranges.push(fragment.row_start..fragment.row_end);
         file_indexes.push(index);
+        previous_fragment = Some(fragment);
     }
 
-    let data_source = build_bound_file_scan(&selected_files, Some(decoded.dtype.clone()))?;
+    let data_source = build_bound_fragment_scan(
+        &selected_files,
+        &row_ranges,
+        aggregate_scan,
+        Some(decoded.dtype.clone()),
+    )?;
     if data_source.dtype() != &decoded.dtype {
         vortex_bail!(
             "Distributed Vortex file schema differs from the coordinator bind: expected {}, got {}",
@@ -392,4 +624,195 @@ pub fn deserialize_runtime_bind(
         has_non_optional_filter: AtomicBool::new(decoded.has_non_optional_filter),
         aggregates: decoded.aggregates,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use vortex::dtype::Nullability;
+    use vortex::dtype::PType;
+    use vortex::dtype::StructFields;
+
+    use super::*;
+
+    fn natural_file(
+        file_index: usize,
+        row_count: u64,
+        ranges: Vec<std::ops::Range<u64>>,
+    ) -> NaturalFileFragments {
+        NaturalFileFragments {
+            file_index,
+            file_size: row_count * 10,
+            row_count,
+            ranges,
+        }
+    }
+
+    fn runtime_bind_bytes_with_aggregates(
+        file_sizes: &[u64],
+        aggregates: Vec<AggregateProto>,
+    ) -> VortexResult<Vec<u8>> {
+        let dtype = DType::Struct(
+            StructFields::from_iter([(
+                "value",
+                DType::Primitive(PType::I64, Nullability::NonNullable),
+            )]),
+            Nullability::NonNullable,
+        );
+        Ok(PortableBindProto {
+            version: PORTABLE_BIND_VERSION,
+            dtype: pb_dtype::DType::try_from(&dtype)?.encode_to_vec(),
+            projections: Vec::new(),
+            filters: Vec::new(),
+            aggregates,
+            has_non_optional_filter: false,
+            files: file_sizes
+                .iter()
+                .enumerate()
+                .map(|(file_index, &size)| FileProto {
+                    source_url: "file:///".to_string(),
+                    path: format!("runtime-{file_index}.vortex"),
+                    size: Some(size),
+                    e_tag: Some(format!("etag-{file_index}")),
+                    version: None,
+                })
+                .collect(),
+        }
+        .encode_to_vec())
+    }
+
+    fn runtime_bind_bytes(file_sizes: &[u64]) -> VortexResult<Vec<u8>> {
+        runtime_bind_bytes_with_aggregates(file_sizes, Vec::new())
+    }
+
+    fn aggregate_runtime_bind_bytes(file_sizes: &[u64]) -> VortexResult<Vec<u8>> {
+        runtime_bind_bytes_with_aggregates(
+            file_sizes,
+            vec![AggregateProto {
+                projection_id: 0,
+                kind: 7,
+            }],
+        )
+    }
+
+    fn fragment(
+        file_index: usize,
+        row_start: u64,
+        row_end: u64,
+        estimated_bytes: u64,
+    ) -> DistributedFragment {
+        DistributedFragment {
+            file_index,
+            row_start,
+            row_end,
+            estimated_bytes,
+        }
+    }
+
+    fn runtime_bind_error(bytes: &[u8], fragments: &[DistributedFragment]) -> String {
+        deserialize_runtime_bind(bytes, fragments)
+            .err()
+            .vortex_expect("invalid fragments must fail")
+            .to_string()
+    }
+
+    #[test]
+    fn fragment_counts_honor_target_and_capacity() {
+        let files = vec![
+            natural_file(0, 40, vec![0..10, 10..20, 20..30, 30..40]),
+            natural_file(1, 20, vec![0..10, 10..20]),
+        ];
+
+        assert_eq!(allocate_fragment_counts(&files, 1), vec![1, 1]);
+        assert_eq!(allocate_fragment_counts(&files, 4), vec![3, 1]);
+        assert_eq!(allocate_fragment_counts(&files, 20), vec![4, 2]);
+    }
+
+    #[test]
+    fn coalesced_fragments_tile_natural_ranges() {
+        let ranges = vec![0..10, 10..20, 20..30, 30..40, 40..50];
+
+        assert_eq!(coalesce_ranges(&ranges, 2), vec![0..20, 20..50]);
+        assert_eq!(coalesce_ranges(&ranges, 3), vec![0..10, 10..30, 30..50]);
+        assert_eq!(coalesce_ranges(&[], 1), vec![0..0]);
+    }
+
+    #[test]
+    fn proportional_byte_estimates_sum_to_file_size() {
+        let ranges = [0..3, 3..7, 7..10];
+        let estimates = ranges
+            .iter()
+            .map(|range| estimate_fragment_bytes(101, 10, range))
+            .collect::<Vec<_>>();
+
+        assert_eq!(estimates, vec![30, 40, 31]);
+        assert_eq!(estimates.iter().sum::<u64>(), 101);
+    }
+
+    #[test]
+    fn natural_fragment_validation_rejects_gaps_and_overlap() {
+        assert!(validate_natural_ranges("gap.vortex", 10, &[0..4, 5..10]).is_err());
+        assert!(validate_natural_ranges("overlap.vortex", 10, &[0..6, 5..10]).is_err());
+        assert!(validate_natural_ranges("reversed.vortex", 10, &[0..6, 6..5]).is_err());
+        assert!(validate_natural_ranges("past-end.vortex", 10, &[0..11]).is_err());
+        assert!(validate_natural_ranges("missing.vortex", 10, &[]).is_err());
+        assert!(validate_natural_ranges("nonempty.vortex", 10, &[0..0, 0..10]).is_err());
+        assert!(validate_natural_ranges("valid.vortex", 10, &[0..4, 4..10]).is_ok());
+        assert!(validate_natural_ranges("empty.vortex", 0, &[]).is_ok());
+        assert!(validate_natural_ranges("invalid-empty.vortex", 0, &[0..0]).is_err());
+    }
+
+    #[test]
+    fn runtime_bind_rejects_out_of_order_fragments() -> VortexResult<()> {
+        let bytes = runtime_bind_bytes(&[10, 10])?;
+        let error = runtime_bind_error(&bytes, &[fragment(1, 0, 10, 10), fragment(0, 0, 10, 10)]);
+
+        assert!(error.contains("not in canonical order"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_bind_rejects_overlapping_fragments() -> VortexResult<()> {
+        let bytes = runtime_bind_bytes(&[10])?;
+        let error = runtime_bind_error(&bytes, &[fragment(0, 0, 6, 6), fragment(0, 5, 10, 5)]);
+
+        assert!(error.contains("overlap within file index 0"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_bind_rejects_estimate_larger_than_file() -> VortexResult<()> {
+        let bytes = runtime_bind_bytes(&[10])?;
+        let error = runtime_bind_error(&bytes, &[fragment(0, 0, 10, 11)]);
+
+        assert!(error.contains("byte estimate 11 exceeds file size 10"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_bind_rejects_unknown_file_index() -> VortexResult<()> {
+        let bytes = runtime_bind_bytes(&[10])?;
+        let error = runtime_bind_error(&bytes, &[fragment(1, 0, 10, 10)]);
+
+        assert!(error.contains("Unknown distributed Vortex file index: 1"));
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_runtime_bind_defers_complete_file_open() -> VortexResult<()> {
+        let bytes = aggregate_runtime_bind_bytes(&[10])?;
+
+        assert!(deserialize_runtime_bind(&bytes, &[fragment(0, 0, 42, 10)]).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_runtime_bind_rejects_partial_file_metadata() -> VortexResult<()> {
+        let bytes = aggregate_runtime_bind_bytes(&[10])?;
+        let start_error = runtime_bind_error(&bytes, &[fragment(0, 1, 42, 10)]);
+        let estimate_error = runtime_bind_error(&bytes, &[fragment(0, 0, 42, 9)]);
+
+        assert!(start_error.contains("must start at row zero"));
+        assert!(estimate_error.contains("estimate the complete file size"));
+        Ok(())
+    }
 }

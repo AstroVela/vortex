@@ -9,6 +9,8 @@ use std::ptr;
 use num_traits::AsPrimitive;
 use vortex::error::VortexExpect;
 #[cfg(vortex_vane_distributed)]
+use vortex::error::VortexResult;
+#[cfg(vortex_vane_distributed)]
 use vortex::error::vortex_err;
 
 use crate::convert::can_push_expression;
@@ -20,6 +22,10 @@ use crate::copy::copy_to_initialize_global;
 use crate::copy::copy_to_sink;
 use crate::cpp;
 #[cfg(vortex_vane_distributed)]
+use crate::distributed::DistributedFragment;
+#[cfg(vortex_vane_distributed)]
+use crate::distributed::DistributedFragmentPlan;
+#[cfg(vortex_vane_distributed)]
 use crate::distributed::DistributedRuntimeGlobal;
 #[cfg(vortex_vane_distributed)]
 use crate::distributed::PortableDistributedBind;
@@ -27,6 +33,8 @@ use crate::distributed::PortableDistributedBind;
 use crate::distributed::deserialize_bind;
 #[cfg(vortex_vane_distributed)]
 use crate::distributed::deserialize_runtime_bind;
+#[cfg(vortex_vane_distributed)]
+use crate::distributed::plan_fragments;
 #[cfg(vortex_vane_distributed)]
 use crate::distributed::pushdown_serialized_projection_aggregates;
 #[cfg(vortex_vane_distributed)]
@@ -80,6 +88,30 @@ pub struct VortexDistributedFieldView {
     pub name: *const u8,
     pub name_len: usize,
     pub logical_type: cpp::duckdb_logical_type,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[cfg(vortex_vane_distributed)]
+pub struct VortexDistributedFragmentView {
+    pub file_index: u64,
+    pub row_start: u64,
+    pub row_end: u64,
+    pub estimated_bytes: u64,
+}
+
+#[cfg(vortex_vane_distributed)]
+impl TryFrom<VortexDistributedFragmentView> for DistributedFragment {
+    type Error = vortex::error::VortexError;
+
+    fn try_from(fragment: VortexDistributedFragmentView) -> Result<Self, Self::Error> {
+        Ok(Self {
+            file_index: usize::try_from(fragment.file_index)?,
+            row_start: fragment.row_start,
+            row_end: fragment.row_end,
+            estimated_bytes: fragment.estimated_bytes,
+        })
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -370,6 +402,81 @@ pub unsafe extern "C-unwind" fn duckdb_table_function_distributed_bind_bytes(
 
 #[cfg(vortex_vane_distributed)]
 #[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn duckdb_table_function_distributed_plan_fragments(
+    portable_bind: *const u8,
+    portable_bind_size: usize,
+    selected_file_indexes: *const u64,
+    selected_file_count: usize,
+    target_fragment_count: usize,
+    error_out: *mut cpp::duckdb_vx_error,
+) -> cpp::duckdb_vx_data {
+    try_or_null(error_out, || {
+        if portable_bind.is_null() && portable_bind_size != 0 {
+            return Err(vortex_err!("Distributed Vortex bind bytes are null"));
+        }
+        if selected_file_indexes.is_null() && selected_file_count != 0 {
+            return Err(vortex_err!(
+                "Distributed Vortex fragment file indexes are null"
+            ));
+        }
+        let bytes = if portable_bind_size == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(portable_bind, portable_bind_size) }
+        };
+        let file_indexes = if selected_file_count == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(selected_file_indexes, selected_file_count) }
+        };
+        Ok(Data::from(Box::new(plan_fragments(
+            bytes,
+            file_indexes,
+            target_fragment_count,
+        )?))
+        .as_ptr())
+    })
+}
+
+#[cfg(vortex_vane_distributed)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn duckdb_table_function_distributed_fragment_count(
+    fragment_plan: *const c_void,
+) -> usize {
+    let fragment_plan = unsafe { fragment_plan.cast::<DistributedFragmentPlan>().as_ref() }
+        .vortex_expect("fragment_plan null pointer");
+    fragment_plan.fragments.len()
+}
+
+#[cfg(vortex_vane_distributed)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn duckdb_table_function_distributed_fragment_at(
+    fragment_plan: *const c_void,
+    index: usize,
+    fragment_out: *mut VortexDistributedFragmentView,
+) -> bool {
+    if fragment_out.is_null() {
+        return false;
+    }
+    let fragment_plan = unsafe { fragment_plan.cast::<DistributedFragmentPlan>().as_ref() }
+        .vortex_expect("fragment_plan null pointer");
+    let Some(fragment) = fragment_plan.fragments.get(index) else {
+        return false;
+    };
+    unsafe {
+        fragment_out.write(VortexDistributedFragmentView {
+            file_index: u64::try_from(fragment.file_index)
+                .vortex_expect("fragment file index must fit in u64"),
+            row_start: fragment.row_start,
+            row_end: fragment.row_end,
+            estimated_bytes: fragment.estimated_bytes,
+        })
+    };
+    true
+}
+
+#[cfg(vortex_vane_distributed)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn duckdb_table_function_distributed_file_count(
     portable_bind: *const c_void,
 ) -> usize {
@@ -480,8 +587,8 @@ pub unsafe extern "C-unwind" fn duckdb_table_function_distributed_file_is_select
 pub unsafe extern "C-unwind" fn duckdb_table_function_init_global_distributed(
     portable_bind: *const u8,
     portable_bind_size: usize,
-    assigned_file_indexes: *const u64,
-    assigned_file_count: usize,
+    assigned_fragments: *const VortexDistributedFragmentView,
+    assigned_fragment_count: usize,
     ignore_optional_filters: bool,
     init_input: *const cpp::duckdb_vx_tfunc_init_input,
     error_out: *mut cpp::duckdb_vx_error,
@@ -490,20 +597,25 @@ pub unsafe extern "C-unwind" fn duckdb_table_function_init_global_distributed(
         if portable_bind.is_null() && portable_bind_size != 0 {
             return Err(vortex_err!("Distributed Vortex bind bytes are null"));
         }
-        if assigned_file_indexes.is_null() && assigned_file_count != 0 {
-            return Err(vortex_err!("Distributed Vortex file indexes are null"));
+        if assigned_fragments.is_null() && assigned_fragment_count != 0 {
+            return Err(vortex_err!("Distributed Vortex fragments are null"));
         }
         let bytes = if portable_bind_size == 0 {
             &[]
         } else {
             unsafe { std::slice::from_raw_parts(portable_bind, portable_bind_size) }
         };
-        let indexes = if assigned_file_count == 0 {
+        let fragments = if assigned_fragment_count == 0 {
             &[]
         } else {
-            unsafe { std::slice::from_raw_parts(assigned_file_indexes, assigned_file_count) }
+            unsafe { std::slice::from_raw_parts(assigned_fragments, assigned_fragment_count) }
         };
-        let bind_data = deserialize_runtime_bind(bytes, indexes)?;
+        let fragments = fragments
+            .iter()
+            .copied()
+            .map(DistributedFragment::try_from)
+            .collect::<VortexResult<Vec<_>>>()?;
+        let bind_data = deserialize_runtime_bind(bytes, &fragments)?;
         let input = unsafe { init_input.as_ref() }.vortex_expect("init_input null pointer");
         let runtime_input = cpp::duckdb_vx_tfunc_init_input {
             bind_data: (&raw const bind_data).cast(),

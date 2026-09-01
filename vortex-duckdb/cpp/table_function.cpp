@@ -51,7 +51,7 @@ unique_ptr<FunctionData> VortexBindData::Copy() const {
     result->explicit_split_mode = explicit_split_mode;
     result->splits_applied = splits_applied;
     result->eligible_file_indexes = eligible_file_indexes;
-    result->assigned_file_indexes = assigned_file_indexes;
+    result->assigned_fragments = assigned_fragments;
     return result;
 #else
     const auto copied_ffi_data = duckdb_table_function_bind_data_clone(ffi_data->DataPtr());
@@ -71,7 +71,7 @@ bool VortexBindData::Equals(const FunctionData &other_base) const {
            portable_bind == other.portable_bind && distributed_files == other.distributed_files &&
            aggregate_scan == other.aggregate_scan && explicit_split_mode == other.explicit_split_mode &&
            splits_applied == other.splits_applied && eligible_file_indexes == other.eligible_file_indexes &&
-           assigned_file_indexes == other.assigned_file_indexes;
+           assigned_fragments == other.assigned_fragments;
 #else
     // if "types" are different, "ffi_data" would also be different as it
     // contains types inside, so omit "types" from comparison.
@@ -131,6 +131,57 @@ VortexBindData::PortableSnapshot VortexBindData::CreatePortableSnapshot() const 
     }
     result.distributed_files = std::move(files);
     return result;
+}
+
+static vector<VortexBindData::DistributedFragment> PlanVortexFragments(const string &portable_bind,
+                                                                       const vector<idx_t> &file_indexes,
+                                                                       idx_t target_fragment_count) {
+    if (!std::is_sorted(file_indexes.begin(), file_indexes.end()) ||
+        std::adjacent_find(file_indexes.begin(), file_indexes.end()) != file_indexes.end()) {
+        throw InvalidInputException("Vortex fragment file indexes are not in canonical order");
+    }
+    duckdb_vx_error error_out = nullptr;
+    auto fragment_plan_data = duckdb_table_function_distributed_plan_fragments(
+        reinterpret_cast<const uint8_t *>(portable_bind.data()),
+        portable_bind.size(),
+        file_indexes.data(),
+        file_indexes.size(),
+        target_fragment_count,
+        &error_out);
+    if (error_out) {
+        throw InvalidInputException(IntoErrString(error_out));
+    }
+    if (!fragment_plan_data) {
+        throw InvalidInputException("Vortex failed to plan distributed scan fragments");
+    }
+    auto fragment_plan = unique_ptr<CData>(reinterpret_cast<CData *>(fragment_plan_data));
+    const auto fragment_count = duckdb_table_function_distributed_fragment_count(fragment_plan->DataPtr());
+    vector<VortexBindData::DistributedFragment> fragments;
+    fragments.reserve(fragment_count);
+    for (idx_t fragment_index = 0; fragment_index < fragment_count; fragment_index++) {
+        VortexDistributedFragmentView view {};
+        if (!duckdb_table_function_distributed_fragment_at(fragment_plan->DataPtr(), fragment_index, &view) ||
+            !std::binary_search(file_indexes.begin(), file_indexes.end(), view.file_index) ||
+            view.row_start > view.row_end || view.estimated_bytes == DConstants::INVALID_INDEX) {
+            throw InvalidInputException("Vortex produced an invalid distributed fragment at index %llu",
+                                        static_cast<unsigned long long>(fragment_index));
+        }
+        VortexBindData::DistributedFragment fragment {view.file_index,
+                                                      view.row_start,
+                                                      view.row_end,
+                                                      view.estimated_bytes};
+        if (!fragments.empty()) {
+            const auto &previous = fragments.back();
+            if (previous.file_index > fragment.file_index ||
+                (previous.file_index == fragment.file_index &&
+                 (previous.row_start >= fragment.row_start || previous.row_end > fragment.row_start))) {
+                throw InvalidInputException("Vortex produced fragments outside canonical order at index %llu",
+                                            static_cast<unsigned long long>(fragment_index));
+            }
+        }
+        fragments.push_back(fragment);
+    }
+    return fragments;
 }
 #endif
 
@@ -472,14 +523,23 @@ unique_ptr<GlobalTableFunctionState> init_global(ClientContext &context, TableFu
     bool distributed = false;
     if (!bind_data.ffi_data) {
         const auto snapshot = bind_data.CreatePortableSnapshot();
-        vector<idx_t> native_file_indexes;
-        const vector<idx_t> *runtime_file_indexes = &bind_data.assigned_file_indexes;
+        vector<VortexBindData::DistributedFragment> native_fragments;
+        const vector<VortexBindData::DistributedFragment> *runtime_fragments = &bind_data.assigned_fragments;
         if (!bind_data.explicit_split_mode) {
+            vector<idx_t> native_file_indexes;
             native_file_indexes.reserve(snapshot.distributed_files.size());
             for (idx_t file_index = 0; file_index < snapshot.distributed_files.size(); file_index++) {
                 native_file_indexes.push_back(file_index);
             }
-            runtime_file_indexes = &native_file_indexes;
+            native_fragments =
+                PlanVortexFragments(snapshot.portable_bind, native_file_indexes, native_file_indexes.size());
+            runtime_fragments = &native_fragments;
+        }
+        vector<VortexDistributedFragmentView> runtime_fragment_views;
+        runtime_fragment_views.reserve(runtime_fragments->size());
+        for (const auto &fragment : *runtime_fragments) {
+            runtime_fragment_views.push_back(
+                {fragment.file_index, fragment.row_start, fragment.row_end, fragment.estimated_bytes});
         }
         // Optional filters (for example TopN's dynamic bound) are maintained
         // by an upstream operator that is absent from Vane's detached scan
@@ -488,8 +548,8 @@ unique_ptr<GlobalTableFunctionState> init_global(ClientContext &context, TableFu
         ffi_global_data = duckdb_table_function_init_global_distributed(
             reinterpret_cast<const uint8_t *>(snapshot.portable_bind.data()),
             snapshot.portable_bind.size(),
-            runtime_file_indexes->data(),
-            runtime_file_indexes->size(),
+            runtime_fragment_views.data(),
+            runtime_fragment_views.size(),
             bind_data.explicit_split_mode,
             &ffi_input,
             &error_out);
@@ -508,7 +568,7 @@ unique_ptr<GlobalTableFunctionState> init_global(ClientContext &context, TableFu
 #ifdef VORTEX_VANE_DISTRIBUTED
     bool force_empty_output = false;
     force_empty_output = distributed && bind_data.explicit_split_mode && bind_data.splits_applied &&
-                         bind_data.assigned_file_indexes.empty();
+                         bind_data.assigned_fragments.empty();
     return make_uniq<VortexGlobalData>(std::move(cdata), distributed, force_empty_output);
 #else
     return make_uniq<VortexGlobalData>(std::move(cdata));
@@ -671,9 +731,11 @@ InsertionOrderPreservingMap<string> to_string(TableFunctionToStringInput &input)
     auto &bind_data = input.bind_data->Cast<VortexBindData>();
     if (!bind_data.ffi_data) {
         result.insert("Function", "Vortex Scan");
-        const auto file_count = bind_data.explicit_split_mode ? bind_data.assigned_file_indexes.size()
-                                                              : bind_data.distributed_files.size();
-        result.insert("Distributed files", std::to_string(file_count));
+        if (bind_data.explicit_split_mode) {
+            result.insert("Assigned fragments", std::to_string(bind_data.assigned_fragments.size()));
+        } else {
+            result.insert("Distributed files", std::to_string(bind_data.distributed_files.size()));
+        }
         return result;
     }
 #endif
@@ -688,7 +750,8 @@ namespace {
 
 static constexpr uint8_t VORTEX_SPLIT_PAYLOAD_VERSION = 1;
 static constexpr uint8_t VORTEX_BIND_SERDE_VERSION = 1;
-static constexpr const char *VORTEX_SPLIT_CODEC = "vane.vortex-file-split";
+static constexpr idx_t VORTEX_MIN_FRAGMENT_PAYLOAD_BYTES = sizeof(uint64_t) * 7;
+static constexpr const char *VORTEX_SPLIT_CODEC = "vane.vortex-file-fragment-split";
 
 static bool IsCanonicalVortexScanId(const string &scan_split_set_id) {
     hugeint_t parsed;
@@ -730,35 +793,44 @@ static void AppendSplitString(string &result, const string &value) {
     result.append(value);
 }
 
-// Binary payload v1:
-//   "VXSP" | u8 version | string scan_split_set_id | u64 file_count |
+// Binary fragment payload v1:
+//   "VXFR" | u8 version | string scan_split_set_id | u64 fragment_count |
 //   repeated(u64 stable_file_index | string source_url | string path |
-//            u64 immutable_size)
-// Normal scans encode one file. Aggregate-pushed scans encode their complete
-// pruned file set so a single worker computes the final aggregate exactly once.
-static string EncodeVortexSplit(const vector<idx_t> &file_indexes,
+//            u64 immutable_size | u64 row_start | u64 row_end | u64 estimated_bytes)
+// Normal scans encode one independently assignable fragment. Aggregate-pushed
+// scans encode one full-file fragment per selected file in one complete-set split.
+static string EncodeVortexSplit(const vector<VortexBindData::DistributedFragment> &fragments,
                                 const vector<VortexBindData::DistributedFile> &distributed_files,
                                 const string &scan_split_set_id) {
-    if (file_indexes.empty()) {
+    if (fragments.empty()) {
         throw InternalException("Cannot encode an empty distributed Vortex split");
     }
     if (!IsCanonicalVortexScanId(scan_split_set_id)) {
         throw InternalException("Cannot encode a distributed Vortex split without a canonical scan identity");
     }
-    string result("VXSP", 4);
+    string result("VXFR", 4);
     AppendSplitByte(result, VORTEX_SPLIT_PAYLOAD_VERSION);
     AppendSplitString(result, scan_split_set_id);
-    AppendSplitU64(result, file_indexes.size());
-    for (auto file_index : file_indexes) {
-        if (file_index >= distributed_files.size()) {
+    AppendSplitU64(result, fragments.size());
+    for (const auto &fragment : fragments) {
+        if (fragment.file_index >= distributed_files.size()) {
             throw InternalException("Cannot encode unknown distributed Vortex file index %llu",
-                                    static_cast<unsigned long long>(file_index));
+                                    static_cast<unsigned long long>(fragment.file_index));
         }
-        const auto &file = distributed_files[file_index];
-        AppendSplitU64(result, file_index);
+        if (fragment.row_start > fragment.row_end || fragment.estimated_bytes == DConstants::INVALID_INDEX) {
+            throw InternalException("Cannot encode an invalid distributed Vortex fragment range or estimate");
+        }
+        const auto &file = distributed_files[fragment.file_index];
+        if (fragment.estimated_bytes > file.size) {
+            throw InternalException("Cannot encode a distributed Vortex fragment larger than its file");
+        }
+        AppendSplitU64(result, fragment.file_index);
         AppendSplitString(result, file.source_url);
         AppendSplitString(result, file.path);
         AppendSplitU64(result, file.size);
+        AppendSplitU64(result, fragment.row_start);
+        AppendSplitU64(result, fragment.row_end);
+        AppendSplitU64(result, fragment.estimated_bytes);
     }
     return result;
 }
@@ -799,23 +871,30 @@ public:
         }
     }
 
+    idx_t RemainingBytes() const {
+        return payload.size() - offset;
+    }
+
 private:
     const string &payload;
     idx_t offset = 0;
 };
 
-struct DecodedVortexFile {
+struct DecodedVortexFragment {
     idx_t file_index;
     VortexBindData::DistributedFile file;
+    idx_t row_start;
+    idx_t row_end;
+    idx_t estimated_bytes;
 };
 
 struct DecodedVortexSplit {
     string scan_split_set_id;
-    vector<DecodedVortexFile> files;
+    vector<DecodedVortexFragment> fragments;
 };
 
 static DecodedVortexSplit DecodeVortexSplit(const string &payload) {
-    if (payload.size() < 5 || payload.compare(0, 4, "VXSP") != 0) {
+    if (payload.size() < 5 || payload.compare(0, 4, "VXFR") != 0) {
         throw InvalidInputException("Invalid distributed Vortex split payload magic");
     }
     VortexSplitDecoder decoder(payload);
@@ -831,75 +910,48 @@ static DecodedVortexSplit DecodeVortexSplit(const string &payload) {
     if (!IsCanonicalVortexScanId(result.scan_split_set_id)) {
         throw InvalidInputException("Distributed Vortex split contains an invalid scan identity");
     }
-    auto file_count = decoder.ReadU64();
-    if (file_count == 0 || file_count > payload.size()) {
-        throw InvalidInputException("Invalid file count in distributed Vortex split payload");
+    auto fragment_count = decoder.ReadU64();
+    if (fragment_count == 0 ||
+        fragment_count > decoder.RemainingBytes() / VORTEX_MIN_FRAGMENT_PAYLOAD_BYTES) {
+        throw InvalidInputException("Invalid fragment count in distributed Vortex split payload");
     }
-    result.files.reserve(file_count);
-    for (idx_t file_offset = 0; file_offset < file_count; file_offset++) {
-        DecodedVortexFile decoded;
+    result.fragments.reserve(fragment_count);
+    for (idx_t fragment_offset = 0; fragment_offset < fragment_count; fragment_offset++) {
+        DecodedVortexFragment decoded;
         decoded.file_index = decoder.ReadU64();
         decoded.file.source_url = decoder.ReadString();
         decoded.file.path = decoder.ReadString();
         decoded.file.size = decoder.ReadU64();
+        decoded.row_start = decoder.ReadU64();
+        decoded.row_end = decoder.ReadU64();
+        decoded.estimated_bytes = decoder.ReadU64();
         if (decoded.file.size == DConstants::INVALID_INDEX) {
             throw InvalidInputException("Distributed Vortex split contains an invalid file size");
+        }
+        if (decoded.row_start > decoded.row_end || decoded.estimated_bytes == DConstants::INVALID_INDEX ||
+            decoded.estimated_bytes > decoded.file.size) {
+            throw InvalidInputException("Distributed Vortex split contains an invalid fragment range");
         }
         if (decoded.file.source_url.empty() || !IsCanonicalVortexFilePath(decoded.file.path)) {
             throw InvalidInputException("Distributed Vortex split contains an invalid file identity");
         }
-        result.files.push_back(std::move(decoded));
+        result.fragments.push_back(std::move(decoded));
     }
     decoder.Finish();
     return result;
 }
 
-static bool IsCanonicalVortexSplitId(const string &split_id) {
-    if (split_id.empty()) {
-        return false;
-    }
-    idx_t segment_start = 0;
-    optional_idx previous;
-    while (segment_start < split_id.size()) {
-        auto segment_end = split_id.find(',', segment_start);
-        if (segment_end == string::npos) {
-            segment_end = split_id.size();
-        }
-        if (segment_end == segment_start ||
-            (segment_end - segment_start > 1 && split_id[segment_start] == '0')) {
-            return false;
-        }
-        idx_t value = 0;
-        for (idx_t offset = segment_start; offset < segment_end; offset++) {
-            auto character = split_id[offset];
-            if (character < '0' || character > '9') {
-                return false;
-            }
-            auto digit = static_cast<idx_t>(character - '0');
-            if (value > (NumericLimits<idx_t>::Maximum() - digit) / 10) {
-                return false;
-            }
-            value = value * 10 + digit;
-        }
-        if (previous.IsValid() && previous.GetIndex() >= value) {
-            return false;
-        }
-        previous = optional_idx(value);
-        if (segment_end == split_id.size()) {
-            return true;
-        }
-        segment_start = segment_end + 1;
-    }
-    return false;
-}
-
-static string CanonicalVortexSplitId(const vector<idx_t> &file_indexes) {
+static string CanonicalVortexSplitId(const vector<VortexBindData::DistributedFragment> &fragments) {
     string result;
-    for (auto file_index : file_indexes) {
+    for (const auto &fragment : fragments) {
         if (!result.empty()) {
             result += ',';
         }
-        result += std::to_string(file_index);
+        result += std::to_string(fragment.file_index);
+        result += ':';
+        result += std::to_string(fragment.row_start);
+        result += '-';
+        result += std::to_string(fragment.row_end);
     }
     return result;
 }
@@ -910,28 +962,29 @@ static idx_t SaturatingVortexSplitEstimate(idx_t left, idx_t right) {
     return right > maximum - left ? maximum : left + right;
 }
 
-static idx_t ProportionalVortexSplitEstimate(idx_t total, idx_t numerator, idx_t denominator) {
-    D_ASSERT(denominator > 0 && numerator <= denominator);
-    if (numerator == 0) {
-        return 0;
-    }
-    if (numerator == denominator) {
-        return total;
-    }
-    const auto scaled = static_cast<long double>(total) * static_cast<long double>(numerator) /
-                        static_cast<long double>(denominator);
-    // On platforms where long double is IEEE double, UINT64_MAX - 1 rounds to
-    // 2^64. Clamp in floating point before the integer conversion so an
-    // extreme estimate cannot invoke an out-of-range conversion.
-    if (scaled >= static_cast<long double>(total)) {
-        return total;
-    }
-    return static_cast<idx_t>(scaled);
-}
-
 static bool SameDistributedFile(const VortexBindData::DistributedFile &left,
                                 const VortexBindData::DistributedFile &right) {
     return left.source_url == right.source_url && left.path == right.path && left.size == right.size;
+}
+
+static bool IsCompleteAggregateVortexAssignment(const vector<VortexBindData::DistributedFragment> &fragments,
+                                                const vector<idx_t> &eligible_file_indexes,
+                                                const vector<VortexBindData::DistributedFile> &files) {
+    if (fragments.size() != eligible_file_indexes.size()) {
+        return false;
+    }
+    for (idx_t fragment_index = 0; fragment_index < fragments.size(); fragment_index++) {
+        const auto file_index = eligible_file_indexes[fragment_index];
+        const auto &fragment = fragments[fragment_index];
+        if (file_index >= files.size() || fragment.file_index != file_index || fragment.row_start != 0 ||
+            fragment.estimated_bytes != files[file_index].size) {
+            return false;
+        }
+    }
+    // The worker checks row_end against the immutable file's actual row count when it opens the
+    // reader. Keeping that storage-dependent check there avoids reopening every aggregate file
+    // while applying or deserializing owned split state.
+    return true;
 }
 
 static void ValidatePortableVortexBind(const string &portable_bind,
@@ -1022,9 +1075,26 @@ static void VortexScanSerialize(Serializer &serializer,
     serializer.WriteProperty(106, "scan_split_set_id", data.scan_split_set_id);
     serializer.WriteProperty(107, "explicit_split_mode", data.explicit_split_mode);
     serializer.WriteProperty(108, "splits_applied", data.splits_applied);
-    serializer.WriteProperty(109, "assigned_file_indexes", data.assigned_file_indexes);
-    serializer.WriteProperty(110, "aggregate_scan", snapshot.aggregate_scan);
-    serializer.WriteProperty(111, "eligible_file_indexes", data.eligible_file_indexes);
+    vector<idx_t> assigned_file_indexes;
+    vector<idx_t> assigned_row_starts;
+    vector<idx_t> assigned_row_ends;
+    vector<idx_t> assigned_estimated_bytes;
+    assigned_file_indexes.reserve(data.assigned_fragments.size());
+    assigned_row_starts.reserve(data.assigned_fragments.size());
+    assigned_row_ends.reserve(data.assigned_fragments.size());
+    assigned_estimated_bytes.reserve(data.assigned_fragments.size());
+    for (const auto &fragment : data.assigned_fragments) {
+        assigned_file_indexes.push_back(fragment.file_index);
+        assigned_row_starts.push_back(fragment.row_start);
+        assigned_row_ends.push_back(fragment.row_end);
+        assigned_estimated_bytes.push_back(fragment.estimated_bytes);
+    }
+    serializer.WriteProperty(109, "assigned_file_indexes", assigned_file_indexes);
+    serializer.WriteProperty(110, "assigned_row_starts", assigned_row_starts);
+    serializer.WriteProperty(111, "assigned_row_ends", assigned_row_ends);
+    serializer.WriteProperty(112, "assigned_estimated_bytes", assigned_estimated_bytes);
+    serializer.WriteProperty(113, "aggregate_scan", snapshot.aggregate_scan);
+    serializer.WriteProperty(114, "eligible_file_indexes", data.eligible_file_indexes);
 }
 
 static unique_ptr<FunctionData> VortexScanDeserialize(Deserializer &deserializer, TableFunction &) {
@@ -1042,8 +1112,11 @@ static unique_ptr<FunctionData> VortexScanDeserialize(Deserializer &deserializer
     auto explicit_split_mode = deserializer.ReadProperty<bool>(107, "explicit_split_mode");
     auto splits_applied = deserializer.ReadProperty<bool>(108, "splits_applied");
     auto assigned_file_indexes = deserializer.ReadProperty<vector<idx_t>>(109, "assigned_file_indexes");
-    auto aggregate_scan = deserializer.ReadProperty<bool>(110, "aggregate_scan");
-    auto eligible_file_indexes = deserializer.ReadProperty<vector<idx_t>>(111, "eligible_file_indexes");
+    auto assigned_row_starts = deserializer.ReadProperty<vector<idx_t>>(110, "assigned_row_starts");
+    auto assigned_row_ends = deserializer.ReadProperty<vector<idx_t>>(111, "assigned_row_ends");
+    auto assigned_estimated_bytes = deserializer.ReadProperty<vector<idx_t>>(112, "assigned_estimated_bytes");
+    auto aggregate_scan = deserializer.ReadProperty<bool>(113, "aggregate_scan");
+    auto eligible_file_indexes = deserializer.ReadProperty<vector<idx_t>>(114, "eligible_file_indexes");
     if (types.size() != names.size() || portable_bind.empty() ||
         !IsCanonicalVortexScanId(scan_split_set_id) || source_urls.size() != paths.size() ||
         source_urls.size() != sizes.size()) {
@@ -1074,27 +1147,46 @@ static unique_ptr<FunctionData> VortexScanDeserialize(Deserializer &deserializer
         }
         previous_eligible = optional_idx(file_index);
     }
-    unordered_set<idx_t> assigned;
-    optional_idx previous_assigned;
-    for (auto file_index : assigned_file_indexes) {
-        if (file_index >= files.size() || !assigned.insert(file_index).second ||
-            !eligible.count(file_index) ||
-            (previous_assigned.IsValid() && previous_assigned.GetIndex() >= file_index)) {
-            throw SerializationException("Invalid assigned Vortex file index %llu",
-                                         static_cast<unsigned long long>(file_index));
+    if (assigned_file_indexes.size() != assigned_row_starts.size() ||
+        assigned_file_indexes.size() != assigned_row_ends.size() ||
+        assigned_file_indexes.size() != assigned_estimated_bytes.size()) {
+        throw SerializationException("Serialized Vortex fragment vectors have different lengths");
+    }
+    vector<VortexBindData::DistributedFragment> assigned_fragments;
+    assigned_fragments.reserve(assigned_file_indexes.size());
+    bool has_previous_fragment = false;
+    idx_t previous_file_index = 0;
+    idx_t previous_row_start = 0;
+    idx_t previous_row_end = 0;
+    for (idx_t fragment_index = 0; fragment_index < assigned_file_indexes.size(); fragment_index++) {
+        const auto file_index = assigned_file_indexes[fragment_index];
+        const auto row_start = assigned_row_starts[fragment_index];
+        const auto row_end = assigned_row_ends[fragment_index];
+        const auto estimated_bytes = assigned_estimated_bytes[fragment_index];
+        const bool same_file = has_previous_fragment && previous_file_index == file_index;
+        if (file_index >= files.size() || !eligible.count(file_index) || row_start > row_end ||
+            estimated_bytes == DConstants::INVALID_INDEX || estimated_bytes > files[file_index].size ||
+            (has_previous_fragment && previous_file_index > file_index) ||
+            (same_file && previous_row_start >= row_start) || (same_file && previous_row_end > row_start)) {
+            throw SerializationException("Invalid assigned Vortex fragment at index %llu",
+                                         static_cast<unsigned long long>(fragment_index));
         }
-        previous_assigned = optional_idx(file_index);
+        assigned_fragments.push_back({file_index, row_start, row_end, estimated_bytes});
+        has_previous_fragment = true;
+        previous_file_index = file_index;
+        previous_row_start = row_start;
+        previous_row_end = row_end;
     }
     if (!explicit_split_mode &&
-        (splits_applied || !eligible_file_indexes.empty() || !assigned_file_indexes.empty())) {
+        (splits_applied || !eligible_file_indexes.empty() || !assigned_fragments.empty())) {
         throw SerializationException("Native Vortex bind contains distributed split state");
     }
-    if (!splits_applied && !assigned_file_indexes.empty()) {
+    if (!splits_applied && !assigned_fragments.empty()) {
         throw SerializationException(
-            "Detached Vortex bind contains assigned files without an applied split batch");
+            "Detached Vortex bind contains assigned fragments without an applied split batch");
     }
-    if (aggregate_scan && splits_applied && !assigned_file_indexes.empty() &&
-        assigned_file_indexes != eligible_file_indexes) {
+    if (aggregate_scan && splits_applied && !assigned_fragments.empty() &&
+        !IsCompleteAggregateVortexAssignment(assigned_fragments, eligible_file_indexes, files)) {
         throw SerializationException(
             "Distributed aggregate Vortex bind contains an incomplete file assignment");
     }
@@ -1107,7 +1199,7 @@ static unique_ptr<FunctionData> VortexScanDeserialize(Deserializer &deserializer
     result->explicit_split_mode = explicit_split_mode;
     result->splits_applied = splits_applied;
     result->eligible_file_indexes = std::move(eligible_file_indexes);
-    result->assigned_file_indexes = std::move(assigned_file_indexes);
+    result->assigned_fragments = std::move(assigned_fragments);
     return result;
 }
 
@@ -1157,58 +1249,42 @@ VortexPlanDistributedScanSplits(const TableFunctionDistributedScanPlanningInput 
     // physical scan. Such a bind is intentionally detached from the original
     // connection, but its owned portable state and immutable file identities
     // are sufficient for deterministic split planning.
-    // target_split_count is a granularity hint. The current stable Vortex
-    // reader API exposes complete files, but not independently reopenable
-    // fragments, so this callback deliberately keeps one split per file.
     auto snapshot = bind_data.CreatePortableSnapshot();
     auto selected_file_indexes = SelectDistributedVortexFiles(input, snapshot.distributed_files.size());
     vector<DistributedScanSplit> result;
     if (selected_file_indexes.empty()) {
         return result;
     }
-    result.reserve(snapshot.aggregate_scan ? 1 : selected_file_indexes.size());
-    idx_t total_bytes = 0;
-    for (auto file_index : selected_file_indexes) {
-        const auto &file = snapshot.distributed_files[file_index];
-        total_bytes = SaturatingVortexSplitEstimate(total_bytes, file.size);
+    const auto fragments =
+        PlanVortexFragments(snapshot.portable_bind,
+                            selected_file_indexes,
+                            snapshot.aggregate_scan ? selected_file_indexes.size()
+                                                    : MaxValue<idx_t>(input.target_split_count, 1));
+    if (fragments.empty()) {
+        throw InvalidInputException("Vortex produced no fragments for a non-empty distributed scan");
     }
-    const auto has_estimated_rows = input.estimated_cardinality != DConstants::INVALID_INDEX;
-    const auto estimated_rows = has_estimated_rows ? input.estimated_cardinality : 0;
     if (snapshot.aggregate_scan) {
+        idx_t total_bytes = 0;
+        for (const auto &fragment : fragments) {
+            total_bytes = SaturatingVortexSplitEstimate(total_bytes, fragment.estimated_bytes);
+        }
         DistributedScanSplit split;
-        split.split_id = CanonicalVortexSplitId(selected_file_indexes);
-        split.payload =
-            EncodeVortexSplit(selected_file_indexes, snapshot.distributed_files, bind_data.scan_split_set_id);
+        split.split_id = CanonicalVortexSplitId(fragments);
+        split.payload = EncodeVortexSplit(fragments, snapshot.distributed_files, bind_data.scan_split_set_id);
         split.estimated_bytes = optional_idx(total_bytes);
         split.estimated_cardinality = optional_idx(1);
         result.push_back(std::move(split));
         return result;
     }
-    idx_t previous_cumulative_rows = 0;
-    uint64_t cumulative_bytes = 0;
-    for (idx_t selected_index = 0; selected_index < selected_file_indexes.size(); selected_index++) {
-        const auto file_index = selected_file_indexes[selected_index];
-        const auto &file = snapshot.distributed_files[file_index];
-        vector<idx_t> split_files {file_index};
+    result.reserve(fragments.size());
+    for (const auto &fragment : fragments) {
+        vector<VortexBindData::DistributedFragment> split_fragments {fragment};
         DistributedScanSplit split;
-        split.split_id = CanonicalVortexSplitId(split_files);
+        split.split_id = CanonicalVortexSplitId(split_fragments);
         split.payload =
-            EncodeVortexSplit(split_files, snapshot.distributed_files, bind_data.scan_split_set_id);
-        split.estimated_bytes = optional_idx(file.size);
-        if (has_estimated_rows) {
-            idx_t cumulative_rows;
-            if (total_bytes > 0) {
-                cumulative_bytes = SaturatingVortexSplitEstimate(cumulative_bytes, file.size);
-                cumulative_rows =
-                    ProportionalVortexSplitEstimate(estimated_rows, cumulative_bytes, total_bytes);
-            } else {
-                cumulative_rows = ProportionalVortexSplitEstimate(estimated_rows,
-                                                                  selected_index + 1,
-                                                                  selected_file_indexes.size());
-            }
-            split.estimated_cardinality = optional_idx(cumulative_rows - previous_cumulative_rows);
-            previous_cumulative_rows = cumulative_rows;
-        }
+            EncodeVortexSplit(split_fragments, snapshot.distributed_files, bind_data.scan_split_set_id);
+        split.estimated_bytes = optional_idx(fragment.estimated_bytes);
+        split.estimated_cardinality = optional_idx(fragment.row_end - fragment.row_start);
         result.push_back(std::move(split));
     }
     return result;
@@ -1247,16 +1323,11 @@ static void VortexApplyDistributedSplits(optional_ptr<FunctionData> worker_bind_
         throw InvalidInputException("Distributed aggregate Vortex scans require one complete file-set split");
     }
     unordered_set<string> split_ids;
-    unordered_set<idx_t> file_indexes;
     unordered_set<idx_t> eligible_file_indexes(bind_data.eligible_file_indexes.begin(),
                                                bind_data.eligible_file_indexes.end());
-    vector<idx_t> assigned;
-    assigned.reserve(bind_data.distributed_files.size());
+    vector<VortexBindData::DistributedFragment> assigned;
     for (const auto &split : splits) {
         split.Validate();
-        if (!IsCanonicalVortexSplitId(split.split_id)) {
-            throw InvalidInputException("Invalid distributed Vortex split id '%s'", split.split_id);
-        }
         if (split.payload.empty()) {
             throw InvalidInputException("Distributed Vortex split '%s' has an empty payload", split.split_id);
         }
@@ -1268,59 +1339,97 @@ static void VortexApplyDistributedSplits(optional_ptr<FunctionData> worker_bind_
             throw InvalidInputException("Distributed Vortex split '%s' belongs to a different scan identity",
                                         split.split_id);
         }
-        if (!bind_data.aggregate_scan && decoded.files.size() != 1) {
+        if (!bind_data.aggregate_scan && decoded.fragments.size() != 1) {
             throw InvalidInputException(
-                "Non-aggregate distributed Vortex splits must reference exactly one file");
+                "Non-aggregate distributed Vortex splits must reference exactly one fragment");
         }
-        vector<idx_t> decoded_file_indexes;
-        decoded_file_indexes.reserve(decoded.files.size());
-        for (const auto &decoded_file : decoded.files) {
-            if (decoded_file.file_index >= bind_data.distributed_files.size()) {
+        vector<VortexBindData::DistributedFragment> decoded_fragments;
+        decoded_fragments.reserve(decoded.fragments.size());
+        for (const auto &decoded_fragment : decoded.fragments) {
+            if (decoded_fragment.file_index >= bind_data.distributed_files.size()) {
                 throw InvalidInputException("Distributed Vortex split '%s' references an unknown file index",
                                             split.split_id);
             }
-            if (!eligible_file_indexes.count(decoded_file.file_index)) {
+            if (!eligible_file_indexes.count(decoded_fragment.file_index)) {
                 throw InvalidInputException(
                     "Distributed Vortex split '%s' references file index %llu outside the planned file set",
                     split.split_id,
-                    static_cast<unsigned long long>(decoded_file.file_index));
+                    static_cast<unsigned long long>(decoded_fragment.file_index));
             }
-            if (!SameDistributedFile(decoded_file.file,
-                                     bind_data.distributed_files[decoded_file.file_index])) {
+            if (!SameDistributedFile(decoded_fragment.file,
+                                     bind_data.distributed_files[decoded_fragment.file_index])) {
                 throw InvalidInputException(
                     "Distributed Vortex split '%s' does not match the bound file identity",
                     split.split_id);
             }
-            if (!file_indexes.insert(decoded_file.file_index).second) {
-                throw InvalidInputException(
-                    "Distributed Vortex splits reference file index %llu more than once",
-                    static_cast<unsigned long long>(decoded_file.file_index));
-            }
-            decoded_file_indexes.push_back(decoded_file.file_index);
-            assigned.push_back(decoded_file.file_index);
+            decoded_fragments.push_back({decoded_fragment.file_index,
+                                         decoded_fragment.row_start,
+                                         decoded_fragment.row_end,
+                                         decoded_fragment.estimated_bytes});
         }
-        if (split.split_id != CanonicalVortexSplitId(decoded_file_indexes)) {
+        if (split.split_id != CanonicalVortexSplitId(decoded_fragments)) {
             throw InvalidInputException(
-                "Distributed Vortex split id '%s' does not match its payload file indexes",
+                "Distributed Vortex split id '%s' does not match its fragment payload",
                 split.split_id);
         }
+        if (!bind_data.aggregate_scan &&
+            (!split.estimated_cardinality.IsValid() || !split.estimated_bytes.IsValid() ||
+             split.estimated_cardinality.GetIndex() !=
+                 decoded_fragments[0].row_end - decoded_fragments[0].row_start ||
+             split.estimated_bytes.GetIndex() != decoded_fragments[0].estimated_bytes)) {
+            throw InvalidInputException(
+                "Distributed Vortex split '%s' estimates do not match its fragment payload",
+                split.split_id);
+        }
+        assigned.insert(assigned.end(), decoded_fragments.begin(), decoded_fragments.end());
     }
-    // A batch is a set of elementary scan splits. Canonicalize its file
-    // assignment so transport or retry code may reorder those splits without
-    // changing scan meaning or defeating idempotent re-application.
-    std::sort(assigned.begin(), assigned.end());
-    if (bind_data.aggregate_scan && !splits.empty() && assigned != bind_data.eligible_file_indexes) {
-        throw InvalidInputException(
-            "Distributed aggregate Vortex split does not contain the complete planned file set");
+    // A batch is a set of elementary scan fragments. Canonicalize its assignment
+    // so transport or retry code may reorder splits without changing scan meaning.
+    std::sort(assigned.begin(), assigned.end(), [](const auto &left, const auto &right) {
+        if (left.file_index != right.file_index) {
+            return left.file_index < right.file_index;
+        }
+        if (left.row_start != right.row_start) {
+            return left.row_start < right.row_start;
+        }
+        return left.row_end < right.row_end;
+    });
+    for (idx_t fragment_index = 1; fragment_index < assigned.size(); fragment_index++) {
+        const auto &previous = assigned[fragment_index - 1];
+        const auto &current = assigned[fragment_index];
+        if (previous.file_index == current.file_index &&
+            (previous.row_start >= current.row_start || previous.row_end > current.row_start)) {
+            throw InvalidInputException(
+                "Distributed Vortex fragment assignment overlaps within file index %llu",
+                static_cast<unsigned long long>(current.file_index));
+        }
+    }
+    if (bind_data.aggregate_scan && !splits.empty()) {
+        if (!IsCompleteAggregateVortexAssignment(assigned,
+                                                 bind_data.eligible_file_indexes,
+                                                 bind_data.distributed_files)) {
+            throw InvalidInputException(
+                "Distributed aggregate Vortex split does not contain the complete planned file set");
+        }
+        idx_t expected_bytes = 0;
+        for (const auto &fragment : assigned) {
+            expected_bytes = SaturatingVortexSplitEstimate(expected_bytes, fragment.estimated_bytes);
+        }
+        if (!splits[0].estimated_cardinality.IsValid() || !splits[0].estimated_bytes.IsValid() ||
+            splits[0].estimated_cardinality.GetIndex() != 1 ||
+            splits[0].estimated_bytes.GetIndex() != expected_bytes) {
+            throw InvalidInputException(
+                "Distributed aggregate Vortex split estimates do not match its fragment payload");
+        }
     }
     if (bind_data.splits_applied) {
-        if (assigned != bind_data.assigned_file_indexes) {
+        if (assigned != bind_data.assigned_fragments) {
             throw InvalidInputException(
                 "Distributed Vortex bind already has a different explicit split assignment");
         }
         return;
     }
-    bind_data.assigned_file_indexes = std::move(assigned);
+    bind_data.assigned_fragments = std::move(assigned);
     bind_data.splits_applied = true;
 }
 
