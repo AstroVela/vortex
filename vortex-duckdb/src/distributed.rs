@@ -11,6 +11,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
+use futures::StreamExt;
+use futures::TryStreamExt;
 use prost::Message;
 use vortex::dtype::DType;
 use vortex::dtype::proto::dtype as pb_dtype;
@@ -24,6 +26,7 @@ use vortex::io::runtime::BlockingRuntime as _;
 use vortex::proto::expr as pb_expr;
 use vortex::scan::DataSource;
 use vortex_utils::aliases::hash_set::HashSet;
+use vortex_utils::parallelism::get_available_parallelism;
 
 use crate::RUNTIME;
 use crate::SESSION;
@@ -311,7 +314,7 @@ pub fn plan_fragments(
 ) -> VortexResult<DistributedFragmentPlan> {
     let decoded = decode_bind(bytes)?;
     let mut previous_file_index = None;
-    let mut files = Vec::with_capacity(selected_file_indexes.len());
+    let mut selected_files = Vec::with_capacity(selected_file_indexes.len());
     for &file_index in selected_file_indexes {
         let file_index = usize::try_from(file_index)?;
         if previous_file_index.is_some_and(|previous| previous >= file_index) {
@@ -321,17 +324,30 @@ pub fn plan_fragments(
         let file = decoded.files.get(file_index).ok_or_else(|| {
             vortex_err!("Unknown distributed Vortex fragment file index: {file_index}")
         })?;
-        let vortex_file = RUNTIME.block_on(open_bound_file(file))?;
-        let row_count = vortex_file.row_count();
-        let ranges = vortex_file.splits()?;
-        validate_natural_ranges(&file.path, row_count, &ranges)?;
-        files.push(NaturalFileFragments {
-            file_index,
-            file_size: file.size,
-            row_count,
-            ranges,
-        });
+        selected_files.push((file_index, file.clone()));
     }
+    let concurrency = get_available_parallelism()
+        .unwrap_or(1)
+        .min(selected_files.len().max(1));
+    let files = RUNTIME.block_on(async move {
+        futures::stream::iter(selected_files)
+            .map(|(file_index, file)| async move {
+                let vortex_file = open_bound_file(&file).await?;
+                let row_count = vortex_file.row_count();
+                let ranges = vortex_file.splits()?;
+                validate_natural_ranges(&file.path, row_count, &ranges)?;
+                Ok::<_, vortex::error::VortexError>(NaturalFileFragments {
+                    file_index,
+                    file_size: file.size,
+                    row_count,
+                    ranges,
+                })
+            })
+            // `buffered` opens files concurrently while preserving canonical input order.
+            .buffered(concurrency)
+            .try_collect::<Vec<_>>()
+            .await
+    })?;
 
     let fragment_counts = allocate_fragment_counts(&files, target_count.max(1));
     let mut fragments = Vec::with_capacity(fragment_counts.iter().sum());
