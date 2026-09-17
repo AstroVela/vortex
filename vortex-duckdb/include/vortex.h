@@ -15,6 +15,15 @@
 
 #if defined(VORTEX_VANE_DISTRIBUTED)
 typedef struct {
+  uint64_t file_index;
+  uint64_t row_start;
+  uint64_t row_end;
+  uint64_t estimated_bytes;
+} VortexDistributedFragmentView;
+#endif
+
+#if defined(VORTEX_VANE_DISTRIBUTED)
+typedef struct {
   const uint8_t *name;
   size_t name_len;
   duckdb_logical_type logical_type;
@@ -120,6 +129,27 @@ const uint8_t *duckdb_table_function_distributed_bind_bytes(const void *portable
 #endif
 
 #if defined(VORTEX_VANE_DISTRIBUTED)
+extern
+duckdb_vx_data duckdb_table_function_distributed_plan_fragments(const uint8_t *portable_bind,
+                                                                size_t portable_bind_size,
+                                                                const uint64_t *selected_file_indexes,
+                                                                size_t selected_file_count,
+                                                                size_t target_fragment_count,
+                                                                duckdb_vx_error *error_out);
+#endif
+
+#if defined(VORTEX_VANE_DISTRIBUTED)
+extern size_t duckdb_table_function_distributed_fragment_count(const void *fragment_plan);
+#endif
+
+#if defined(VORTEX_VANE_DISTRIBUTED)
+extern
+bool duckdb_table_function_distributed_fragment_at(const void *fragment_plan,
+                                                   size_t index,
+                                                   VortexDistributedFragmentView *fragment_out);
+#endif
+
+#if defined(VORTEX_VANE_DISTRIBUTED)
 extern size_t duckdb_table_function_distributed_file_count(const void *portable_bind);
 #endif
 
@@ -158,8 +188,8 @@ bool duckdb_table_function_distributed_file_is_selected(duckdb_vx_table_filter_s
 extern
 duckdb_vx_data duckdb_table_function_init_global_distributed(const uint8_t *portable_bind,
                                                              size_t portable_bind_size,
-                                                             const uint64_t *assigned_file_indexes,
-                                                             size_t assigned_file_count,
+                                                             const VortexDistributedFragmentView *assigned_fragments,
+                                                             size_t assigned_fragment_count,
                                                              bool ignore_optional_filters,
                                                              const duckdb_vx_tfunc_init_input *init_input,
                                                              duckdb_vx_error *error_out);
