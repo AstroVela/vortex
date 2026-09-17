@@ -1328,7 +1328,7 @@ static TableFunctionDistributedScanCallbacks VortexDistributedScanCallbacks() {
     TableFunctionDistributedScanCallbacks callbacks;
     callbacks.protocol_version = 1;
     callbacks.split_codec = {VORTEX_SPLIT_CODEC, 1};
-    callbacks.bind_data_mode = TableFunctionDistributedBindDataMode::REQUIRED;
+    callbacks.bind_data_mode = TableFunctionDistributedBindDataMode::BIND_DATA_REQUIRED;
     callbacks.plan_splits = VortexPlanDistributedScanSplits;
     callbacks.create_worker_bind = VortexCreateDistributedWorkerBind;
     callbacks.apply_splits = VortexApplyDistributedSplits;
