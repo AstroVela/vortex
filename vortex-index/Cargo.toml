@@ -1,0 +1,32 @@
+[package]
+name = "vortex-index"
+description = "Experimental engine-independent secondary index contracts for Vortex"
+authors.workspace = true
+categories.workspace = true
+edition.workspace = true
+homepage.workspace = true
+include.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]
+async-trait = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+vortex-array = { workspace = true }
+vortex-buffer = { workspace = true }
+vortex-error = { workspace = true }
+vortex-scan = { workspace = true }
+
+[dev-dependencies]
+futures = { workspace = true, features = ["executor"] }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

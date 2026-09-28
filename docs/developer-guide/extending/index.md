@@ -17,6 +17,7 @@ The following topics are planned for this section:
   on-disk data organizations.
 - **Writing a Compute Function** -- the dispatch model, implementing kernels, vtable
   registration, and testing.
+- **Secondary Indexes** -- experimental engine-independent index contracts and snapshot semantics.
 
 ```{toctree}
 ---
@@ -27,4 +28,5 @@ extension-dtypes
 writing-an-encoding
 writing-a-layout
 writing-a-compute-fn
+secondary-indexes
 ```

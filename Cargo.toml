@@ -24,6 +24,7 @@ members = [
     "vortex-layout",
     "vortex-scan",
     "vortex-file",
+    "vortex-index",
     "vortex-ipc",
     "vortex",
     "vortex-bench",
@@ -334,6 +335,7 @@ vortex-zstd = { version = "0.1.0", path = "./encodings/zstd", default-features =
 # END crates published by this project
 
 # No version constraints for unpublished crates.
+vortex-index = { path = "./vortex-index", default-features = false }
 vortex-bench = { path = "./vortex-bench", default-features = false }
 vortex-cuda = { path = "./vortex-cuda", default-features = false }
 vortex-cuda-macros = { path = "./vortex-cuda/macros" }
