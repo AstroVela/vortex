@@ -10244,6 +10244,7 @@ dependencies = [
  "base16ct",
  "bytes",
  "futures",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

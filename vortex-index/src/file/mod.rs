@@ -36,6 +36,8 @@ use base16ct::HexDisplay;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::stream::BoxStream;
+#[cfg(unix)]
+use rustix::fs as unix_fs;
 use sha2::Digest;
 use sha2::Sha256;
 use vortex_array::IntoArray;
@@ -102,6 +104,7 @@ impl LocalFileSource {
     /// [`schema_fingerprint`]. Empty inventories still require an explicit dtype.
     /// The session must have file encodings/layouts and a live runtime configured.
     /// Blocking file reads run on that runtime's blocking executor.
+    /// Files may omit their embedded dtype; when present it must match `dtype`.
     pub async fn open(
         snapshot: Snapshot,
         dtype: DType,
@@ -141,7 +144,20 @@ impl LocalFileSource {
                 let mut remaining = max_pinned_bytes;
                 let mut files = BTreeMap::new();
                 for entry in &snapshot.files {
-                    let file = File::open(&entry.uri).map_err(|err| {
+                    // Inspect the opened descriptor, but do not wait for a FIFO writer.
+                    #[cfg(unix)]
+                    let opened_file = unix_fs::open(
+                        entry.uri.as_str(),
+                        unix_fs::OFlags::RDONLY
+                            | unix_fs::OFlags::NONBLOCK
+                            | unix_fs::OFlags::NOCTTY
+                            | unix_fs::OFlags::CLOEXEC,
+                        unix_fs::Mode::empty(),
+                    )
+                    .map(File::from);
+                    #[cfg(not(unix))]
+                    let opened_file = File::open(&entry.uri);
+                    let file = opened_file.map_err(|err| {
                         vortex_err!("Cannot open source file {}: {}", entry.id, err)
                     })?;
                     let metadata = file.metadata()?;
@@ -164,6 +180,7 @@ impl LocalFileSource {
                     }
                     let opened = session
                         .open_options()
+                        .with_fallback_dtype(dtype.clone())
                         .open_buffer(ByteBuffer::from(bytes))?;
                     if opened.dtype() != &dtype || opened.row_count() != entry.row_count {
                         vortex_bail!("Source file {} schema or row count mismatch", entry.id);

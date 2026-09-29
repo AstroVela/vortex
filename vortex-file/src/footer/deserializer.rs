@@ -40,6 +40,8 @@ pub struct FooterDeserializer {
     session: VortexSession,
     // The DType, if provided externally.
     dtype: Option<DType>,
+    // Used only when neither an explicit override nor an embedded DType exists.
+    fallback_dtype: Option<DType>,
 
     // Internal state that we accumulate
 
@@ -56,6 +58,7 @@ impl FooterDeserializer {
             buffer: initial_read,
             session,
             dtype: None,
+            fallback_dtype: None,
             file_size: None,
             postscript: None,
         }
@@ -63,7 +66,9 @@ impl FooterDeserializer {
 
     /// Provide the file dtype externally.
     ///
-    /// This is required for files written with [`VortexWriteOptions::exclude_dtype`](crate::VortexWriteOptions::exclude_dtype).
+    /// This overrides an embedded dtype. Use [`Self::with_fallback_dtype`] to
+    /// supply a dtype only for files written with
+    /// [`VortexWriteOptions::exclude_dtype`](crate::VortexWriteOptions::exclude_dtype).
     pub fn with_dtype(mut self, dtype: DType) -> Self {
         self.dtype = Some(dtype);
         self
@@ -72,6 +77,15 @@ impl FooterDeserializer {
     /// Provide or clear the externally known file dtype.
     pub fn with_some_dtype(mut self, dtype: Option<DType>) -> Self {
         self.dtype = dtype;
+        self
+    }
+
+    /// Supply a dtype only when no explicit or embedded dtype is present.
+    ///
+    /// This does not mask errors parsing an embedded dtype. An explicit dtype
+    /// supplied with [`Self::with_dtype`] or [`Self::with_some_dtype`] wins.
+    pub fn with_fallback_dtype(mut self, dtype: DType) -> Self {
+        self.fallback_dtype = Some(dtype);
         self
     }
 
@@ -112,18 +126,17 @@ impl FooterDeserializer {
                 .vortex_expect("Just set postscript")
         };
 
-        // If we haven't been provided a DType, we must read one from the file.
-        let dtype_segment = self
-            .dtype
-            .is_none()
-            .then(|| {
-                postscript.dtype.as_ref().ok_or_else(|| {
-                    vortex_err!(
-                        "Vortex file doesn't embed a DType and none provided to VortexOpenOptions"
-                    )
-                })
-            })
-            .transpose()?;
+        let dtype_segment = if self.dtype.is_none() {
+            postscript.dtype.as_ref()
+        } else {
+            None
+        };
+        let provided_dtype = self.dtype.as_ref().or(self.fallback_dtype.as_ref());
+        if dtype_segment.is_none() && provided_dtype.is_none() {
+            vortex_bail!(
+                "Vortex file doesn't embed a DType and none provided to VortexOpenOptions"
+            );
+        }
 
         // The other postscript segments are required, so now we figure out our the offset that
         // contains all the required segments.
@@ -166,7 +179,7 @@ impl FooterDeserializer {
         let dtype = dtype_segment
             .map(|segment| self.parse_dtype(initial_offset, &self.buffer, segment))
             .transpose()?
-            .unwrap_or_else(|| self.dtype.clone().vortex_expect("DType was provided"));
+            .unwrap_or_else(|| provided_dtype.cloned().vortex_expect("DType was provided"));
         let file_stats = postscript
             .statistics
             .as_ref()
@@ -410,6 +423,31 @@ mod tests {
         buffer.extend_from_slice(&u16::try_from(postscript_bytes.len())?.to_le_bytes());
         buffer.extend_from_slice(&MAGIC_BYTES);
         Ok(buffer.freeze())
+    }
+
+    #[test]
+    fn fallback_dtype_does_not_mask_invalid_embedded_dtype() -> VortexResult<()> {
+        let postscript = Postscript {
+            dtype: Some(segment(0, u32::MAX)),
+            layout: segment(0, 1),
+            statistics: None,
+            footer: segment(0, 1),
+            metadata: Vec::new(),
+        };
+        let buffer = eof_buffer(&postscript)?;
+        let file_size = buffer.len() as u64;
+        let mut deserializer = FooterDeserializer::new(buffer, array_session())
+            .with_fallback_dtype(DType::Primitive(PType::I32, Nullability::NonNullable))
+            .with_size(file_size);
+        let Err(err) = deserializer.deserialize() else {
+            vortex_bail!("Invalid embedded dtype segment must fail even with a fallback");
+        };
+        assert!(
+            err.to_string()
+                .contains(&format!("Segment length {}", u32::MAX)),
+            "{err}"
+        );
+        Ok(())
     }
 
     #[rstest]

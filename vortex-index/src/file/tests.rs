@@ -6,9 +6,17 @@ use std::fs;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::mpsc;
+#[cfg(unix)]
+use std::thread;
+#[cfg(unix)]
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::TryStreamExt;
+#[cfg(unix)]
+use rustix::fs as unix_fs;
 use tempfile::TempDir;
 use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
@@ -24,6 +32,7 @@ use vortex_array::assert_arrays_eq;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
+use vortex_array::dtype::StructFields;
 use vortex_array::session::ArraySessionExt;
 use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
@@ -219,6 +228,117 @@ fn test_file_and_schema_identities() -> VortexResult<()> {
         schema_fingerprint(data(&[1, 2])?.dtype())?
     );
     Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn test_fifo_open_rejects_without_waiting_for_writer() -> VortexResult<()> {
+    block_on(|handle| async move {
+        let mut fixture = Fixture::new(handle).await?;
+        fixture.snapshot.files.truncate(1);
+        let path = fixture.snapshot.files[0].uri.clone();
+        fs::remove_file(&path)?;
+        unix_fs::mkfifoat(
+            unix_fs::CWD,
+            path.as_str(),
+            unix_fs::Mode::RUSR | unix_fs::Mode::WUSR,
+        )
+        .map_err(std::io::Error::from)?;
+
+        let (finished, receiver) = mpsc::channel();
+        // Release a blocking opener on regression, keeping the test suite live.
+        // A correct implementation returns before any writer is opened.
+        let guard = thread::spawn(move || -> VortexResult<bool> {
+            if receiver.recv_timeout(Duration::from_secs(2)).is_ok() {
+                return Ok(false);
+            }
+            let writer = unix_fs::open(
+                path.as_str(),
+                unix_fs::OFlags::RDWR | unix_fs::OFlags::NONBLOCK | unix_fs::OFlags::CLOEXEC,
+                unix_fs::Mode::empty(),
+            )
+            .map_err(std::io::Error::from)?;
+            let _ = receiver.recv_timeout(Duration::from_secs(5));
+            drop(writer);
+            Ok(true)
+        });
+        let result = fixture.open().await;
+        let _ = finished.send(());
+        let needed_writer = guard
+            .join()
+            .map_err(|_| vortex_err!("FIFO guard panicked"))??;
+        assert_error(result, "not a regular file")?;
+        assert!(
+            !needed_writer,
+            "Opening a FIFO waited for a writer before rejecting it"
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn test_external_dtype_file_scan_and_take() -> VortexResult<()> {
+    block_on(|handle| async move {
+        let mut fixture = Fixture::new(handle).await?;
+        let mut bytes = Vec::new();
+        fixture
+            .session
+            .write_options()
+            .with_strategy(Arc::new(FlatLayoutStrategy::default()))
+            .exclude_dtype()
+            .write(
+                &mut bytes,
+                data(&[30, 31, 32])?.into_array().to_array_stream(),
+            )
+            .await?;
+        let file = &mut fixture.snapshot.files[1];
+        fs::write(&file.uri, &bytes)?;
+        file.version = file_version(&bytes);
+
+        let source = fixture.open().await?;
+        let batches: Vec<_> = source
+            .scan(&[10, 30], &fields(&["embedding", "note", "id"]))?
+            .try_collect()
+            .await?;
+        let projection = ["embedding".into(), "note".into(), "id".into()];
+        let expected = data(&[10, 11, 12, 13, 14, 30, 31, 32])?.project(&projection)?;
+        let actual = ChunkedArray::try_new(
+            batches.into_iter().map(|batch| batch.data),
+            expected.dtype().clone(),
+        )?;
+        let mut ctx = fixture.session.create_execution_ctx();
+        assert_arrays_eq!(actual, expected, &mut ctx);
+        let rows = [row(30, 2), row(10, 0), row(30, 0), row(30, 2)];
+        let batch = source
+            .take(&rows, &fields(&["embedding", "note", "id"]))
+            .await?;
+        assert_eq!(batch.rows, rows);
+        assert_arrays_eq!(
+            batch.data,
+            data(&[32, 10, 30, 32])?.project(&projection)?,
+            &mut ctx
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn test_external_dtype_does_not_override_embedded_schema() -> VortexResult<()> {
+    block_on(|handle| async move {
+        let mut fixture = Fixture::new(handle).await?;
+        let dtypes = fixture
+            .dtype
+            .as_struct_fields_opt()
+            .ok_or_else(|| vortex_err!("Test schema must be a struct"))?
+            .fields()
+            .collect();
+        fixture.dtype = DType::Struct(
+            StructFields::new(["renamed_id", "embedding", "note"].into(), dtypes),
+            Nullability::NonNullable,
+        );
+        fixture.snapshot.schema_fingerprint = schema_fingerprint(&fixture.dtype)?;
+        assert_error(fixture.open().await, "schema or row count mismatch")
+    })
 }
 
 #[test]
