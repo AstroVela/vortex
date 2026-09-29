@@ -388,6 +388,12 @@ impl IndexProvider for ReferenceProvider {
 
 struct NoStorage;
 
+#[test]
+fn test_local_files_capability_is_optional() {
+    let store: &dyn IndexStore = &NoStorage;
+    assert!(store.as_local_files().is_none());
+}
+
 #[async_trait]
 impl IndexStore for NoStorage {
     async fn read(&self, _: &IndexArtifact) -> VortexResult<Bytes> {

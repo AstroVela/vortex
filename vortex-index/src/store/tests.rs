@@ -4,6 +4,7 @@
 use std::cell::Cell;
 use std::fs;
 use std::os::unix::fs::symlink;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::Barrier;
 use std::sync::mpsc;
@@ -35,6 +36,7 @@ const LIMITS: LocalStoreLimits = LocalStoreLimits {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Fault {
+    ChunkCopied,
     FileWritten,
     FileSynced,
     ManifestInstalled,
@@ -395,43 +397,45 @@ fn test_leaf_symlink_never_overwrites_or_reads_target() -> VortexResult<()> {
 
 #[test]
 fn test_fifo_read_is_nonblocking() -> VortexResult<()> {
-    block_on(async {
-        let dir = tempfile::tempdir()?;
-        let root = dir.path().canonicalize()?;
-        let store = LocalIndexStore::create(&root, "gen-1", LIMITS)?;
-        let artifact = store.write("fifo", Bytes::new()).await?;
-        let path = root.join("gen-1/artifacts/fifo");
-        fs::remove_file(&path)?;
-        unix_fs::mkfifoat(
-            unix_fs::CWD,
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    let store = LocalIndexStore::create(&root, "gen-1", LIMITS)?;
+    let artifact = block_on(store.write("fifo", Bytes::new()))?;
+    let path = root.join("gen-1/artifacts/fifo");
+    fs::remove_file(&path)?;
+    assert_rejects_fifo(&path, || block_on(store.read(&artifact)))
+}
+
+fn assert_rejects_fifo<T>(path: &Path, read: impl FnOnce() -> VortexResult<T>) -> VortexResult<()> {
+    unix_fs::mkfifoat(
+        unix_fs::CWD,
+        path,
+        unix_fs::Mode::RUSR | unix_fs::Mode::WUSR,
+    )
+    .map_err(|err| vortex_err!("{}", err))?;
+    let path = path.to_owned();
+    let (done, wait) = mpsc::channel();
+    let watchdog = thread::spawn(move || -> VortexResult<bool> {
+        if wait.recv_timeout(Duration::from_secs(2)).is_ok() {
+            return Ok(false);
+        }
+        let writer = unix_fs::open(
             &path,
-            unix_fs::Mode::RUSR | unix_fs::Mode::WUSR,
+            unix_fs::OFlags::RDWR | unix_fs::OFlags::NONBLOCK,
+            unix_fs::Mode::empty(),
         )
         .map_err(|err| vortex_err!("{}", err))?;
-        let (done, wait) = mpsc::channel();
-        let watchdog = thread::spawn(move || -> VortexResult<bool> {
-            if wait.recv_timeout(Duration::from_secs(2)).is_ok() {
-                return Ok(false);
-            }
-            let writer = unix_fs::open(
-                &path,
-                unix_fs::OFlags::RDWR | unix_fs::OFlags::NONBLOCK,
-                unix_fs::Mode::empty(),
-            )
-            .map_err(|err| vortex_err!("{}", err))?;
-            let _received = wait.recv_timeout(Duration::from_secs(2));
-            drop(writer);
-            Ok(true)
-        });
-        let result = store.read(&artifact).await;
-        let _sent = done.send(());
-        let released = watchdog
-            .join()
-            .map_err(|_| vortex_err!("Watchdog panicked"))??;
-        assert!(!released, "FIFO needed a writer to unblock its reader");
-        assert_error(result, "not a regular file")?;
-        Ok(())
-    })
+        let _received = wait.recv_timeout(Duration::from_secs(2));
+        drop(writer);
+        Ok(true)
+    });
+    let result = read();
+    let _sent = done.send(());
+    let released = watchdog
+        .join()
+        .map_err(|_| vortex_err!("Watchdog panicked"))??;
+    assert!(!released, "FIFO needed a writer to unblock its reader");
+    assert_error(result, "not a regular file")
 }
 
 #[test]
@@ -464,6 +468,8 @@ fn test_failed_write_and_interrupted_seal_are_not_reopenable() -> VortexResult<(
         Ok(())
     })
 }
+
+mod local_files;
 
 #[test]
 fn test_manifest_install_does_not_clobber_and_poisoned_writer_cannot_retry() -> VortexResult<()> {

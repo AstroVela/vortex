@@ -16,7 +16,14 @@ publish = false
 
 [features]
 default = []
-local-store = ["dep:base16ct", "dep:parking_lot", "dep:rustix", "dep:serde_json", "dep:sha2"]
+local-store = [
+    "dep:base16ct",
+    "dep:parking_lot",
+    "dep:rustix",
+    "dep:serde_json",
+    "dep:sha2",
+    "dep:tempfile",
+]
 file = [
     "dep:async-stream",
     "dep:base16ct",
@@ -49,6 +56,7 @@ vortex-session = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
 futures = { workspace = true, features = ["executor"] }

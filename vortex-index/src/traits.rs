@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::fmt::Debug;
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -161,6 +162,58 @@ pub trait IndexStore: Send + Sync {
     /// Return only after the bytes are durable under the store's documented contract.
     /// This does not publish an index or commit a source snapshot.
     async fn write(&self, path: &str, data: Bytes) -> VortexResult<IndexArtifact>;
+
+    /// Optional blocking file-path IO for native backends.
+    ///
+    /// Providers requiring paths must reject stores without this capability.
+    fn as_local_files(&self) -> Option<&dyn LocalIndexFiles> {
+        None
+    }
+}
+
+/// Optional file-path access without loading whole artifacts into memory.
+///
+/// These operations are blocking and belong on a blocking worker, including when
+/// called from an async builder or provider. They do not publish a generation.
+pub trait LocalIndexFiles: Send + Sync {
+    /// Stream a closed, regular source file into a new private artifact.
+    ///
+    /// The destination is a portable relative artifact path. The source must be
+    /// absolute, contain no symlinks, and remain unchanged throughout the copy.
+    /// The caller must quiesce native writers first; this does not establish a
+    /// consistent snapshot of a running backend. Copy bytes, never adopt or hard
+    /// link the source. Return a size/checksum identity only after durable IO.
+    fn import_file(&self, path: &str, source: &Path) -> VortexResult<IndexArtifact>;
+
+    /// Copy and verify selected artifacts from a sealed generation into a lease.
+    ///
+    /// Reject unknown identities and duplicate paths. Preserve relative paths
+    /// beneath a fresh directory in `scratch_root`, which must be absolute,
+    /// symlink-free and owner-managed. `max_bytes` bounds the sum of artifact
+    /// lengths, not filesystem allocation or RSS; per-artifact limits also apply.
+    /// Copies must not share writable inodes with the generation or other leases.
+    /// A failed call must not expose a partially verified lease.
+    fn materialize(
+        &self,
+        artifacts: &[IndexArtifact],
+        scratch_root: &Path,
+        max_bytes: u64,
+    ) -> VortexResult<Box<dyn LocalArtifactLease>>;
+}
+
+/// Owns private, verified local copies for a native reader's lifetime.
+///
+/// The provider must retain this lease until all native handles, background
+/// tasks and mappings have been closed, and must not mutate its files. Paths
+/// embedded in backend configuration still require backend-specific validation;
+/// a lease is not a sandbox for native code or same-user filesystem mutation.
+/// Dropping the lease attempts cleanup, not durable reclamation. Process crashes
+/// can leave scratch files; their cleanup belongs to the scratch-root owner.
+pub trait LocalArtifactLease: Debug + Send + Sync {
+    /// Absolute directory containing exactly the requested relative file paths.
+    ///
+    /// The directory is process-local scratch space, not a persistent identity.
+    fn path(&self) -> &Path;
 }
 
 /// A backend-owned build request for a new, unpublished generation.
