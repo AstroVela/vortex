@@ -1,0 +1,53 @@
+name: Vortex Index
+
+on:
+  push:
+    branches:
+      - develop
+      - feat/vortex-index
+  # Shared Vortex crates can affect index behavior, so do not filter by path.
+  pull_request: { }
+  workflow_dispatch: { }
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_BUILD_JOBS: 4
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  index:
+    name: Index (all features)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      # Uses the stable version pinned in rust-toolchain.toml, including Clippy.
+      - uses: ./.github/actions/setup-rust
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          key: vortex-index-all-features
+          cache-on-failure: true
+
+      - name: Install native build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libclang-dev pkg-config
+          echo "BINDGEN_EXTRA_CLANG_ARGS=-isystem $(gcc -print-file-name=include)" >> "$GITHUB_ENV"
+
+      # Defaults are empty: all-features enables file, local-store and their
+      # cross-process persistence tests. cargo test also runs Rust doctests.
+      - name: Run index tests (all features)
+        run: cargo test --locked -p vortex-index --all-features
+
+      - name: Run index Clippy (all targets, all features)
+        run: cargo clippy --locked -p vortex-index --all-targets --all-features -- -D warnings
