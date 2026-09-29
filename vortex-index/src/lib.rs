@@ -43,6 +43,8 @@ pub use traits::IndexBuilder;
 pub use traits::IndexProvider;
 pub use traits::IndexSource;
 pub use traits::IndexStore;
+pub use traits::LocalArtifactLease;
+pub use traits::LocalIndexFiles;
 pub use traits::ScalarIndex;
 pub use traits::SourceBatch;
 pub use traits::VectorIndex;

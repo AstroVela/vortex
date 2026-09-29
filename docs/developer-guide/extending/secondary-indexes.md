@@ -77,11 +77,12 @@ provider/store verifies bytes and rejects corruption or missing artifacts.
 Metadata validation alone is not checksum verification. Native SPFresh files
 may retain their own format; mapping and auxiliary columns may use Vortex files.
 
-`IndexStore` initially specifies whole-object IO to keep the prototype small.
-Production backends need a range-read or pinned-local-artifact capability to
-avoid downloading/materializing an entire native index. An object-store catalog
-does not imply that SPFresh can query objects remotely. Unsupported storage
-capabilities must be rejected explicitly.
+`IndexStore` provides whole-object IO and optional `as_local_files()` access for
+path-based backends. `LocalIndexFiles` imports files with bounded streaming IO
+and materializes verified, isolated local copies held by a `LocalArtifactLease`.
+Stores without this capability return `None`; providers requiring paths must
+reject them explicitly. Range reads and shared local caching remain future work.
+An object-store catalog does not imply that SPFresh can query objects remotely.
 
 ## Read interfaces
 
@@ -202,7 +203,7 @@ must never expose a partially built index. Drop first removes the catalog
 reference; physical deletion follows safe reclamation.
 
 Mutable SPFresh operations do not imply table-level ACID. A future writer API
-must define sequence numbers, replay/idempotency, checkpoint durability and
+must define sequence numbers, replay/idempotency, durable native state and
 generation publication before exposing updates through SQL. Published reader
 generations remain immutable; mutation occurs in private state. The prototype
 deliberately does not publish an `insert/delete/flush` trait with unspecified
@@ -212,13 +213,13 @@ recovery semantics.
 
 The independent `vortex-index/local-store` feature provides Unix
 `store::LocalIndexStore`. It implements immutable local artifacts, not catalog
-publication or native backend file access.
+publication. Its optional file-path capability is described below.
 
 1. `create` exclusively allocates a new generation under an existing durable,
    absolute, symlink-free root. There is no reopen-for-write or name reuse.
-2. `write` accepts portable relative artifact paths. It creates files without
-   clobbering, syncs file bytes and directory entries, and records size/SHA-256
-   identities. All traversal uses directory descriptors and no-follow opens;
+2. `write` and `import_file` accept portable relative artifact paths. They create
+   files without clobbering, sync file bytes and directory entries, and record
+   size/SHA-256 identities. Artifact traversal uses directory descriptors and no-follow opens;
    special-file reads are nonblocking and rejected after descriptor validation.
 3. `seal` requires the exact successful artifact inventory and rechecks its
    contents. It syncs a pending manifest, atomically hard-links it into its final
@@ -237,8 +238,9 @@ IO is blocking, including async trait methods, and belongs on a blocking worker.
 Explicit limits apply to each artifact and manifest, not total memory. The root
 and its children must be owner-managed: this is not protection against a
 same-user process moving directories or rewriting files. Returned bytes are
-pinned; a mutable file descriptor alone is not. Local filesystem sync and
-atomic hard-link semantics are required. Network storage and power-loss recovery
+pinned, and leased copies are isolated from generation changes; a mutable file
+descriptor alone is not. Local filesystem sync and atomic hard-link semantics
+are required. Network storage and power-loss recovery
 are not qualified, and cleanup requires a later reader-safe reclamation policy.
 
 A test-only persistent Flat provider covers independent builder and reader
@@ -247,6 +249,57 @@ Storage tests cover corruption, missing objects, limits, path escape/symlinks,
 FIFOs, concurrent creation/writes, interrupted manifests, injected write/sync
 boundary failures and a builder killed before seal. This does not turn the
 in-memory `FlatIndex` into a supported persistent or production backend.
+
+### Native file adaptation
+
+`LocalIndexStore` implements `LocalIndexFiles` under the same `local-store`
+feature. No C++ dependency or backend-specific configuration enters the common
+interfaces. This adapts the existing generation/artifact lifecycle; it does not
+introduce a separate checkpoint abstraction.
+
+Before importing, the backend must stop writers and finalize its complete file
+set. `import_file(relative_path, absolute_source)` rejects symlinks in every
+source path component and non-regular files, including FIFOs without a writer.
+It copies bytes through a 64 KiB buffer, hashes them, enforces the per-artifact
+limit, and uses the same durable, exclusive write protocol as `write`. It never
+adopts a source file or hard-links one into the generation. The caller must keep
+the source unchanged during copying: this is not a snapshot of a live native
+writer, and same-length concurrent rewrites are not reliably detected. Imports
+and sealing serialize on the same writer state; a partial-copy or sync failure
+invalidates that writer. Preflight validation failures leave it usable.
+
+After sealing, `materialize(artifacts, scratch_root, max_bytes)` creates a fresh
+owner-only scratch directory. It checks inventory membership, rejects repeated
+paths, and limits the sum of requested artifact sizes before copying. Each file
+is streamed and reverified against its declared length and SHA-256, retains its
+relative path, and becomes read-only before the lease is returned. No partially
+verified lease is returned on failure. The implementation uses ordinary copies,
+not hard links: mutations or deletion of the original generation do not affect
+an existing lease, and a native library modifying one lease cannot modify the
+generation or another lease through shared inodes.
+
+The provider must retain `Box<dyn LocalArtifactLease>` until all native handles,
+background readers and mappings are closed, including libraries that reopen
+files lazily. A copied path string does not retain that lifetime. The lease does
+not depend on the store handle remaining alive. Native readers must not mutate
+their leased files. Paths inside configuration files are opaque to the store;
+the backend must validate/resolve them and ensure that every required file is
+included. Read-only file permissions are not a sandbox for native code.
+
+Scratch roots must be absolute, symlink-free, exclusively owner-managed and
+stable for the entire lease lifetime, including temporary-directory creation
+and cleanup. Dropping the lease attempts to remove its directory. Scratch copies
+are not durable, and a process crash can leave orphan directories; the owner
+must reclaim them without removing active leases. Every lease costs a full disk
+copy of the requested files. The total byte limit is per call and excludes
+filesystem overhead, other leases, page cache and native-library allocations.
+There is no shared cache, disk reservation, global quota or cloud staging yet.
+
+Tests cover bounded/short/interrupted streaming reads, import/seal races, partial
+copy and sync failures, invalid paths, symlinks and FIFOs, corruption, byte limits,
+independent concurrent leases, mutation isolation, lifetime cleanup, and import /
+seal / reopen / file-path access in separate processes. These exercise the file
+adapter, not SPFresh format compatibility or native search correctness.
 
 ## Delivery plan
 
@@ -258,11 +311,12 @@ in-memory `FlatIndex` into a supported persistent or production backend.
    implemented, including file scan / Flat search / ranked row retrieval tests.
    The local generation store now supports durable immutable artifacts and
    trusted manifest reopening, exercised across processes by a test-only
-   reference backend. Next add constrained native artifact access, port the
-   separately tested native bridge into an optional backend, persist native-ID
-   mappings, then qualify SPFresh build/open/search/take across multiple files.
-   First qualify local storage and immutable checkpoints. Fix native PIC and
-   dependency isolation before qualifying shared-extension packaging.
+   reference backend. Streaming imports and leased local native artifact copies
+   are implemented. Next port the separately tested native bridge into an
+   optional backend, persist native-ID mappings, then qualify SPFresh
+   build/open/search/take across multiple files. First qualify local storage and
+   immutable artifact generations. Fix native PIC and dependency isolation before
+   qualifying shared-extension packaging.
 3. **Engine integration:** add common SQL entrypoints through `vortex-duckdb`,
    leave current SPFresh SQL names as compatibility adapters, and update the
    external extension's pinned Vortex revision. Do not duplicate index logic in

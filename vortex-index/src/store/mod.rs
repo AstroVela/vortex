@@ -13,7 +13,7 @@
 //! sandbox against processes that can rename directories or modify their bytes.
 //! Descriptor-relative, no-follow opens reject symlinks, and nonblocking opens
 //! reject special files without waiting on a FIFO. Reads verify content anew;
-//! only the returned bytes, not the on-disk files, are pinned against mutation.
+//! returned bytes and leased copies are isolated from later generation mutation.
 //!
 //! Successful writes sync files and containing directories. Sealing syncs a
 //! temporary manifest, installs it with an atomic, no-clobber hard link, then
@@ -23,12 +23,13 @@
 //! a failed write poisons its writer. Neither can publish an index to readers.
 //!
 //! IO is blocking, including the async [`IndexStore`] methods. Callers should use
-//! a blocking worker. Whole-object reads have explicit byte limits; this is not
-//! a range-IO or native-backend file-handle API.
+//! a blocking worker. [`LocalIndexFiles`] adds streaming file imports and leased
+//! scratch copies for native readers, not range IO or a shared local cache.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs::File;
+use std::io::ErrorKind;
 use std::io::Read;
 use std::io::Write;
 use std::mem;
@@ -52,14 +53,16 @@ use vortex_error::vortex_err;
 use crate::IndexArtifact;
 use crate::IndexMetadata;
 use crate::IndexStore;
+use crate::LocalIndexFiles;
 use crate::Snapshot;
 use crate::metadata::validate_artifact_path;
 
 const ARTIFACTS: &str = "artifacts";
 const MANIFEST: &str = "manifest.json";
 const PENDING: &str = "manifest.pending";
+const COPY_BUFFER_BYTES: usize = 64 * 1024;
 
-/// Explicit limits for whole-object IO, not a process RSS budget.
+/// Explicit per-object limits for IO, not a process RSS or total disk budget.
 #[derive(Debug, Clone, Copy)]
 pub struct LocalStoreLimits {
     /// Maximum size of each backend artifact, including writes and verification.
@@ -150,7 +153,7 @@ impl LocalIndexStore {
         }
         let artifacts = open_directory(&directory, OsStr::new(ARTIFACTS))?;
         for artifact in &metadata.artifacts {
-            verify(&artifacts, artifact, limits.max_artifact_bytes, |_| {})?;
+            verify(&artifacts, artifact, limits.max_artifact_bytes, |_| Ok(()))?;
         }
         let inventory = inventory(&metadata);
         Ok((
@@ -192,10 +195,13 @@ impl LocalIndexStore {
                 &self.artifacts,
                 artifact,
                 self.limits.max_artifact_bytes,
-                |_| {},
+                |_| Ok(()),
             )?;
         }
-        write_new(&self.directory, PENDING, &bytes)?;
+        write_new(&self.directory, PENDING, |file| {
+            file.write_all(&bytes)?;
+            Ok(())
+        })?;
         unix_fs::linkat(
             &self.directory,
             PENDING,
@@ -214,6 +220,31 @@ impl LocalIndexStore {
             generation: self.generation.clone(),
             manifest: artifact(MANIFEST, &bytes)?,
         })
+    }
+
+    fn write_artifact(
+        &self,
+        path: &str,
+        write: impl FnOnce(&mut File) -> VortexResult<IndexArtifact>,
+    ) -> VortexResult<IndexArtifact> {
+        validate_artifact_path(path)?;
+        let mut state = self.state.lock();
+        let State::Private(inventory) = &*state else {
+            vortex_bail!("Only a private generation can be written");
+        };
+        if inventory.contains_key(path) {
+            vortex_bail!("Artifact already exists: {}", path);
+        }
+        // Failed writes may have created directories or partial files. Never
+        // allow sealing a writer after such a failure or silently reuse a name.
+        let State::Private(mut inventory) = mem::replace(&mut *state, State::Failed) else {
+            vortex_bail!("Only a private generation can be written");
+        };
+        let (parent, name) = artifact_parent(&self.artifacts, path, true)?;
+        let artifact = write_new(&parent, name, write)?;
+        inventory.insert(path.to_owned(), artifact.clone());
+        *state = State::Private(inventory);
+        Ok(artifact)
     }
 }
 
@@ -237,24 +268,15 @@ impl IndexStore for LocalIndexStore {
         if data.len() > self.limits.max_artifact_bytes {
             vortex_bail!("Artifact exceeds the byte limit");
         }
-        let mut state = self.state.lock();
-        let State::Private(inventory) = &mut *state else {
-            vortex_bail!("Only a private generation can be written");
-        };
-        if inventory.contains_key(path) {
-            vortex_bail!("Artifact already exists: {}", path);
-        }
         let artifact = artifact(path, &data)?;
-        // Failed writes may have created directories or partial files. Never
-        // allow sealing a writer after such a failure or silently reuse a name.
-        let State::Private(mut inventory) = mem::replace(&mut *state, State::Failed) else {
-            vortex_bail!("Only a private generation can be written");
-        };
-        let (parent, name) = artifact_parent(&self.artifacts, path, true)?;
-        write_new(&parent, name, &data)?;
-        inventory.insert(path.to_owned(), artifact.clone());
-        *state = State::Private(inventory);
-        Ok(artifact)
+        self.write_artifact(path, |file| {
+            file.write_all(&data)?;
+            Ok(artifact)
+        })
+    }
+
+    fn as_local_files(&self) -> Option<&dyn LocalIndexFiles> {
+        Some(self)
     }
 }
 
@@ -341,8 +363,8 @@ fn file_flags() -> unix_fs::OFlags {
         | unix_fs::OFlags::CLOEXEC
 }
 
-fn write_new(parent: &File, name: &str, data: &[u8]) -> VortexResult<()> {
-    let mut file = File::from(
+fn create_file(parent: &File, name: &str) -> VortexResult<File> {
+    Ok(File::from(
         unix_fs::openat(
             parent,
             name,
@@ -353,15 +375,39 @@ fn write_new(parent: &File, name: &str, data: &[u8]) -> VortexResult<()> {
             unix_fs::Mode::RUSR | unix_fs::Mode::WUSR,
         )
         .map_err(|err| vortex_err!("Cannot create artifact {}: {}", name, err))?,
+    ))
+}
+
+fn open_file(parent: &File, name: &OsStr) -> VortexResult<File> {
+    let file = File::from(
+        unix_fs::openat(
+            parent,
+            name,
+            file_flags() | unix_fs::OFlags::RDONLY,
+            unix_fs::Mode::empty(),
+        )
+        .map_err(|err| vortex_err!("Cannot open artifact {:?}: {}", name, err))?,
     );
-    file.write_all(data)?;
+    if !file.metadata()?.is_file() {
+        vortex_bail!("Artifact is not a regular file: {:?}", name);
+    }
+    Ok(file)
+}
+
+fn write_new<T>(
+    parent: &File,
+    name: &str,
+    write: impl FnOnce(&mut File) -> VortexResult<T>,
+) -> VortexResult<T> {
+    let mut file = create_file(parent, name)?;
+    let result = write(&mut file)?;
     #[cfg(test)]
     tests::inject_fault(tests::Fault::FileWritten)?;
     file.sync_all()?;
     #[cfg(test)]
     tests::inject_fault(tests::Fault::FileSynced)?;
     parent.sync_all()?;
-    Ok(())
+    Ok(result)
 }
 
 fn artifact(path: &str, bytes: &[u8]) -> VortexResult<IndexArtifact> {
@@ -375,7 +421,8 @@ fn artifact(path: &str, bytes: &[u8]) -> VortexResult<IndexArtifact> {
 fn read_bytes(root: &File, artifact: &IndexArtifact, limit: usize) -> VortexResult<Bytes> {
     let mut bytes = Vec::new();
     verify(root, artifact, limit, |chunk| {
-        bytes.extend_from_slice(chunk)
+        bytes.extend_from_slice(chunk);
+        Ok(())
     })?;
     Ok(Bytes::from(bytes))
 }
@@ -384,7 +431,7 @@ fn verify(
     root: &File,
     artifact: &IndexArtifact,
     limit: usize,
-    mut consume: impl FnMut(&[u8]),
+    consume: impl FnMut(&[u8]) -> VortexResult<()>,
 ) -> VortexResult<()> {
     if artifact.size > u64::try_from(limit)? {
         vortex_bail!("Artifact exceeds the byte limit: {}", artifact.path);
@@ -402,46 +449,44 @@ fn verify(
         vortex_bail!("Invalid SHA-256 artifact checksum: {}", artifact.path);
     }
     let (parent, name) = artifact_parent(root, &artifact.path, false)?;
-    let mut file = File::from(
-        unix_fs::openat(
-            &parent,
-            name,
-            file_flags() | unix_fs::OFlags::RDONLY,
-            unix_fs::Mode::empty(),
-        )
-        .map_err(|err| vortex_err!("Cannot open artifact {}: {}", artifact.path, err))?,
-    );
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        vortex_bail!("Artifact is not a regular file: {}", artifact.path);
-    }
-    if metadata.len() != artifact.size {
+    let mut file = open_file(&parent, OsStr::new(name))?;
+    if file.metadata()?.len() != artifact.size {
         vortex_bail!("Artifact length mismatch: {}", artifact.path);
     }
-    let mut remaining = artifact.size;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
-    while remaining != 0 {
-        let count = usize::try_from(remaining.min(buffer.len() as u64))?;
-        let count = file.read(&mut buffer[..count])?;
-        if count == 0 {
-            vortex_bail!("Truncated artifact: {}", artifact.path);
-        }
-        remaining -= count as u64;
-        hasher.update(&buffer[..count]);
-        consume(&buffer[..count]);
-    }
-    if file.read(&mut buffer[..1])? != 0 {
-        vortex_bail!(
-            "Artifact grew beyond its declared length: {}",
-            artifact.path
-        );
-    }
-    if format!("sha256:{:x}", HexDisplay(&hasher.finalize())) != artifact.checksum {
+    let checksum = copy_and_hash(&mut file, artifact.size, consume)
+        .map_err(|err| err.with_context(format!("Reading artifact {}", artifact.path)))?;
+    if checksum != artifact.checksum {
         vortex_bail!("Artifact checksum mismatch: {}", artifact.path);
     }
     Ok(())
 }
+
+fn copy_and_hash(
+    source: &mut impl Read,
+    size: u64,
+    mut consume: impl FnMut(&[u8]) -> VortexResult<()>,
+) -> VortexResult<String> {
+    let mut remaining = size;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; COPY_BUFFER_BYTES];
+    while remaining != 0 {
+        let count = usize::try_from(remaining.min(buffer.len() as u64))?;
+        source.read_exact(&mut buffer[..count])?;
+        remaining -= count as u64;
+        hasher.update(&buffer[..count]);
+        consume(&buffer[..count])?;
+        #[cfg(test)]
+        tests::inject_fault(tests::Fault::ChunkCopied)?;
+    }
+    match source.read_exact(&mut buffer[..1]) {
+        Ok(()) => vortex_bail!("Artifact grew beyond its declared length"),
+        Err(err) if err.kind() == ErrorKind::UnexpectedEof => {}
+        Err(err) => return Err(err.into()),
+    }
+    Ok(format!("sha256:{:x}", HexDisplay(&hasher.finalize())))
+}
+
+mod local_files;
 
 #[cfg(test)]
 mod tests;
