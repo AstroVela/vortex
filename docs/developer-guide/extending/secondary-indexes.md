@@ -3,8 +3,8 @@
 :::{warning}
 This is an experimental design and interface prototype on AstroVela's Vane
 development branch. It is not a stable API, a new Vortex file-format feature,
-or an index-enabled SQL release. SPFresh and persistent catalog integration
-are subsequent milestones.
+or an index-enabled SQL release. A read-only SPFresh provider is available behind
+an explicit native feature; persistent catalog and SQL integration remain future work.
 :::
 
 ## Scope and ownership
@@ -21,7 +21,7 @@ the earlier `vendor/vortex-index` prototype.
 | Component | Responsibility |
 |---|---|
 | `vortex-index` | Common metadata, registry, source/storage traits, scalar/vector query contracts, reference implementation |
-| Future `vortex-index-spfresh` | Native bridge, SPFresh format/configuration, ID mapping, backend capabilities |
+| `vortex-index-spfresh` | Optional read-only native bridge, pinned SPFresh format, ID mapping, backend capabilities |
 | `vortex-duckdb` in this monorepo | SQL binding, query planning, permission checks, result conversion |
 | External `duckdb-vortex` repository | Extension composition, build/package configuration, pinned dependency revisions |
 | Source/table adapter | Snapshot identity, visibility, catalog publication, conflict detection, cleanup |
@@ -312,11 +312,13 @@ adapter, not SPFresh format compatibility or native search correctness.
    The local generation store now supports durable immutable artifacts and
    trusted manifest reopening, exercised across processes by a test-only
    reference backend. Streaming imports and leased local native artifact copies
-   are implemented. Next port the separately tested native bridge into an
-   optional backend, persist native-ID mappings, then qualify SPFresh
-   build/open/search/take across multiple files. First qualify local storage and
-   immutable artifact generations. Fix native PIC and dependency isolation before
-   qualifying shared-extension packaging.
+   are implemented. The optional `vortex-index-spfresh/native` backend now
+   imports frozen Float32/L2 static bundles, persists dense native-ID mappings,
+   opens verified leased copies, and implements unfiltered ANN search/batch.
+   Real native tests cover C ABI parity, Flat recall, multi-file retrieval,
+   independent processes and concurrent reader lifetimes. The pinned native
+   build checks PIC by linking a shared bridge. Public initial build, dynamic
+   updates, SPDK and shared DuckDB extension packaging remain unimplemented.
 3. **Engine integration:** add common SQL entrypoints through `vortex-duckdb`,
    leave current SPFresh SQL names as compatibility adapters, and update the
    external extension's pinned Vortex revision. Do not duplicate index logic in

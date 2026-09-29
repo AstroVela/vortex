@@ -1,0 +1,442 @@
+diff --git a/AnnService/inc/Core/Common/Dataset.h b/AnnService/inc/Core/Common/Dataset.h
+index 915205a..0f02ef0 100644
+--- a/AnnService/inc/Core/Common/Dataset.h
++++ b/AnnService/inc/Core/Common/Dataset.h
+@@ -239,8 +239,10 @@ namespace SPTAG
+             ~Dataset()
+             {
+                 if (ownData) ALIGN_FREE(data);
+-                for (char* ptr : *incBlocks) ALIGN_FREE(ptr);
+-                incBlocks->clear();
++                if (incBlocks != nullptr) {
++                    for (char* ptr : *incBlocks) ALIGN_FREE(ptr);
++                    incBlocks->clear();
++                }
+             }
+ 
+             void Initialize(SizeType rows_, DimensionType cols_, SizeType rowsInBlock_, SizeType capacity_, const void* data_ = nullptr, bool shareOwnership_ = true, std::shared_ptr<std::vector<char*>> incBlocks_ = nullptr, int colStart_ = 0, int rowEnd_ = -1)
+@@ -479,4 +481,4 @@ namespace SPTAG
+     }
+ }
+ 
+-#endif // _SPTAG_COMMON_DATASET_H_
+\ No newline at end of file
++#endif // _SPTAG_COMMON_DATASET_H_
+diff --git a/AnnService/inc/Helper/AsyncFileReader.h b/AnnService/inc/Helper/AsyncFileReader.h
+index be9c5cd..399cb2b 100644
+--- a/AnnService/inc/Helper/AsyncFileReader.h
++++ b/AnnService/inc/Helper/AsyncFileReader.h
+@@ -15,10 +15,14 @@
+ #include <thread>
+ #include <stdint.h>
+ 
++#ifndef SPTAG_STATIC_ONLY
+ #define ASYNC_READ 1
+ #define BATCH_READ 1
++#endif
+ 
++#if !defined(SPTAG_DISABLE_NUMA)
+ #define NUMA 1
++#endif
+ 
+ #ifdef _MSC_VER
+ #include <tchar.h>
+diff --git a/AnnService/inc/Helper/DiskIO.h b/AnnService/inc/Helper/DiskIO.h
+index b583d38..15fd23e 100644
+--- a/AnnService/inc/Helper/DiskIO.h
++++ b/AnnService/inc/Helper/DiskIO.h
+@@ -8,6 +8,7 @@
+ #include <fstream>
+ #include <string.h>
+ #include <memory>
++#include <cstdint>
+ 
+ namespace SPTAG
+ {
+diff --git a/AnnService/src/Core/Common/DistanceUtils.cpp b/AnnService/src/Core/Common/DistanceUtils.cpp
+index 5c86cad..c8af316 100644
+--- a/AnnService/src/Core/Common/DistanceUtils.cpp
++++ b/AnnService/src/Core/Common/DistanceUtils.cpp
+@@ -103,6 +103,7 @@ inline __m128 _mm_sqdf_ps(__m128 X, __m128 Y)
+     return _mm_mul_ps(d, d);
+ }
+ 
++__attribute__((target("avx2")))
+ inline __m256 _mm256_mul_epi8(__m256i X, __m256i Y)
+ {
+     __m256i zero = _mm256_setzero_si256();
+@@ -118,6 +119,7 @@ inline __m256 _mm256_mul_epi8(__m256i X, __m256i Y)
+     return _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_madd_epi16(xlo, ylo), _mm256_madd_epi16(xhi, yhi)));
+ }
+ 
++__attribute__((target("avx2")))
+ inline __m256 _mm256_sqdf_epi8(__m256i X, __m256i Y)
+ {
+     __m256i zero = _mm256_setzero_si256();
+@@ -136,6 +138,7 @@ inline __m256 _mm256_sqdf_epi8(__m256i X, __m256i Y)
+     return _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_madd_epi16(dlo, dlo), _mm256_madd_epi16(dhi, dhi)));
+ }
+ 
++__attribute__((target("avx2")))
+ inline __m256 _mm256_mul_epu8(__m256i X, __m256i Y)
+ {
+     __m256i zero = _mm256_setzero_si256();
+@@ -148,6 +151,7 @@ inline __m256 _mm256_mul_epu8(__m256i X, __m256i Y)
+     return _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_madd_epi16(xlo, ylo), _mm256_madd_epi16(xhi, yhi)));
+ }
+ 
++__attribute__((target("avx2")))
+ inline __m256 _mm256_sqdf_epu8(__m256i X, __m256i Y)
+ {
+     __m256i zero = _mm256_setzero_si256();
+@@ -163,11 +167,13 @@ inline __m256 _mm256_sqdf_epu8(__m256i X, __m256i Y)
+     return _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_madd_epi16(dlo, dlo), _mm256_madd_epi16(dhi, dhi)));
+ }
+ 
++__attribute__((target("avx2")))
+ inline __m256 _mm256_mul_epi16(__m256i X, __m256i Y)
+ {
+     return _mm256_cvtepi32_ps(_mm256_madd_epi16(X, Y));
+ }
+ 
++__attribute__((target("avx2")))
+ inline __m256 _mm256_sqdf_epi16(__m256i X, __m256i Y)
+ {
+     __m256i zero = _mm256_setzero_si256();
+@@ -186,6 +192,7 @@ inline __m256 _mm256_sqdf_epi16(__m256i X, __m256i Y)
+     return _mm256_add_ps(_mm256_mul_ps(dlo, dlo), _mm256_mul_ps(dhi, dhi));
+ }
+ 
++__attribute__((target("avx")))
+ inline __m256 _mm256_sqdf_ps(__m256 X, __m256 Y)
+ {
+     __m256 d = _mm256_sub_ps(X, Y);
+@@ -194,6 +201,7 @@ inline __m256 _mm256_sqdf_ps(__m256 X, __m256 Y)
+ 
+ // Do not use intrinsics not supported by old MS compiler version
+ #if (!defined _MSC_VER) || (_MSC_VER >= 1920)
++__attribute__((target("avx512f,avx512bw,avx512dq")))
+ inline __m512 _mm512_mul_epi8(__m512i X, __m512i Y)
+ {
+     __m512i zero = _mm512_setzero_si512();
+@@ -212,6 +220,7 @@ inline __m512 _mm512_mul_epi8(__m512i X, __m512i Y)
+     return _mm512_cvtepi32_ps(_mm512_add_epi32(_mm512_madd_epi16(xlo, ylo), _mm512_madd_epi16(xhi, yhi)));
+ }
+ 
++__attribute__((target("avx512f,avx512bw,avx512dq")))
+ inline __m512 _mm512_sqdf_epi8(__m512i X, __m512i Y)
+ {
+     __m512i zero = _mm512_setzero_si512();
+@@ -233,6 +242,7 @@ inline __m512 _mm512_sqdf_epi8(__m512i X, __m512i Y)
+     return _mm512_cvtepi32_ps(_mm512_add_epi32(_mm512_madd_epi16(dlo, dlo), _mm512_madd_epi16(dhi, dhi)));
+ }
+ 
++__attribute__((target("avx512f,avx512bw,avx512dq")))
+ inline __m512 _mm512_mul_epu8(__m512i X, __m512i Y)
+ {
+     __m512i zero = _mm512_setzero_si512();
+@@ -245,6 +255,7 @@ inline __m512 _mm512_mul_epu8(__m512i X, __m512i Y)
+     return _mm512_cvtepi32_ps(_mm512_add_epi32(_mm512_madd_epi16(xlo, ylo), _mm512_madd_epi16(xhi, yhi)));
+ }
+ 
++__attribute__((target("avx512f,avx512bw,avx512dq")))
+ inline __m512 _mm512_sqdf_epu8(__m512i X, __m512i Y)
+ {
+     __m512i zero = _mm512_setzero_si512();
+@@ -260,11 +271,13 @@ inline __m512 _mm512_sqdf_epu8(__m512i X, __m512i Y)
+     return _mm512_cvtepi32_ps(_mm512_add_epi32(_mm512_madd_epi16(dlo, dlo), _mm512_madd_epi16(dhi, dhi)));
+ }
+ 
++__attribute__((target("avx512f,avx512bw,avx512dq")))
+ inline __m512 _mm512_mul_epi16(__m512i X, __m512i Y)
+ {
+     return _mm512_cvtepi32_ps(_mm512_madd_epi16(X, Y));
+ }
+ 
++__attribute__((target("avx512f,avx512bw,avx512dq")))
+ inline __m512 _mm512_sqdf_epi16(__m512i X, __m512i Y)
+ {
+     __m512i zero = _mm512_setzero_si512();
+@@ -286,6 +299,7 @@ inline __m512 _mm512_sqdf_epi16(__m512i X, __m512i Y)
+     return _mm512_add_ps(_mm512_mul_ps(dlo, dlo), _mm512_mul_ps(dhi, dhi));
+ }
+ 
++__attribute__((target("avx512f,avx512bw,avx512dq")))
+ inline __m512 _mm512_sqdf_ps(__m512 X, __m512 Y)
+ {
+     __m512 d = _mm512_sub_ps(X, Y);
+@@ -331,6 +345,7 @@ float DistanceUtils::ComputeL2Distance_SSE(const std::int8_t* pX, const std::int
+     return diff;
+ }
+ 
++__attribute__((target("avx2")))
+ float DistanceUtils::ComputeL2Distance_AVX(const std::int8_t* pX, const std::int8_t* pY, DimensionType length)
+ {
+     const std::int8_t* pEnd32 = pX + ((length >> 5) << 5);
+@@ -360,6 +375,7 @@ float DistanceUtils::ComputeL2Distance_AVX(const std::int8_t* pX, const std::int
+     return diff;
+ }
+ 
++__attribute__((target("avx512f,avx512bw,avx512dq")))
+ float DistanceUtils::ComputeL2Distance_AVX512(const std::int8_t* pX, const std::int8_t* pY, DimensionType length)
+ {
+     const std::int8_t* pEnd32 = pX + ((length >> 5) << 5);
+@@ -428,6 +444,7 @@ float DistanceUtils::ComputeL2Distance_SSE(const std::uint8_t* pX, const std::ui
+     return diff;
+ }
+ 
++__attribute__((target("avx2")))
+ float DistanceUtils::ComputeL2Distance_AVX(const std::uint8_t* pX, const std::uint8_t* pY, DimensionType length)
+ {
+     const std::uint8_t* pEnd32 = pX + ((length >> 5) << 5);
+@@ -457,6 +474,7 @@ float DistanceUtils::ComputeL2Distance_AVX(const std::uint8_t* pX, const std::ui
+     return diff;
+ }
+ 
++__attribute__((target("avx512f,avx512bw,avx512dq")))
+ float DistanceUtils::ComputeL2Distance_AVX512(const std::uint8_t* pX, const std::uint8_t* pY, DimensionType length)
+ {
+     const std::uint8_t* pEnd32 = pX + ((length >> 5) << 5);
+@@ -526,6 +544,7 @@ float DistanceUtils::ComputeL2Distance_SSE(const std::int16_t* pX, const std::in
+     return diff;
+ }
+ 
++__attribute__((target("avx2")))
+ float DistanceUtils::ComputeL2Distance_AVX(const std::int16_t* pX, const std::int16_t* pY, DimensionType length)
+ {
+     const std::int16_t* pEnd16 = pX + ((length >> 4) << 4);
+@@ -556,6 +575,7 @@ float DistanceUtils::ComputeL2Distance_AVX(const std::int16_t* pX, const std::in
+     return diff;
+ }
+ 
++__attribute__((target("avx512f,avx512bw,avx512dq")))
+ float DistanceUtils::ComputeL2Distance_AVX512(const std::int16_t* pX, const std::int16_t* pY, DimensionType length)
+ {
+     const std::int16_t* pEnd16 = pX + ((length >> 4) << 4);
+@@ -622,6 +642,7 @@ float DistanceUtils::ComputeL2Distance_SSE(const float* pX, const float* pY, Dim
+     return diff;
+ }
+ 
++__attribute__((target("avx")))
+ float DistanceUtils::ComputeL2Distance_AVX(const float* pX, const float* pY, DimensionType length)
+ {
+     const float* pEnd16 = pX + ((length >> 4) << 4);
+@@ -647,6 +668,7 @@ float DistanceUtils::ComputeL2Distance_AVX(const float* pX, const float* pY, Dim
+     return diff;
+ }
+ 
++__attribute__((target("avx512f,avx512bw,avx512dq")))
+ float DistanceUtils::ComputeL2Distance_AVX512(const float* pX, const float* pY, DimensionType length)
+ {
+     const float* pEnd8 = pX + ((length >> 3) << 3);
+@@ -709,6 +731,7 @@ float DistanceUtils::ComputeCosineDistance_SSE(const std::int8_t* pX, const std:
+     return 16129 - diff;
+ }
+ 
++__attribute__((target("avx2")))
+ float DistanceUtils::ComputeCosineDistance_AVX(const std::int8_t* pX, const std::int8_t* pY, DimensionType length)
+ {
+     const std::int8_t* pEnd32 = pX + ((length >> 5) << 5);
+@@ -737,6 +760,7 @@ float DistanceUtils::ComputeCosineDistance_AVX(const std::int8_t* pX, const std:
+     return 16129 - diff;
+ }
+ 
++__attribute__((target("avx512f,avx512bw,avx512dq")))
+ float DistanceUtils::ComputeCosineDistance_AVX512(const std::int8_t* pX, const std::int8_t* pY, DimensionType length)
+ {
+     const std::int8_t* pEnd32 = pX + ((length >> 5) << 5);
+@@ -803,6 +827,7 @@ float DistanceUtils::ComputeCosineDistance_SSE(const std::uint8_t* pX, const std
+     return 65025 - diff;
+ }
+ 
++__attribute__((target("avx2")))
+ float DistanceUtils::ComputeCosineDistance_AVX(const std::uint8_t* pX, const std::uint8_t* pY, DimensionType length)
+ {
+     const std::uint8_t* pEnd32 = pX + ((length >> 5) << 5);
+@@ -831,6 +856,7 @@ float DistanceUtils::ComputeCosineDistance_AVX(const std::uint8_t* pX, const std
+     return 65025 - diff;
+ }
+ 
++__attribute__((target("avx512f,avx512bw,avx512dq")))
+ float DistanceUtils::ComputeCosineDistance_AVX512(const std::uint8_t* pX, const std::uint8_t* pY, DimensionType length)
+ {
+     const std::uint8_t* pEnd32 = pX + ((length >> 5) << 5);
+@@ -898,6 +924,7 @@ float DistanceUtils::ComputeCosineDistance_SSE(const std::int16_t* pX, const std
+     return  1073676289 - diff;
+ }
+ 
++__attribute__((target("avx2")))
+ float DistanceUtils::ComputeCosineDistance_AVX(const std::int16_t* pX, const std::int16_t* pY, DimensionType length)
+ {
+     const std::int16_t* pEnd16 = pX + ((length >> 4) << 4);
+@@ -927,6 +954,7 @@ float DistanceUtils::ComputeCosineDistance_AVX(const std::int16_t* pX, const std
+     return  1073676289 - diff;
+ }
+ 
++__attribute__((target("avx512f,avx512bw,avx512dq")))
+ float DistanceUtils::ComputeCosineDistance_AVX512(const std::int16_t* pX, const std::int16_t* pY, DimensionType length)
+ {
+     const std::int16_t* pEnd16 = pX + ((length >> 4) << 4);
+@@ -990,6 +1018,7 @@ float DistanceUtils::ComputeCosineDistance_SSE(const float* pX, const float* pY,
+     return 1 - diff;
+ }
+ 
++__attribute__((target("avx")))
+ float DistanceUtils::ComputeCosineDistance_AVX(const float* pX, const float* pY, DimensionType length)
+ {
+     const float* pEnd16 = pX + ((length >> 4) << 4);
+@@ -1013,6 +1042,7 @@ float DistanceUtils::ComputeCosineDistance_AVX(const float* pX, const float* pY,
+     return 1 - diff;
+ }
+ 
++__attribute__((target("avx512f,avx512bw,avx512dq")))
+ float DistanceUtils::ComputeCosineDistance_AVX512(const float* pX, const float* pY, DimensionType length)
+ {
+     const float* pEnd8 = pX + ((length >> 3) << 3);
+diff --git a/AnnService/src/Core/Common/InstructionUtils.cpp b/AnnService/src/Core/Common/InstructionUtils.cpp
+index e1ef2cf..ee338eb 100644
+--- a/AnnService/src/Core/Common/InstructionUtils.cpp
++++ b/AnnService/src/Core/Common/InstructionUtils.cpp
+@@ -64,6 +64,13 @@ namespace SPTAG {
+ #endif
+ #endif
+             }
++#if defined(SPTAG_STATIC_ONLY) && defined(__GNUC__)
++            // Check OS register-state support as well as every emitted ISA subset.
++            HW_AVX = __builtin_cpu_supports("avx");
++            HW_AVX2 = __builtin_cpu_supports("avx2");
++            HW_AVX512 = __builtin_cpu_supports("avx512f")
++                && __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512dq");
++#endif
+             if (HW_AVX512)
+                 LOG(Helper::LogLevel::LL_Info, "Using AVX512 InstructionSet!\n");
+             else if (HW_AVX2)
+diff --git a/AnnService/src/Core/SPANN/SPANNIndex.cpp b/AnnService/src/Core/SPANN/SPANNIndex.cpp
+index 76f835a..bb698f2 100644
+--- a/AnnService/src/Core/SPANN/SPANNIndex.cpp
++++ b/AnnService/src/Core/SPANN/SPANNIndex.cpp
+@@ -4,7 +4,9 @@
+ #include "inc/Core/SPANN/Index.h"
+ #include "inc/Helper/VectorSetReaders/MemoryReader.h"
+ #include "inc/Core/SPANN/ExtraStaticSearcher.h"
++#ifndef SPTAG_STATIC_ONLY
+ #include "inc/Core/SPANN/ExtraDynamicSearcher.h"
++#endif
+ #include <shared_mutex>
+ #include <chrono>
+ #include <random>
+@@ -22,7 +24,11 @@ namespace SPTAG
+         template <typename T>
+         thread_local std::shared_ptr<ExtraWorkSpace> Index<T>::m_workspace;
+ 
++#ifdef SPTAG_STATIC_ONLY
++        std::function<std::shared_ptr<Helper::DiskIO>(void)> f_createAsyncIO = []() { return SPTAG::f_createIO(); };
++#else
+         std::function<std::shared_ptr<Helper::DiskIO>(void)> f_createAsyncIO = []() -> std::shared_ptr<Helper::DiskIO> { return std::shared_ptr<Helper::DiskIO>(new Helper::AsyncFileIO()); };
++#endif
+ 
+         template <typename T>
+         bool Index<T>::CheckHeadIndexType() {
+@@ -98,6 +104,7 @@ namespace SPTAG
+             }
+             else
+             {
++#ifndef SPTAG_STATIC_ONLY
+                 if (m_options.m_useKV) {
+                     if (m_options.m_inPlace) {
+                         m_extraSearcher.reset(new ExtraDynamicSearcher<T>(m_options.m_KVPath.c_str(), m_options.m_dim, INT_MAX, m_options.m_useDirectIO, m_options.m_latencyLimit, m_options.m_mergeThreshold));
+@@ -106,7 +113,9 @@ namespace SPTAG
+                         m_extraSearcher.reset(new ExtraDynamicSearcher<T>(m_options.m_KVPath.c_str(), m_options.m_dim, m_options.m_postingPageLimit * PageSize / (sizeof(T) * m_options.m_dim + sizeof(int) + sizeof(uint8_t)), m_options.m_useDirectIO, m_options.m_latencyLimit, m_options.m_mergeThreshold));
+                     }
+                 }
+-                else {
++                else
++#endif
++                {
+                     m_extraSearcher.reset(new ExtraStaticSearcher<T>());
+                 }
+             }
+@@ -139,6 +148,7 @@ namespace SPTAG
+             }
+             else
+             {
++#ifndef SPTAG_STATIC_ONLY
+                 if (m_options.m_useKV) {
+                     if (m_options.m_inPlace) {
+                         m_extraSearcher.reset(new ExtraDynamicSearcher<T>(m_options.m_KVPath.c_str(), m_options.m_dim, INT_MAX, m_options.m_useDirectIO, m_options.m_latencyLimit, m_options.m_mergeThreshold));
+@@ -149,7 +159,9 @@ namespace SPTAG
+                 }
+                 else if (m_options.m_useSPDK) {
+                     m_extraSearcher.reset(new ExtraDynamicSearcher<T>(m_options.m_spdkMappingPath.c_str(), m_options.m_dim, m_options.m_postingPageLimit, m_options.m_useDirectIO, m_options.m_latencyLimit, m_options.m_mergeThreshold, true, m_options.m_spdkBatchSize, m_options.m_bufferLength));
+-                } else {
++                } else
++#endif
++                {
+                     m_extraSearcher.reset(new ExtraStaticSearcher<T>());
+                 }
+             }
+@@ -163,6 +175,7 @@ namespace SPTAG
+ 
+             omp_set_num_threads(m_options.m_iSSDNumberOfThreads);
+ 
++#ifndef SPTAG_STATIC_ONLY
+             if (m_options.m_useSPDK) {
+                 int m_vectorLimit = m_options.m_postingPageLimit * PageSize / (sizeof(T) * m_options.m_dim + sizeof(int) + sizeof(uint8_t));
+                 m_versionMap.Initialize(m_options.m_vectorSize, m_index->m_iDataBlockSize, m_index->m_iDataCapacity);
+@@ -255,6 +268,7 @@ namespace SPTAG
+                 }
+                 m_extraSearcher->RefineIndex(vectorReader, m_index);
+             }
++#endif
+ 
+             return ErrorCode::Success;
+         }
+@@ -318,10 +332,14 @@ namespace SPTAG
+             if (!m_bReady) return ErrorCode::EmptyIndex;
+ 
+             COMMON::QueryResultSet<T>* p_queryResults;
++            std::unique_ptr<COMMON::QueryResultSet<T>> ownedResults;
+             if (p_query.GetResultNum() >= m_options.m_searchInternalResultNum)
+                 p_queryResults = (COMMON::QueryResultSet<T>*) & p_query;
+             else
+-                p_queryResults = new COMMON::QueryResultSet<T>((const T*)p_query.GetTarget(), m_options.m_searchInternalResultNum);
++            {
++                ownedResults.reset(new COMMON::QueryResultSet<T>((const T*)p_query.GetTarget(), m_options.m_searchInternalResultNum));
++                p_queryResults = ownedResults.get();
++            }
+ 
+             m_index->SearchIndex(*p_queryResults);
+ 
+@@ -361,7 +379,6 @@ namespace SPTAG
+ 
+             if (p_query.GetResultNum() < m_options.m_searchInternalResultNum) {
+                 std::copy(p_queryResults->GetResults(), p_queryResults->GetResults() + p_query.GetResultNum(), p_query.GetResults());
+-                delete p_queryResults;
+             }
+ 
+             if (p_query.WithMeta() && nullptr != m_pMetadata)
+@@ -845,6 +862,7 @@ namespace SPTAG
+                 m_index->SetParameter("HashTableExponent", std::to_string(m_options.m_hashExp));
+                 m_index->UpdateIndex();
+ 
++#ifndef SPTAG_STATIC_ONLY
+                 if (m_options.m_useKV)
+                 {
+                     if (m_options.m_inPlace) {
+@@ -863,7 +881,9 @@ namespace SPTAG
+                         m_extraSearcher.reset(new ExtraDynamicSearcher<T>(m_options.m_spdkMappingPath.c_str(), m_options.m_dim, m_options.m_postingPageLimit, m_options.m_useDirectIO, m_options.m_latencyLimit, m_options.m_mergeThreshold, true, m_options.m_spdkBatchSize));
+                     }  
+                 }
+-                else {
++                else
++#endif
++                {
+                     if (m_pQuantizer) {
+                         m_extraSearcher.reset(new ExtraStaticSearcher<std::uint8_t>());
+                     }
+@@ -1134,5 +1154,3 @@ template class SPTAG::SPANN::Index<Type>; \
+ 
+ #include "inc/Core/DefinitionList.h"
+ #undef DefineVectorValueType
+-
+-

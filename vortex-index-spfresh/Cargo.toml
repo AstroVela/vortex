@@ -1,0 +1,46 @@
+[package]
+name = "vortex-index-spfresh"
+description = "Experimental read-only SPFresh backend for Vortex indexes"
+authors.workspace = true
+categories.workspace = true
+edition.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme = "README.md"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+publish = false
+
+[features]
+default = []
+native = ["dep:base16ct", "dep:cc", "dep:sha2"]
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+vortex-buffer.workspace = true
+vortex-error.workspace = true
+vortex-index.workspace = true
+
+[build-dependencies]
+base16ct = { workspace = true, features = ["alloc"], optional = true }
+cc = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+
+[dev-dependencies]
+futures = { workspace = true, features = ["executor"] }
+tempfile.workspace = true
+vortex-array = { workspace = true, features = ["_test-harness"] }
+vortex-edition.workspace = true
+vortex-file.workspace = true
+vortex-index = { workspace = true, features = ["file", "local-store"] }
+vortex-io.workspace = true
+vortex-layout.workspace = true
+vortex-session.workspace = true
+
+[lints]
+workspace = true
