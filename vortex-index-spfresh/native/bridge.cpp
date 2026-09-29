@@ -145,7 +145,7 @@ extern "C" int vortex_spfresh_search(void *opaque,
         auto &handle = *static_cast<Handle *>(opaque);
         if (dimension != handle.dimension || count == 0 || k == 0 || k > handle.rows ||
             internal_results < k || internal_results > 4096 || max_check < internal_results ||
-            max_check > 1048576 || search_pages == 0 || search_pages > handle.posting_pages) {
+            max_check > 1048576 || search_pages != handle.posting_pages) {
             throw std::runtime_error("Invalid SPFresh query options");
         }
         const auto set = [&](const char *name, uint32_t value, const char *section) {

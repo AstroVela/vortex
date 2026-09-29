@@ -488,6 +488,7 @@ fn test_query_rejections_and_empty_batch() -> VortexResult<()> {
             r#"{"max_check":4096,"internal_results":2,"search_pages":12}"#,
             r#"{"max_check":1,"internal_results":64,"search_pages":12}"#,
             r#"{"max_check":4096,"internal_results":64,"search_pages":13}"#,
+            r#"{"max_check":4096,"internal_results":64,"search_pages":11}"#,
             r#"{"max_check":4096,"internal_results":64,"search_pages":0}"#,
         ] {
             let invalid = VectorSearchOptions {

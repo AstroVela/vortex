@@ -110,10 +110,14 @@ bundle's page limit. Explicit JSON must specify exactly:
 ```
 
 Require k <= internal_results <= 4096, internal_results <= max_check <= 1048576,
-and 1 <= search_pages <= the bundle page limit. The provider limits materialized
-bytes, mapping rows, batch vectors and posting-buffer allocation separately.
-Those are not a total native RSS limit or global disk quota. Each handle costs
-a full artifact copy and retains its own in-memory head index and row map.
+and search_pages == the bundle page limit. Posting reads are truncated by the
+bundle page limit when the index is opened; in this static path a smaller
+per-query search_pages would shrink the native read buffers without reducing
+IO, so values below the page limit are rejected. The provider limits
+materialized bytes, mapping rows, batch vectors and posting-buffer allocation
+separately. Those are not a total native RSS limit or global disk quota. Each
+handle costs a full artifact copy and retains its own in-memory head index and
+row map.
 
 Open/import/search are **blocking**, despite common async trait signatures.
 Run them on blocking workers. The bridge serializes all native calls across

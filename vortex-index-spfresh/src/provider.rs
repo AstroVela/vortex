@@ -253,14 +253,15 @@ impl SpFreshIndex {
             || native.internal_results > 4096
             || native.max_check < native.internal_results
             || native.max_check > 1_048_576
-            || native.search_pages == 0
-            || native.search_pages > self.bundle.posting_page_limit
+            || native.search_pages != self.bundle.posting_page_limit
         {
             vortex_bail!("Invalid SPFresh native query options");
         }
-        let pages = self.bundle.posting_page_limit.min(native.search_pages + 1);
-        if u64::from(pages) * u64::from(native.internal_results) * 4096
-            > self.limits.max_posting_buffer_bytes
+        // Posting reads are truncated by the bundle page limit when the index is
+        // opened; search_pages must equal that limit (validated above), so each
+        // native page buffer holds exactly posting_page_limit pages.
+        let pages = u64::from(self.bundle.posting_page_limit);
+        if pages * u64::from(native.internal_results) * 4096 > self.limits.max_posting_buffer_bytes
         {
             vortex_bail!("SPFresh query exceeds posting buffer budget");
         }
