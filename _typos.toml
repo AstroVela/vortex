@@ -7,6 +7,9 @@ extend-ignore-re = [
     "(?s)(#|//)\\s*spellchecker:off.*?\\n\\s*(#|//)\\s*spellchecker:on", # Ignore block between hints
 ]
 
+[default.extend-identifiers]
+WRONLY = "WRONLY" # Unix write-only open flag.
+
 [files]
 # scripts/measurement_id_golden.json is a frozen hash-pin artifact whose vectors include
 # deliberate Unicode edge cases (JSON-escaped, so "café" reads as the token "caf"); its bytes
