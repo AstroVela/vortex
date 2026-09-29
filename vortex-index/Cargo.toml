@@ -14,19 +14,47 @@ rust-version.workspace = true
 version.workspace = true
 publish = false
 
+[features]
+default = []
+file = [
+    "dep:async-stream",
+    "dep:base16ct",
+    "dep:rustix",
+    "dep:serde_json",
+    "dep:sha2",
+    "dep:vortex-file",
+    "dep:vortex-io",
+    "dep:vortex-session",
+    "vortex-array/serde",
+]
+
 [dependencies]
+async-stream = { workspace = true, optional = true }
 async-trait = { workspace = true }
+base16ct = { workspace = true, optional = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 vortex-array = { workspace = true }
 vortex-buffer = { workspace = true }
 vortex-error = { workspace = true }
+vortex-file = { workspace = true, optional = true }
+vortex-io = { workspace = true, optional = true }
 vortex-scan = { workspace = true }
+vortex-session = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, optional = true }
 
 [dev-dependencies]
 futures = { workspace = true, features = ["executor"] }
 serde_json = { workspace = true }
+tempfile = { workspace = true }
+vortex-array = { workspace = true, features = ["_test-harness"] }
+vortex-edition = { workspace = true }
+vortex-layout = { workspace = true }
 
 [lints]
 workspace = true

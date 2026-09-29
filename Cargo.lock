@@ -10239,15 +10239,25 @@ dependencies = [
 name = "vortex-index"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "async-trait",
+ "base16ct",
  "bytes",
  "futures",
+ "rustix",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "vortex-array",
  "vortex-buffer",
+ "vortex-edition",
  "vortex-error",
+ "vortex-file",
+ "vortex-io",
+ "vortex-layout",
  "vortex-scan",
+ "vortex-session",
 ]
 
 [[package]]

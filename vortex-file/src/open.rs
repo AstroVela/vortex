@@ -65,6 +65,8 @@ pub struct VortexOpenOptions {
     file_size: Option<u64>,
     /// An optional, externally provided, DType.
     dtype: Option<DType>,
+    /// A DType to use only when neither an override nor an embedded DType exists.
+    fallback_dtype: Option<DType>,
     /// An optional, externally provided, file layout.
     footer: Option<Footer>,
     /// Whether to include user-defined metadata segments when opening the file.
@@ -89,6 +91,7 @@ pub trait OpenOptionsSessionExt:
             initial_read_size: INITIAL_READ_SIZE,
             file_size: None,
             dtype: None,
+            fallback_dtype: None,
             footer: None,
             include_metadata: false,
             metrics_registry: None,
@@ -167,9 +170,20 @@ impl VortexOpenOptions {
     ///
     /// If this is provided, then the Vortex file may be opened with fewer I/O requests.
     ///
-    /// For Vortex files that do not contain a `DType`, this is required.
+    /// This overrides any embedded dtype. To prefer an embedded dtype and use
+    /// the supplied one only when absent, use [`Self::with_fallback_dtype`].
     pub fn with_dtype(mut self, dtype: DType) -> Self {
         self.dtype = Some(dtype);
+        self
+    }
+
+    /// Supply a dtype only for files written without an embedded dtype.
+    ///
+    /// Embedded dtypes remain authoritative, including parse errors. Callers
+    /// requiring a particular schema must still compare the opened file's dtype.
+    /// Explicit [`Self::with_dtype`] and [`Self::with_footer`] take precedence.
+    pub fn with_fallback_dtype(mut self, dtype: DType) -> Self {
+        self.fallback_dtype = Some(dtype);
         self
     }
 
@@ -369,6 +383,9 @@ impl VortexOpenOptions {
         let mut deserializer = Footer::deserializer(initial_read, self.session.clone())
             .with_size(file_size)
             .with_some_dtype(self.dtype.clone());
+        if let Some(dtype) = &self.fallback_dtype {
+            deserializer = deserializer.with_fallback_dtype(dtype.clone());
+        }
 
         let footer = loop {
             match deserializer.deserialize()? {
@@ -504,11 +521,14 @@ mod tests {
     use futures::future::BoxFuture;
     use parking_lot::Mutex;
     use vortex_array::IntoArray;
+    use vortex_array::VortexSessionExecute;
+    use vortex_array::assert_arrays_eq;
     use vortex_array::buffer::BufferHandle;
     use vortex_array::memory::DefaultHostAllocator;
     use vortex_array::memory::HostAllocator;
     use vortex_array::memory::MemorySessionExt;
     use vortex_array::memory::WritableHostBuffer;
+    use vortex_array::stream::ArrayStreamExt;
     use vortex_buffer::Alignment;
     use vortex_buffer::Buffer;
     use vortex_buffer::ByteBuffer;
@@ -530,6 +550,61 @@ mod tests {
         crate::register_default_encodings(&session);
         crate::enable_all_registered_array_encodings(&session);
         session
+    }
+
+    #[rstest::rstest]
+    #[case::embedded(true)]
+    #[case::external(false)]
+    #[tokio::test]
+    async fn test_fallback_dtype_buffer_and_read(#[case] embedded: bool) -> VortexResult<()> {
+        let session = test_session();
+        let array = Buffer::from(vec![1_u32, 2, 3]).into_array();
+        let dtype = array.dtype().clone();
+        let other_dtype = DType::Bool(vortex_array::dtype::Nullability::NonNullable);
+        let options = session.write_options();
+        let options = if embedded {
+            options
+        } else {
+            options.exclude_dtype()
+        };
+        let mut bytes = Vec::new();
+        options
+            .write(&mut bytes, array.clone().to_array_stream())
+            .await?;
+        let bytes = ByteBuffer::from(bytes);
+        let fallback = if embedded {
+            other_dtype.clone()
+        } else {
+            dtype.clone()
+        };
+        let options = session.open_options().with_fallback_dtype(fallback);
+
+        let buffered = options.clone().open_buffer(bytes.clone())?;
+        let streamed = options.open_read(bytes.clone()).await?;
+        let mut ctx = session.create_execution_ctx();
+        for file in [buffered, streamed] {
+            assert_eq!(file.dtype(), &dtype);
+            let actual = file.scan()?.into_array_stream()?.read_all().await?;
+            assert_arrays_eq!(actual, array, &mut ctx);
+        }
+
+        // Preserve explicit-override semantics regardless of builder call order.
+        for options in [
+            session
+                .open_options()
+                .with_dtype(dtype.clone())
+                .with_fallback_dtype(other_dtype.clone()),
+            session
+                .open_options()
+                .with_fallback_dtype(other_dtype)
+                .with_dtype(dtype.clone()),
+        ] {
+            assert_eq!(options.open_buffer(bytes.clone())?.dtype(), &dtype);
+        }
+        if !embedded {
+            assert!(session.open_options().open_buffer(bytes).is_err());
+        }
+        Ok(())
     }
 
     #[derive(Clone)]

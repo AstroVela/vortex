@@ -39,7 +39,8 @@
 //! Supplying known metadata can reduce open-time IO:
 //!
 //! - [`VortexOpenOptions::with_file_size`] avoids a size request.
-//! - [`VortexOpenOptions::with_dtype`] is required for files written without an embedded dtype.
+//! - [`VortexOpenOptions::with_dtype`] supplies a known dtype, overriding any embedded dtype.
+//! - [`VortexOpenOptions::with_fallback_dtype`] supplies a dtype only when one is not embedded.
 //! - [`VortexOpenOptions::with_footer`] can open a file without reading footer bytes.
 //! - [`VortexOpenOptions::with_segment_cache`] reuses segment buffers across scans.
 //!
