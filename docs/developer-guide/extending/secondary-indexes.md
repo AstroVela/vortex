@@ -208,6 +208,46 @@ generations remain immutable; mutation occurs in private state. The prototype
 deliberately does not publish an `insert/delete/flush` trait with unspecified
 recovery semantics.
 
+### Implemented local generation store
+
+The independent `vortex-index/local-store` feature provides Unix
+`store::LocalIndexStore`. It implements immutable local artifacts, not catalog
+publication or native backend file access.
+
+1. `create` exclusively allocates a new generation under an existing durable,
+   absolute, symlink-free root. There is no reopen-for-write or name reuse.
+2. `write` accepts portable relative artifact paths. It creates files without
+   clobbering, syncs file bytes and directory entries, and records size/SHA-256
+   identities. All traversal uses directory descriptors and no-follow opens;
+   special-file reads are nonblocking and rejected after descriptor validation.
+3. `seal` requires the exact successful artifact inventory and rechecks its
+   contents. It syncs a pending manifest, atomically hard-links it into its final
+   name without replacement, removes the pending link, and syncs the directory.
+   The handle then rejects writes. IO failures invalidate the writer.
+4. The catalog may publish the returned `LocalGeneration` with its expected
+   snapshot through its own transaction. No latest pointer is written by the
+   store. An error after manifest installation can leave a complete but
+   unreferenced generation; the store does not automatically adopt or delete it.
+5. `open` verifies the manifest against the trusted descriptor, checks metadata
+   generation and exact snapshot identity, and streams verification of every
+   artifact. Reads validate inventory membership and recheck bytes before
+   returning them. A changed file is an error, never a new implicit version.
+
+IO is blocking, including async trait methods, and belongs on a blocking worker.
+Explicit limits apply to each artifact and manifest, not total memory. The root
+and its children must be owner-managed: this is not protection against a
+same-user process moving directories or rewriting files. Returned bytes are
+pinned; a mutable file descriptor alone is not. Local filesystem sync and
+atomic hard-link semantics are required. Network storage and power-loss recovery
+are not qualified, and cleanup requires a later reader-safe reclamation policy.
+
+A test-only persistent Flat provider covers independent builder and reader
+processes, multiple source files, exact/filter search, and ranked row retrieval.
+Storage tests cover corruption, missing objects, limits, path escape/symlinks,
+FIFOs, concurrent creation/writes, interrupted manifests, injected write/sync
+boundary failures and a builder killed before seal. This does not turn the
+in-memory `FlatIndex` into a supported persistent or production backend.
+
 ## Delivery plan
 
 1. **Implemented foundation:** draft contracts and metadata validation; registry;
@@ -216,9 +256,11 @@ recovery semantics.
    vectors, is not persistent, and is not a production query path.
 2. **Vortex/SPFresh end-to-end:** the optional, memory-pinned local file source is
    implemented, including file scan / Flat search / ranked row retrieval tests.
-   Next implement a generation store, port the separately tested native bridge
-   into an optional backend, persist native-ID mappings, then validate
-   build/open/search/take across multiple files.
+   The local generation store now supports durable immutable artifacts and
+   trusted manifest reopening, exercised across processes by a test-only
+   reference backend. Next add constrained native artifact access, port the
+   separately tested native bridge into an optional backend, persist native-ID
+   mappings, then qualify SPFresh build/open/search/take across multiple files.
    First qualify local storage and immutable checkpoints. Fix native PIC and
    dependency isolation before qualifying shared-extension packaging.
 3. **Engine integration:** add common SQL entrypoints through `vortex-duckdb`,

@@ -16,6 +16,7 @@ publish = false
 
 [features]
 default = []
+local-store = ["dep:base16ct", "dep:parking_lot", "dep:rustix", "dep:serde_json", "dep:sha2"]
 file = [
     "dep:async-stream",
     "dep:base16ct",
@@ -34,6 +35,7 @@ async-trait = { workspace = true }
 base16ct = { workspace = true, optional = true }
 bytes = { workspace = true }
 futures = { workspace = true }
+parking_lot = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
