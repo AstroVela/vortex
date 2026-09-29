@@ -74,6 +74,8 @@ use crate::bundle::ROWS;
 use crate::ffi::Native;
 use crate::import_bundle;
 
+mod builder;
+
 const BUDGET: usize = 64 * 1024 * 1024;
 const LIMITS: LocalStoreLimits = LocalStoreLimits {
     max_artifact_bytes: BUDGET,

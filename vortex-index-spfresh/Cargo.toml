@@ -1,6 +1,6 @@
 [package]
 name = "vortex-index-spfresh"
-description = "Experimental read-only SPFresh backend for Vortex indexes"
+description = "Experimental static SPFresh backend for Vortex indexes"
 authors.workspace = true
 categories.workspace = true
 edition.workspace = true
@@ -15,16 +15,20 @@ publish = false
 
 [features]
 default = []
-native = ["dep:base16ct", "dep:cc", "dep:sha2"]
+native = ["dep:base16ct", "dep:cc", "dep:sha2", "dep:futures", "dep:tempfile", "dep:vortex-array", "dep:vortex-session"]
 
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true
+futures = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+tempfile = { workspace = true, optional = true }
+vortex-array = { workspace = true, optional = true }
 vortex-buffer.workspace = true
 vortex-error.workspace = true
 vortex-index.workspace = true
+vortex-session = { workspace = true, optional = true }
 
 [build-dependencies]
 base16ct = { workspace = true, features = ["alloc"], optional = true }

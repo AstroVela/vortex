@@ -3,8 +3,9 @@
 :::{warning}
 This is an experimental design and interface prototype on AstroVela's Vane
 development branch. It is not a stable API, a new Vortex file-format feature,
-or an index-enabled SQL release. A read-only SPFresh provider is available behind
-an explicit native feature; persistent catalog and SQL integration remain future work.
+or an index-enabled SQL release. Immutable SPFresh readers and an opt-in static
+initial builder are available behind an explicit native feature; persistent
+catalog and SQL integration remain future work.
 :::
 
 ## Scope and ownership
@@ -21,7 +22,7 @@ the earlier `vendor/vortex-index` prototype.
 | Component | Responsibility |
 |---|---|
 | `vortex-index` | Common metadata, registry, source/storage traits, scalar/vector query contracts, reference implementation |
-| `vortex-index-spfresh` | Optional read-only native bridge, pinned SPFresh format, ID mapping, backend capabilities |
+| `vortex-index-spfresh` | Optional static native builder and immutable readers, pinned SPFresh format, ID mapping, backend capabilities |
 | `vortex-duckdb` in this monorepo | SQL binding, query planning, permission checks, result conversion |
 | External `duckdb-vortex` repository | Extension composition, build/package configuration, pinned dependency revisions |
 | Source/table adapter | Snapshot identity, visibility, catalog publication, conflict detection, cleanup |
@@ -317,8 +318,12 @@ adapter, not SPFresh format compatibility or native search correctness.
    opens verified leased copies, and implements unfiltered ANN search/batch.
    Real native tests cover C ABI parity, Flat recall, multi-file retrieval,
    independent processes and concurrent reader lifetimes. The pinned native
-   build checks PIC by linking a shared bridge. Public initial build, dynamic
-   updates, SPDK and shared DuckDB extension packaging remain unimplemented.
+   build checks PIC by linking a shared bridge. `SpFreshIndexBuilder` now supports
+   bounded in-memory initial construction from a pinned `IndexSource`, preserving
+   physical row addresses and validating native coverage before import. It is
+   explicitly attached to a provider; the owner still seals and publishes the
+   generation. Only non-nullable Float32/L2 static construction is supported;
+   dynamic updates, SPDK and shared DuckDB extension packaging remain unimplemented.
 3. **Engine integration:** add common SQL entrypoints through `vortex-duckdb`,
    leave current SPFresh SQL names as compatibility adapters, and update the
    external extension's pinned Vortex revision. Do not duplicate index logic in

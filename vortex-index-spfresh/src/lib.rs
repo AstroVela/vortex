@@ -19,6 +19,14 @@ pub const SPFRESH_ID: &str = "spfresh.static";
 pub const SPFRESH_FORMAT_VERSION: u32 = 1;
 
 #[cfg(feature = "native")]
+mod builder;
+#[cfg(feature = "native")]
+pub use builder::SpFreshBuildLimits;
+#[cfg(feature = "native")]
+pub use builder::SpFreshBuildOptions;
+#[cfg(feature = "native")]
+pub use builder::SpFreshIndexBuilder;
+#[cfg(feature = "native")]
 mod ffi;
 #[cfg(feature = "native")]
 mod provider;
