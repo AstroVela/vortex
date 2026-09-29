@@ -10262,6 +10262,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "vortex-index-spfresh"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base16ct",
+ "bytes",
+ "cc",
+ "futures",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "vortex-array",
+ "vortex-buffer",
+ "vortex-edition",
+ "vortex-error",
+ "vortex-file",
+ "vortex-index",
+ "vortex-io",
+ "vortex-layout",
+ "vortex-session",
+]
+
+[[package]]
 name = "vortex-io"
 version = "0.1.0"
 dependencies = [

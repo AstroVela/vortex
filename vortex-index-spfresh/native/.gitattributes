@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright the Vortex contributors
+# Unified diff context must retain upstream whitespace verbatim.
+*.patch whitespace=-blank-at-eol,-blank-at-eof

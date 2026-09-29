@@ -51,3 +51,46 @@ jobs:
 
       - name: Run index Clippy (all targets, all features)
         run: cargo clippy --locked -p vortex-index --all-targets --all-features -- -D warnings
+
+      - name: Test backend without native dependencies
+        run: cargo test --locked -p vortex-index-spfresh --no-default-features
+
+  spfresh:
+    name: SPFresh (real native, Linux x86_64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      - uses: ./.github/actions/setup-rust
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          key: vortex-index-spfresh-native-v1
+          cache-on-failure: true
+
+      - name: Install native build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes cmake g++ libzstd-dev libclang-dev pkg-config
+          echo "BINDGEN_EXTRA_CLANG_ARGS=-isystem $(gcc -print-file-name=include)" >> "$GITHUB_ENV"
+
+      # No restored native binaries: compile the pinned source and explicit patch,
+      # link a shared bridge to prove PIC, and build the real fixture generator.
+      - name: Build pinned SPFresh
+        run: |
+          bash vortex-index-spfresh/native/build.sh
+          echo "VORTEX_SPFRESH_NATIVE=$PWD/target/spfresh-native/build" >> "$GITHUB_ENV"
+
+      - name: Native parity, persistence and lifetime tests
+        run: cargo test --locked -p vortex-index-spfresh --all-features
+
+      - name: Repeat native lifetime tests
+        run: |
+          for iteration in 1 2 3 4 5; do
+            cargo test --locked -p vortex-index-spfresh --all-features test_concurrent_handles_repeat_and_lease_lifetime
+          done
+
+      - name: Native Clippy
+        run: cargo clippy --locked -p vortex-index-spfresh --all-targets --all-features -- -D warnings

@@ -90,7 +90,8 @@ jobs:
       - name: Rust Tests
         if: ${{ matrix.suite == 'tests' }}
         run: |
-          cargo nextest run --locked --workspace --all-features --no-fail-fast --exclude vortex-python-cuda
+          # SPFresh native dependencies are built and tested in vortex-index.yml.
+          cargo nextest run --locked --workspace --all-features --no-fail-fast --exclude vortex-python-cuda --exclude vortex-index-spfresh
       - name: Generate coverage report
         run: |
           RUST_SYSROOT="$(rustc --print sysroot)"

@@ -220,7 +220,8 @@ jobs:
           # including all private docs.
           cargo doc --profile ci --no-deps --document-private-items --workspace --exclude vortex-python --exclude vortex-python-cuda
           # nextest doesn't support doc tests, so we run it here
-          cargo test --profile ci --doc --workspace --all-features --exclude vortex-jni --exclude vortex-ffi --exclude xtask --exclude vortex-python-cuda --no-fail-fast
+          # SPFresh native is qualified separately in vortex-index.yml.
+          cargo test --profile ci --doc --workspace --all-features --exclude vortex-jni --exclude vortex-ffi --exclude xtask --exclude vortex-python-cuda --exclude vortex-index-spfresh --no-fail-fast
 
   build-rust:
     name: "Rust build (${{matrix.config.name}})"
@@ -316,15 +317,15 @@ jobs:
       - name: Rustc check
         id: check
         continue-on-error: true
-        run: RUSTFLAGS="-D warnings" cargo check --profile ci --locked --all-features --all-targets
+        run: RUSTFLAGS="-D warnings" cargo check --profile ci --locked --workspace --exclude vortex-index-spfresh --all-features --all-targets
       - name: Rustc check (release)
         id: check-release
         continue-on-error: true
-        run: RUSTFLAGS="-D warnings" cargo check --locked --all-features --all-targets --release
+        run: RUSTFLAGS="-D warnings" cargo check --locked --workspace --exclude vortex-index-spfresh --all-features --all-targets --release
       - name: Rust Lint - Clippy All Features
         id: clippy-all
         continue-on-error: true
-        run: cargo clippy --profile ci --locked --all-features --all-targets -- -D warnings
+        run: cargo clippy --profile ci --locked --workspace --exclude vortex-index-spfresh --all-features --all-targets -- -D warnings
       - name: Rust Lint - Clippy Default Features
         id: clippy-default
         continue-on-error: true
@@ -422,7 +423,7 @@ jobs:
             --exclude duckdb-bench `
             --exclude lance-bench --exclude datafusion-bench --exclude random-access-bench `
             --exclude compress-bench --exclude xtask --exclude vortex-datafusion `
-            --exclude gpu-scan-cli --exclude vortex-sqllogictest
+            --exclude gpu-scan-cli --exclude vortex-sqllogictest --exclude vortex-index-spfresh
 
       - name: sccache stats
         if: always() && github.repository == 'vortex-data/vortex'
@@ -452,10 +453,10 @@ jobs:
           enable-sccache: "true"
       - name: Rust Tests
         run: |
-          cargo nextest run --cargo-profile ci --locked --workspace --all-features --no-fail-fast --exclude vortex-bench --exclude xtask --exclude vortex-sqllogictest
+          cargo nextest run --cargo-profile ci --locked --workspace --all-features --no-fail-fast --exclude vortex-bench --exclude xtask --exclude vortex-sqllogictest --exclude vortex-index-spfresh
       - uses: ./.github/actions/check-rebuild
         with:
-          command: "cargo test --profile ci --locked --workspace --all-features --no-run --exclude vortex-bench --exclude xtask --exclude vortex-sqllogictest"
+          command: "cargo test --profile ci --locked --workspace --all-features --no-run --exclude vortex-bench --exclude xtask --exclude vortex-sqllogictest --exclude vortex-index-spfresh"
 
       - name: Alert incident.io
         if: failure() && github.event_name == 'push' && github.ref == 'refs/heads/develop'
