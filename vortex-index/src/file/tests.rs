@@ -134,6 +134,35 @@ async fn write_file(
     })
 }
 
+fn test_session(handle: Handle) -> VortexResult<VortexSession> {
+    let session = array_session()
+        .with::<LayoutSession>()
+        .with::<RuntimeSession>()
+        .with_handle(handle);
+    vortex_file::register_default_encodings(&session);
+    let edition = EditionId::new("index-test", 2026, 7, 0);
+    let editions = session.editions();
+    editions
+        .declare_edition(Edition {
+            id: edition,
+            min_vortex_version: None,
+        })
+        .map_err(|err| vortex_err!("{}", err))?;
+    let encodings = session
+        .arrays()
+        .registry()
+        .read(|map| map.keys().copied().collect::<Vec<_>>());
+    for encoding in encodings {
+        editions
+            .declare_inclusion(EditionInclusion::new(&encoding, edition))
+            .map_err(|err| vortex_err!("{}", err))?;
+    }
+    session
+        .enable_edition(edition)
+        .map_err(|err| vortex_err!("{}", err))?;
+    Ok(session)
+}
+
 struct Fixture {
     dir: TempDir,
     snapshot: Snapshot,
@@ -143,31 +172,7 @@ struct Fixture {
 
 impl Fixture {
     async fn new(handle: Handle) -> VortexResult<Self> {
-        let session = array_session()
-            .with::<LayoutSession>()
-            .with::<RuntimeSession>()
-            .with_handle(handle);
-        vortex_file::register_default_encodings(&session);
-        let edition = EditionId::new("index-test", 2026, 7, 0);
-        let editions = session.editions();
-        editions
-            .declare_edition(Edition {
-                id: edition,
-                min_vortex_version: None,
-            })
-            .map_err(|err| vortex_err!("{}", err))?;
-        let encodings = session
-            .arrays()
-            .registry()
-            .read(|map| map.keys().copied().collect::<Vec<_>>());
-        for encoding in encodings {
-            editions
-                .declare_inclusion(EditionInclusion::new(&encoding, edition))
-                .map_err(|err| vortex_err!("{}", err))?;
-        }
-        session
-            .enable_edition(edition)
-            .map_err(|err| vortex_err!("{}", err))?;
+        let session = test_session(handle)?;
         let dir = tempfile::tempdir()?;
         let first = data(&[10, 11, 12, 13, 14])?.into_array();
         let dtype = first.dtype().clone();
@@ -198,6 +203,9 @@ impl Fixture {
         .await
     }
 }
+
+#[cfg(all(unix, feature = "local-store"))]
+mod persistence;
 
 fn assert_error<T>(result: VortexResult<T>, message: &str) -> VortexResult<()> {
     let err = result

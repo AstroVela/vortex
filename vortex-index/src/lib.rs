@@ -18,6 +18,8 @@ mod flat;
 mod metadata;
 mod query;
 mod registry;
+#[cfg(all(unix, feature = "local-store"))]
+pub mod store;
 mod traits;
 
 pub use flat::FlatIndex;
