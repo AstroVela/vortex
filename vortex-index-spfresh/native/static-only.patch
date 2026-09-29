@@ -1,3 +1,36 @@
+diff --git a/AnnService/inc/Core/Common/CommonUtils.h b/AnnService/inc/Core/Common/CommonUtils.h
+index 755994c..7c5f630 100644
+--- a/AnnService/inc/Core/Common/CommonUtils.h
++++ b/AnnService/inc/Core/Common/CommonUtils.h
+@@ -32,22 +32,13 @@ namespace SPTAG
+ 
+             static inline float atomic_float_add(volatile float* ptr, const float operand)
+             {
+-                union {
+-                    volatile long iOld;
+-                    float fOld;
+-                };
+-                union {
+-                    long iNew;
+-                    float fNew;
+-                };
+-
+-                while (true) {
+-                    iOld = *(volatile long *)ptr;
+-                    fNew = fOld + operand;
+-                    if (InterlockedCompareExchange((long *)ptr, iNew, iOld) == iOld) {
+-                        return fNew;
+-                    }
++                float result;
++#pragma omp atomic capture
++                {
++                    *ptr += operand;
++                    result = *ptr;
+                 }
++                return result;
+             }
+ 
+             template<typename T>
 diff --git a/AnnService/inc/Core/Common/Dataset.h b/AnnService/inc/Core/Common/Dataset.h
 index 915205a..0f02ef0 100644
 --- a/AnnService/inc/Core/Common/Dataset.h

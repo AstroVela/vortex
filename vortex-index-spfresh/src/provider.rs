@@ -15,6 +15,7 @@ use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 use vortex_index::DistanceMetric;
 use vortex_index::Index;
+use vortex_index::IndexBuilder;
 use vortex_index::IndexMetadata;
 use vortex_index::IndexProvider;
 use vortex_index::IndexStore;
@@ -31,6 +32,7 @@ use crate::SPFRESH_FORMAT_VERSION;
 use crate::SPFRESH_ID;
 use crate::SPFRESH_REVISION;
 use crate::SpFreshBundle;
+use crate::SpFreshIndexBuilder;
 use crate::bundle::DESCRIPTOR;
 use crate::bundle::Descriptor;
 use crate::bundle::NATIVE_FILES;
@@ -69,12 +71,14 @@ impl Default for SpFreshLimits {
 /// Requires the `native` feature and a local-file-capable sealed store. Call open
 /// and search on a blocking worker; async signatures do not make native IO async.
 /// All native operations in this bridge are serialized across handles, and native
-/// thread-local workspaces are cleared at call boundaries. No builder or mutation
-/// capability is advertised. The owner must qualify recall for its workload.
+/// thread-local workspaces are cleared at call boundaries. Initial construction
+/// is opt-in via [`Self::with_builder`]; opened indexes have no mutation capability.
+/// The owner must qualify recall for its workload.
 #[derive(Debug)]
 pub struct SpFreshProvider {
     scratch_root: PathBuf,
     limits: SpFreshLimits,
+    builder: Option<SpFreshIndexBuilder>,
 }
 
 impl SpFreshProvider {
@@ -94,7 +98,14 @@ impl SpFreshProvider {
         Ok(Self {
             scratch_root,
             limits,
+            builder: None,
         })
+    }
+
+    /// Advertise an explicitly configured, initial-build-only capability.
+    pub fn with_builder(mut self, builder: SpFreshIndexBuilder) -> Self {
+        self.builder = Some(builder);
+        self
     }
 }
 
@@ -105,6 +116,12 @@ impl IndexProvider for SpFreshProvider {
     }
     fn supports_version(&self, version: u32) -> bool {
         version == SPFRESH_FORMAT_VERSION
+    }
+
+    fn builder(&self) -> Option<&dyn IndexBuilder> {
+        self.builder
+            .as_ref()
+            .map(|builder| builder as &dyn IndexBuilder)
     }
 
     async fn open(

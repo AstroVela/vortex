@@ -32,6 +32,7 @@ elif ! diff -u "$here/static-only.patch" <(git -C "$source" diff HEAD --binary);
 fi
 cmake -S "$here" -B "$root/build" -DSPFRESH_SOURCE="$source" -DCMAKE_BUILD_TYPE=Release
 cmake --build "$root/build" --parallel "${CMAKE_BUILD_PARALLEL_LEVEL:-2}"
+ctest --test-dir "$root/build" --output-on-failure
 for stamp in revision patch-sha256 source zstd-library; do
     cp "$root/build/$stamp.expected" "$root/build/$stamp.txt"
 done

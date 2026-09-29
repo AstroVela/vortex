@@ -1,7 +1,8 @@
 # SPFresh Index Provider
 
-Experimental read-only backend for `vortex-index`. This is not a SQL integration,
-an online SPFresh writer, or a stable portable native file format.
+Experimental static backend for `vortex-index`, with immutable readers and an
+opt-in initial builder. This is not a SQL integration, an online SPFresh writer,
+or a stable portable native file format.
 
 ## Build
 
@@ -25,7 +26,10 @@ native sources. The patch disables dynamic/SPDK/RocksDB branches and the externa
 delete-map load, makes NUMA optional, and fixes destruction of uninitialized
 datasets. It selects upstream's checked synchronous posting reader (the AIO
 completion path ignores read errors) and makes query-result ownership exception
-safe. SIMD intrinsics have per-function ISA targets; dispatch checks CPU and OS
+safe. Float atomic accumulation during construction uses a correctly sized
+OpenMP operation rather than a platform-dependent `long` cast; an ordinary native
+test checks neighboring data and concurrent increments. SIMD intrinsics have
+per-function ISA targets; dispatch checks CPU and OS
 support without applying AVX flags to baseline code. No SPDK memory shim,
 RocksDB, TBB, Boost or git submodules are needed.
 The upstream MIT notice is in `native/SPFresh.LICENSE`.
@@ -79,7 +83,55 @@ Mapping validation takes O(rows log rows) time and O(rows) memory.
 The owner calls `LocalIndexStore::seal`, retains its trusted `LocalGeneration`,
 and opens the backend successfully before catalog publication. Import alone
 does not open/qualify native binaries, seal or publish anything. It is usable
-without the native feature. The provider deliberately has no builder.
+without the native feature. Providers advertise no builder unless explicitly
+configured with `SpFreshProvider::with_builder`.
+
+## Initial Static Build
+
+`SpFreshIndexBuilder::try_new(scratch_root, session, limits)` implements the common
+`IndexBuilder` trait. It requires the `native` feature, an existing absolute
+symlink-free scratch directory, a session supporting the source encodings, and a
+local-file-capable private store. The supplied metadata must match the source's
+pinned snapshot, declare one top-level vector field, and have no artifacts.
+
+Serialize `SpFreshBuildOptions` into `IndexBuildRequest.backend_options`. All
+fields are required; unknown fields and versions fail:
+
+```json
+{"format_version":1,"dimension":8,"head_count":64,"posting_page_limit":12,"replicas":4}
+```
+
+This version accepts at least 64 covered rows, 32 <= head_count < rows,
+1 <= dimension <= 4096, 1 <= posting_page_limit <= 4096 and 1 <= replicas <= 8.
+It uses random head selection, BKT heads, one static posting file and fixed
+single-threaded native construction. The metric is always squared L2. Source
+batches must be non-nullable structs projecting exactly the requested field as
+non-nullable FixedSizeList<Float32>, with no non-finite components. Nullable
+schemas are rejected even if their current values are all valid.
+
+The builder scans only the requested files, checks row/data alignment and full
+physical coverage, and preserves scan order in the dense native-ID mapping.
+Missing/deleted/duplicate rows are errors, not silently renumbered exclusions.
+It constructs in a fresh private scratch directory, closes native writers,
+validates native structure and coverage, and reopens the native index before
+importing the closed files. If posting truncation loses any source row, the build
+fails; increase head_count or posting_page_limit and retry in a fresh generation.
+
+Successful build returns durable artifact metadata, **not** a sealed store or a
+published index. The owner calls `LocalIndexStore::seal`, opens through the
+provider, and publishes only against the expected snapshot. Scan/native failures
+do not import artifacts. Failed imports can leave unreferenced partial artifacts;
+retry in a fresh generation without overwriting existing files. Scratch is
+removed on success, ordinary errors and cancellation between scan batches;
+process-crash cleanup belongs to the owner.
+
+The first builder buffers vectors and the row map in memory. Default limits are
+1,000,000 rows, 256 MiB of flattened Float32 input, and 1 GiB of the six native
+output files. Output size is checked after construction, before validation/import.
+These are **not** native RSS or temporary-disk quotas; source batch execution,
+head graphs, replica selection, temporary files and metadata need additional
+resources. The builder is not out-of-core. Native build is synchronous, cannot
+be interrupted by dropping an async future mid-call, and serializes with searches.
 
 ## Open, Search And Lifetime
 
@@ -140,6 +192,9 @@ results, check recall against FlatIndex, and use ranked addresses to retrieve
 rows from two Vortex files. They exercise independent build/read processes after
 deleting original native inputs, multiple handles with changing probe counts,
 lease cleanup, checksum corruption and semantic corruption with valid checksums.
-CI runs these tests and all-target Clippy after the pinned native build.
+Initial-builder tests cover actual multi-file Vortex input, Flat recall, ranked
+take, independent build/read processes, invalid source/options, byte limits and
+real multipage postings from 30,000 eight-dimensional vectors. CI runs these
+ordinary tests and all-target Clippy after the pinned native build.
 This is correctness qualification, not a large-scale latency/recall benchmark
 or NVMe/SPDK qualification.

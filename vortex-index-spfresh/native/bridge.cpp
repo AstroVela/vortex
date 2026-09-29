@@ -67,6 +67,84 @@ int boundary(char *error, F &&function) noexcept {
 }
 } // namespace
 
+extern "C" int vortex_spfresh_build(const char *root,
+                                    const float *vectors,
+                                    uint32_t dimension,
+                                    uint32_t rows,
+                                    uint32_t heads,
+                                    uint32_t posting_pages,
+                                    uint32_t replicas,
+                                    char *error) {
+    return boundary(error, [&] {
+        const uint64_t components = static_cast<uint64_t>(dimension) * rows;
+        if (vectors == nullptr || dimension == 0 || dimension > 4096 || rows < 64 || rows > INT32_MAX ||
+            heads < 32 || heads >= rows || posting_pages == 0 || posting_pages > 4096 || replicas == 0 ||
+            replicas > 8 || components * sizeof(float) > INT32_MAX) {
+            throw std::runtime_error("Invalid SPFresh static build options");
+        }
+        for (uint64_t component = 0; component < components; ++component) {
+            if (!std::isfinite(vectors[component])) {
+                throw std::runtime_error("Non-finite build vector component");
+            }
+        }
+        const std::filesystem::path directory(root);
+        if (!directory.is_absolute() || !std::filesystem::create_directory(directory)) {
+            throw std::runtime_error("SPFresh build requires a new absolute directory");
+        }
+        {
+            SPTAG::SPANN::Index<float> index;
+            const auto set = [&](const char *section, const char *name, const std::string &value) {
+                check(index.SetParameter(name, value.c_str(), section), name);
+            };
+            set("Base", "IndexAlgoType", "BKT");
+            set("Base", "ValueType", "Float");
+            set("Base", "DistCalcMethod", "L2");
+            set("Base", "IndexDirectory", directory.string());
+            set("Base", "HeadVectorIDs", "head_ids.bin");
+            set("Base", "SSDIndex", "postings.bin");
+            set("Base", "SSDIndexFileNum", "1");
+            set("Base", "DataBlockSize", "1024");
+            set("Base", "DataCapacity", std::to_string(rows));
+            set("SelectHead", "isExecute", "true");
+            set("SelectHead", "SelectHeadType", "Random");
+            set("SelectHead", "Count", std::to_string(heads));
+            set("SelectHead", "NumberOfThreads", "1");
+            set("BuildHead", "isExecute", "true");
+            set("BuildHead", "DistCalcMethod", "L2");
+            set("BuildHead", "NumberOfThreads", "1");
+            set("BuildHead", "BKTKmeansK", "4");
+            set("BuildHead", "TPTNumber", "4");
+            set("BuildHead", "TPTLeafSize", "32");
+            set("BuildHead", "NeighborhoodSize", "16");
+            set("BuildHead", "RefineIterations", "2");
+            set("BuildHead", "DataBlockSize", "1024");
+            set("BuildHead", "DataCapacity", std::to_string(rows));
+            set("BuildSSDIndex", "isExecute", "true");
+            set("BuildSSDIndex", "BuildSsdIndex", "true");
+            set("BuildSSDIndex", "NumberOfThreads", "1");
+            set("BuildSSDIndex", "IOThreadsPerHandler", "1");
+            set("BuildSSDIndex", "UseKV", "false");
+            set("BuildSSDIndex", "UseSPDK", "false");
+            set("BuildSSDIndex", "ExcludeHead", "true");
+            set("BuildSSDIndex", "EnableDataCompression", "false");
+            set("BuildSSDIndex", "EnableDeltaEncoding", "false");
+            set("BuildSSDIndex", "EnablePostingListRearrange", "false");
+            set("BuildSSDIndex", "OutputEmptyReplicaID", "false");
+            set("BuildSSDIndex", "PostingPageLimit", std::to_string(posting_pages));
+            set("BuildSSDIndex", "SearchPostingPageLimit", std::to_string(posting_pages));
+            set("BuildSSDIndex", "ReplicaCount", std::to_string(replicas));
+            set("BuildSSDIndex", "InternalResultNum", "32");
+            set("BuildSSDIndex", "SearchInternalResultNum", "32");
+            set("BuildSSDIndex", "TmpDir", directory.string());
+            // The synchronous L2 build borrows the immutable input without normalization.
+            check(index.BuildIndex(vectors, rows, dimension, false, true), "BuildIndex");
+        }
+        for (const auto *name : {"vectors.bin", "tree.bin", "graph.bin", "deletes.bin"}) {
+            std::filesystem::rename(directory / "HeadIndex" / name, directory / name);
+        }
+    });
+}
+
 extern "C" int vortex_spfresh_open(const char *root,
                                    uint32_t dimension,
                                    uint32_t rows,

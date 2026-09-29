@@ -39,6 +39,11 @@ target_link_options(vortex_spfresh_pic_check PRIVATE -Wl,--no-undefined)
 add_executable(spfresh_fixture fixture.cpp)
 target_link_libraries(spfresh_fixture PRIVATE spfresh_core)
 
+enable_testing()
+add_executable(spfresh_native_tests tests.cpp)
+target_link_libraries(spfresh_native_tests PRIVATE spfresh_core)
+add_test(NAME spfresh_native_tests COMMAND spfresh_native_tests)
+
 file(WRITE "${CMAKE_BINARY_DIR}/revision.expected" "5893eb61ee3b18610b6b00f1939be7dae1af8904\n")
 file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/static-only.patch" patch_hash)
 file(WRITE "${CMAKE_BINARY_DIR}/patch-sha256.expected" "${patch_hash}\n")

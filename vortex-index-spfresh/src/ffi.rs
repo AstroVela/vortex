@@ -14,9 +14,20 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 
+use crate::SpFreshBuildOptions;
 use crate::SpFreshBundle;
 
 unsafe extern "C" {
+    fn vortex_spfresh_build(
+        root: *const c_char,
+        vectors: *const f32,
+        dimension: u32,
+        rows: u32,
+        heads: u32,
+        posting_pages: u32,
+        replicas: u32,
+        error: *mut c_char,
+    ) -> i32;
     fn vortex_spfresh_open(
         root: *const c_char,
         dimension: u32,
@@ -66,6 +77,40 @@ fn result(code: i32, error: &[u8; 1024]) -> VortexResult<()> {
 }
 
 impl Native {
+    pub(crate) fn build(
+        root: &Path,
+        vectors: &[f32],
+        bundle: SpFreshBundle,
+        options: &SpFreshBuildOptions,
+    ) -> VortexResult<()> {
+        bundle.validate()?;
+        options.validate(bundle.rows)?;
+        if options.dimension != bundle.dimension
+            || options.posting_page_limit != bundle.posting_page_limit
+            || (bundle.rows as usize).checked_mul(bundle.dimension as usize) != Some(vectors.len())
+        {
+            vortex_bail!("Invalid native build vector shape");
+        }
+        let path = CString::new(root.as_os_str().as_bytes()).map_err(|err| vortex_err!("{err}"))?;
+        let mut error = [0u8; 1024];
+        // SAFETY: dimensions match the live input slice. The synchronous, serialized
+        // L2 build borrows but never mutates or retains it. Scratch is private and
+        // the error buffer is 1024 bytes; the bridge catches native exceptions.
+        let code = unsafe {
+            vortex_spfresh_build(
+                path.as_ptr(),
+                vectors.as_ptr(),
+                bundle.dimension,
+                bundle.rows,
+                options.head_count,
+                options.posting_page_limit,
+                options.replicas,
+                error.as_mut_ptr().cast(),
+            )
+        };
+        result(code, &error)
+    }
+
     pub(crate) fn open(root: &Path, bundle: SpFreshBundle) -> VortexResult<Self> {
         bundle.validate()?;
         let path = CString::new(root.as_os_str().as_bytes()).map_err(|err| vortex_err!("{err}"))?;

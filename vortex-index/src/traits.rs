@@ -227,10 +227,11 @@ pub struct IndexBuildRequest {
 /// Optional initial-build capability. Incremental mutation is deliberately separate.
 #[async_trait]
 pub trait IndexBuilder: Send + Sync {
-    /// Build durable artifacts from the pinned source and return sealed metadata.
+    /// Build durable artifacts from the pinned source and return complete artifact metadata.
     ///
     /// Validate metadata against the source before reading. A successful return is
-    /// not a catalog commit; the owner must compare-and-swap the expected snapshot.
+    /// not a store seal or catalog commit; the owner must seal its generation and
+    /// compare-and-swap the expected snapshot before publication.
     /// A failure may leave unreferenced artifacts but must not change reader visibility.
     async fn build(
         &self,

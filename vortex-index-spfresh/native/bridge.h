@@ -9,6 +9,15 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+// Build into a new, private directory. Input remains live and immutable until return.
+int vortex_spfresh_build(const char *root,
+                         const float *vectors,
+                         uint32_t dimension,
+                         uint32_t rows,
+                         uint32_t heads,
+                         uint32_t posting_pages,
+                         uint32_t replicas,
+                         char *error);
 int vortex_spfresh_open(const char *root,
                         uint32_t dimension,
                         uint32_t rows,
