@@ -3,9 +3,10 @@
 :::{warning}
 This is an experimental design and interface prototype on AstroVela's Vane
 development branch. It is not a stable API, a new Vortex file-format feature,
-or an index-enabled SQL release. Immutable SPFresh readers and an opt-in static
-initial builder are available behind an explicit native feature; persistent
-catalog and SQL integration remain future work.
+or a stable index-enabled SQL release. Immutable SPFresh readers and an opt-in
+static initial builder are available behind an explicit native feature. The
+optional DuckDB adapter supports explicit local static-index operations;
+persistent table catalogs and automatic query planning remain future work.
 :::
 
 ## Scope and ownership
@@ -189,7 +190,8 @@ return an error instead of silently returning no rows.
 ## Build, publication and future updates
 
 `IndexBuilder` writes a new private generation from a pinned source and returns
-sealed metadata. It does not publish the descriptor. The catalog owner must:
+complete artifact metadata. It does not seal or publish the descriptor. The
+catalog owner must:
 
 1. Write and durably finalize all generation artifacts.
 2. Validate the inventory, source snapshot and backend metadata.
@@ -324,10 +326,17 @@ adapter, not SPFresh format compatibility or native search correctness.
    explicitly attached to a provider; the owner still seals and publishes the
    generation. Only non-nullable Float32/L2 static construction is supported;
    dynamic updates, SPDK and shared DuckDB extension packaging remain unimplemented.
-3. **Engine integration:** add common SQL entrypoints through `vortex-duckdb`,
-   leave current SPFresh SQL names as compatibility adapters, and update the
-   external extension's pinned Vortex revision. Do not duplicate index logic in
-   C++ SQL binding code. Existing Vane branches remain unchanged until this step.
+3. **Engine integration:** `vortex-duckdb/index` provides explicit static
+   `vortex_index_build` and `vortex_index_search` functions. The owner supplies
+   provider factories; common SQL code has no native backend dependency.
+   Construction seals and qualifies a reader before exclusively publishing a
+   reference containing the exact source schema/snapshot and manifest identity.
+   Queries require full coverage, recheck source/artifact identity, and use
+   ordered `take` to return original rows with ANN distances. Nullable vector
+   schema markers are accepted only after checking actual NULLs. External
+   `duckdb-vortex` composes the SPFresh provider and native build behind an
+   explicit feature. Automatic planning, filtered ANN, mutable table catalogs,
+   handle caching and distributed index execution remain follow-up work.
 4. **Lifecycle and distribution:** qualify partial coverage across snapshots,
    updates, crash recovery, compaction and reader-safe reclamation before Ray
    execution. Workers reopen by immutable descriptor, never serialized native

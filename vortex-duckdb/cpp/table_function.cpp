@@ -33,6 +33,9 @@
 #endif
 
 using namespace std::string_literals;
+#ifdef VORTEX_INDEX
+void RegisterVortexIndexFunctions(duckdb::DatabaseInstance &db);
+#endif
 constexpr column_t COLUMN_IDENTIFIER_FILE_INDEX = MultiFileReader::COLUMN_IDENTIFIER_FILE_INDEX;
 constexpr column_t COLUMN_IDENTIFIER_FILE_ROW_NUMBER = MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER;
 
@@ -1479,5 +1482,8 @@ extern "C" duckdb_state duckdb_vx_register_table_functions(duckdb_database ffi_d
             }
         }
     }
+#ifdef VORTEX_INDEX
+    RegisterVortexIndexFunctions(db);
+#endif
     return DuckDBSuccess;
 }

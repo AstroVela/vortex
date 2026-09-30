@@ -55,6 +55,28 @@ jobs:
       - name: Test backend without native dependencies
         run: cargo test --locked -p vortex-index-spfresh --no-default-features
 
+  sql-index:
+    name: Index SQL adapter (no native backend)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: ./.github/actions/setup-rust
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          key: vortex-index-sql
+          cache-on-failure: true
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes cmake g++ libclang-dev pkg-config
+          echo "BINDGEN_EXTRA_CLANG_ARGS=-isystem $(gcc -print-file-name=include)" >> "$GITHUB_ENV"
+      - name: Test SQL adapter with persisted reference backend
+        run: cargo test --locked -p vortex-duckdb --features index index::tests
+      - name: SQL adapter Clippy
+        run: cargo clippy --locked -p vortex-duckdb --all-targets --features index -- -D warnings
+
   spfresh:
     name: SPFresh (real native, Linux x86_64)
     runs-on: ubuntu-24.04

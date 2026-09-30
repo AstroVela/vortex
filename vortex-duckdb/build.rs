@@ -570,8 +570,17 @@ fn bindgen_c2rust(crate_dir: &Path, duckdb_include_dir: &Path) {
             exit(1);
         }
     };
-    let out_path = crate_dir.join("src/cpp.rs");
-    if let Err(e) = fs::write(&out_path, bindings.to_string()) {
+    let (out_path, bindings) = if vane_enabled(duckdb_include_dir) {
+        // Vane and ordinary DuckDB can build from one checkout without
+        // replacing the engine-specific bindings used by another build.
+        (
+            PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("vane_cpp.rs"),
+            format!("#[allow(rustdoc::all)]\nmod cpp {{\n{bindings}\n}}\n"),
+        )
+    } else {
+        (crate_dir.join("src/cpp.rs"), bindings.to_string())
+    };
+    if let Err(e) = fs::write(&out_path, bindings) {
         println!("cargo:error=Failed to write Rust bindings: {e}");
         exit(1);
     }
@@ -598,6 +607,14 @@ fn compile_cpp(duckdb_include_dir: &Path) {
         .files(SOURCE_FILES);
     if vane_enabled(duckdb_include_dir) {
         build.define("VORTEX_VANE_DISTRIBUTED", "1");
+    }
+    if env::var_os("CARGO_FEATURE_INDEX").is_some()
+        && env::var("CARGO_CFG_TARGET_FAMILY").is_ok_and(|family| family == "unix")
+    {
+        build.define("VORTEX_INDEX", "1");
+        build.define("VORTEX_INDEX_UNIX", "1");
+        build.file("cpp/index.cpp");
+        println!("cargo:rerun-if-changed=cpp/index.cpp");
     }
     build.compile("vortex-duckdb-extras");
     for e in SOURCE_FILES {

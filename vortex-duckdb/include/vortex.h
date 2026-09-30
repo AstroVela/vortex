@@ -194,6 +194,35 @@ void duckdb_copy_function_copy_to_sink(const void *bind_data,
 
 extern void duckdb_copy_function_copy_to_finalize(void *global_data, duckdb_vx_error *error_out);
 
+#if (defined(VORTEX_INDEX) && defined(VORTEX_INDEX_UNIX))
+extern
+void *vortex_index_bind(bool build,
+                        const duckdb_value *inputs,
+                        size_t count,
+                        duckdb_logical_type *result_type,
+                        duckdb_vx_error *error);
+#endif
+
+#if (defined(VORTEX_INDEX) && defined(VORTEX_INDEX_UNIX))
+extern void *vortex_index_bind_copy(const void *bind);
+#endif
+
+#if (defined(VORTEX_INDEX) && defined(VORTEX_INDEX_UNIX))
+extern void vortex_index_bind_free(void *bind);
+#endif
+
+#if (defined(VORTEX_INDEX) && defined(VORTEX_INDEX_UNIX))
+extern void *vortex_index_execute(const void *bind, duckdb_vx_error *error);
+#endif
+
+#if (defined(VORTEX_INDEX) && defined(VORTEX_INDEX_UNIX))
+extern bool vortex_index_scan(void *state, duckdb_data_chunk chunk, duckdb_vx_error *error);
+#endif
+
+#if (defined(VORTEX_INDEX) && defined(VORTEX_INDEX_UNIX))
+extern void vortex_index_state_free(void *state);
+#endif
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus

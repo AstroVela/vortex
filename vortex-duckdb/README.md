@@ -107,3 +107,60 @@ loaded.
 
 Change `DUCKDB_VERSION` environment variable value to a preferred hash or commit
 (local build), or change build.rs (for testing in CI).
+
+## Static Index SQL
+
+The optional Unix `index` feature registers `vortex_index_build` and
+`vortex_index_search`. An extension supplies backend factories through
+`index::register_index_provider_factory`; this crate does not link SPFresh.
+The external `duckdb-vortex` extension's `index-spfresh` feature supplies the
+`spfresh.static` provider and its qualified native build.
+
+Construction takes an explicit ordered list of absolute local Vortex paths,
+an absolute reference filename under an existing owner-managed directory,
+a vector field, backend ID, and backend-owned build JSON. Files must share a
+schema and the selected field must contain fixed-size Float32 vectors without
+NULL rows or elements. Nullable schema markers are accepted only after checking
+the actual vectors. File IDs are assigned starting at one in the supplied order.
+
+```sql
+SELECT * FROM vortex_index_build(
+    ['/data/a.vortex', '/data/b.vortex'], '/indexes/embedding.json',
+    'embedding', 'spfresh.static',
+    '{"format_version":1,"dimension":8,"head_count":64,"posting_page_limit":12,"replicas":4}'
+);
+
+SELECT rank, file_id, row_offset, distance, "row".id
+FROM vortex_index_search(
+    '/indexes/embedding.json', [1,2,3,4,5,6,7,8]::FLOAT[], 10
+)
+ORDER BY rank;
+```
+
+Build executes during query initialization, not bind or EXPLAIN. It builds a
+private generation, seals it, verifies a reopened reader, rechecks the source,
+and durably publishes a new reference without replacing an existing name.
+The result contains `reference`, `generation`, and `rows`. Side effects are
+external to DuckDB transactions; rollback does not remove a completed index.
+Failed builds/imports may leave unreferenced generations for owner cleanup.
+
+Search returns ANN candidates with one-based `rank`, physical `file_id` and
+`row_offset`, squared-L2 `distance`, and a `row` struct containing all original
+columns fetched through `IndexSource::take`. Use `ORDER BY rank` for SQL result
+ordering. Optional `backend_options` is passed unchanged to the provider.
+Each execution verifies the reference, source contents, sealed manifest and
+artifacts anew. Source replacement, deletion or corruption fails; prepared
+queries also reject changed reference bytes instead of silently adopting them.
+
+The initial path requires full coverage of a frozen local source, enabled
+external access and a registered provider. SQL WHERE clauses filter returned
+candidates after ANN retrieval; they do not implement filtered top-k. The
+adapter does not rewrite exact SQL distance ordering, reuse native handles,
+support online mutation, or serialize native state to Ray workers.
+Native work runs synchronously on the DuckDB query worker.
+
+Limits are 512 MiB of pinned encoded source bytes, 16 MiB of reference/manifest
+bytes, 1 GiB per artifact, 64 KiB of backend options, at most 4096 input files,
+and `1 <= k <= 10000`. Backend build limits also apply. These are input/object
+budgets, not total RSS or temporary-disk quotas. Reference and index directories
+are owner-managed trusted metadata, and scratch directories are private.
