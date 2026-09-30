@@ -19,6 +19,7 @@ use std::fs::File;
 use std::io::Read;
 use std::io::Write;
 use std::num::NonZeroUsize;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
@@ -314,6 +315,7 @@ async fn build(
     }
     let scratch = tempfile::Builder::new()
         .prefix(".index-scratch-")
+        .permissions(fs::Permissions::from_mode(0o700))
         .tempdir_in(root)?;
     let provider = provider(backend, scratch.path())?;
     let builder = provider
@@ -496,6 +498,7 @@ async fn search(
     }
     let scratch = tempfile::Builder::new()
         .prefix(".index-scratch-")
+        .permissions(fs::Permissions::from_mode(0o700))
         .tempdir_in(root)?;
     let mut registry = IndexRegistry::default();
     registry.register(provider(&metadata.backend, scratch.path())?)?;

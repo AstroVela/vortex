@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 mod prepared;
+mod scratch;
 
 use std::ffi::CStr;
 use std::ffi::CString;
