@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::ffi::c_void;
 use std::num::NonZeroUsize;
@@ -8,6 +9,7 @@ use std::path::PathBuf;
 use std::slice;
 
 use bytes::Bytes;
+use parking_lot::Mutex;
 use vortex::array::IntoArray;
 use vortex::array::RecursiveCanonical;
 use vortex::array::VortexSessionExecute;
@@ -120,11 +122,61 @@ fn bind(build: bool, inputs: &[&ValueRef]) -> VortexResult<Request> {
     }
 }
 
+#[derive(Default)]
+struct ReferencePins(Mutex<BTreeMap<PathBuf, String>>);
+
+impl ReferencePins {
+    fn record(&self, request: &Request) -> VortexResult<()> {
+        if let Request::Search {
+            reference,
+            identity,
+            ..
+        } = request
+        {
+            let mut pins = self.0.lock();
+            let pinned = pins
+                .entry(reference.clone())
+                .or_insert_with(|| identity.clone());
+            if pinned != identity {
+                vortex_bail!("Index reference changed after bind; prepare a new query");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C-unwind" fn vortex_index_pins_new() -> *mut c_void {
+    Box::into_raw(Box::new(ReferencePins::default())).cast()
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C-unwind" fn vortex_index_pins_free(pins: *mut c_void) {
+    // The owning DuckDB dependency frees its pin set after all statement copies.
+    unsafe { drop(Box::from_raw(pins.cast::<ReferencePins>())) };
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C-unwind" fn vortex_index_pins_record(
+    pins: *const c_void,
+    bind: *const c_void,
+    error: *mut cpp::duckdb_vx_error,
+) -> bool {
+    // DuckDB lends the owning dependency and live FunctionData during planning.
+    let pins = unsafe { &*pins.cast::<ReferencePins>() };
+    let request = unsafe { &*bind.cast::<Request>() };
+    try_or(error, || {
+        pins.record(request)?;
+        Ok(true)
+    })
+}
+
 #[unsafe(no_mangle)]
 unsafe extern "C-unwind" fn vortex_index_bind(
     build: bool,
     inputs: *const cpp::duckdb_value,
     count: usize,
+    pins: *const c_void,
     result_type: *mut cpp::duckdb_logical_type,
     error: *mut cpp::duckdb_vx_error,
 ) -> *mut c_void {
@@ -136,6 +188,11 @@ unsafe extern "C-unwind" fn vortex_index_bind(
         .collect::<Vec<_>>();
     try_or_null(error, || {
         let request = bind(build, &inputs)?;
+        if !pins.is_null() {
+            // This dependency belongs to the original prepared statement, not
+            // the new FunctionData constructed by DuckDB's automatic rebind.
+            unsafe { &*pins.cast::<ReferencePins>() }.record(&request)?;
+        }
         let logical_type = LogicalType::try_from(request.result_dtype()?)?;
         unsafe { result_type.write(logical_type.into_ptr()) };
         Ok(Box::into_raw(Box::new(request)).cast())

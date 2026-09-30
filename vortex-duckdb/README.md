@@ -121,7 +121,9 @@ an absolute reference filename under an existing owner-managed directory,
 a vector field, backend ID, and backend-owned build JSON. Files must share a
 schema and the selected field must contain fixed-size Float32 vectors without
 NULL rows or elements. Nullable schema markers are accepted only after checking
-the actual vectors. File IDs are assigned starting at one in the supplied order.
+the actual vectors. Unsupported field types return SQL errors before canonical
+conversion or generation creation, including for empty sources. File IDs are
+assigned starting at one in the supplied order.
 
 ```sql
 SELECT * FROM vortex_index_build(
@@ -151,6 +153,10 @@ ordering. Optional `backend_options` is passed unchanged to the provider.
 Each execution verifies the reference, source contents, sealed manifest and
 artifacts anew. Source replacement, deletion or corruption fails; prepared
 queries also reject changed reference bytes instead of silently adopting them.
+Reference identity is pinned per prepared statement at its first resolved bind
+and survives automatic parameter and catalog rebinding. Query vectors, `k`, and
+backend options may change between executions; each reference path retains its
+first identity. Prepare a new statement to accept a replacement reference.
 
 The initial path requires full coverage of a frozen local source, enabled
 external access and a registered provider. SQL WHERE clauses filter returned

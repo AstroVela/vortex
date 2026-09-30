@@ -220,7 +220,7 @@ impl Request {
                 options,
             } => {
                 if file_version(&read_regular(reference, MAX_REFERENCE_BYTES)?) != *identity {
-                    vortex_bail!("Index reference changed after bind; rebind the query");
+                    vortex_bail!("Index reference changed after bind; prepare a new query");
                 }
                 search(reference, descriptor, query, *k, options.clone()).await
             }
@@ -346,6 +346,13 @@ async fn build(
         });
     }
     let dtype = dtype.ok_or_else(|| vortex_err!("Index construction requires source files"))?;
+    let DType::Struct(fields, _) = &dtype else {
+        vortex_bail!("Index source requires a struct schema");
+    };
+    let vector_dtype = fields
+        .field(field)
+        .ok_or_else(|| vortex_err!("Index vector field does not exist: {field}"))?;
+    validate_vector_dtype(&vector_dtype)?;
     let snapshot = Snapshot {
         dataset_id: reference.to_string_lossy().into_owned(),
         version: file_version(
@@ -570,6 +577,17 @@ struct BuildSource {
     field: String,
 }
 
+fn validate_vector_dtype(dtype: &DType) -> VortexResult<()> {
+    if !matches!(
+        dtype,
+        DType::FixedSizeList(element, 1..=4096, _)
+            if matches!(element.as_ref(), DType::Primitive(PType::F32, _))
+    ) {
+        vortex_bail!("Index vectors require fixed-size Float32 arrays with dimension 1..=4096");
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl IndexSource for BuildSource {
     fn snapshot(&self) -> &Snapshot {
@@ -591,6 +609,7 @@ impl IndexSource for BuildSource {
             move |batch| {
                 let batch = batch?;
                 let data = batch.data.execute::<StructArray>(&mut ctx)?;
+                validate_vector_dtype(data.unmasked_field(0).dtype())?;
                 let lists = data
                     .unmasked_field(0)
                     .clone()

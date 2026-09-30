@@ -13,11 +13,34 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/execution/operator/scan/physical_table_scan.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/client_context_state.hpp"
+#include "duckdb/main/connection_manager.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/main/prepared_statement_data.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/expression/star_expression.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
+#include "duckdb/parser/parsed_data/create_view_info.hpp"
+#include "duckdb/parser/query_node/recursive_cte_node.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/query_node/set_operation_node.hpp"
+#include "duckdb/parser/statement/call_statement.hpp"
+#include "duckdb/parser/statement/copy_statement.hpp"
+#include "duckdb/parser/statement/create_statement.hpp"
+#include "duckdb/parser/statement/delete_statement.hpp"
+#include "duckdb/parser/statement/explain_statement.hpp"
+#include "duckdb/parser/statement/insert_statement.hpp"
+#include "duckdb/parser/statement/merge_into_statement.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/statement/update_statement.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
+#include "duckdb/planner/extension_callback.hpp"
 
 using namespace duckdb;
 
@@ -71,6 +94,159 @@ struct IndexBind final : FunctionData {
     void *request;
 };
 
+const char *const PIN_DEPENDENCY = "vortex_index_reference_pins";
+
+struct ReferencePins final : DependencyItem {
+    ReferencePins() : pins(vortex_index_pins_new()) {
+    }
+    ~ReferencePins() override {
+        vortex_index_pins_free(pins);
+    }
+    void Remember(const PhysicalOperator &op) {
+        if (op.type == PhysicalOperatorType::TABLE_SCAN) {
+            auto &scan = op.Cast<PhysicalTableScan>();
+            if (scan.function.name == "vortex_index_search") {
+                duckdb_vx_error error = nullptr;
+                vortex_index_pins_record(pins, scan.bind_data->Cast<IndexBind>().request, &error);
+                CheckError(error);
+            }
+        }
+        for (auto &child : op.GetChildren()) {
+            Remember(child.get());
+        }
+    }
+    void *pins;
+};
+
+optional_ptr<TableRef> PinAnchor(QueryNode &node) {
+    switch (node.type) {
+    case QueryNodeType::SELECT_NODE:
+        return node.Cast<SelectNode>().from_table.get();
+    case QueryNodeType::SET_OPERATION_NODE:
+        return PinAnchor(*node.Cast<SetOperationNode>().children.front());
+    case QueryNodeType::RECURSIVE_CTE_NODE:
+        return PinAnchor(*node.Cast<RecursiveCTENode>().left);
+    default:
+        return nullptr;
+    }
+}
+
+optional_ptr<TableRef> PinAnchor(unique_ptr<SQLStatement> &statement) {
+    if (statement->type == StatementType::CALL_STATEMENT) {
+        auto &function = statement->Cast<CallStatement>().function;
+        if (function->GetExpressionClass() != ExpressionClass::FUNCTION ||
+            !StringUtil::CIEquals(function->Cast<FunctionExpression>().function_name,
+                                  "vortex_index_search")) {
+            return nullptr;
+        }
+        // Match DuckDB's CALL-to-SELECT rewrite so the unbound statement has a
+        // dependency owner even when parameters prevent an initial bind.
+        auto select = make_uniq<SelectStatement>();
+        auto node = make_uniq<SelectNode>();
+        auto table = make_uniq<TableFunctionRef>();
+        table->function = std::move(function);
+        node->from_table = std::move(table);
+        node->select_list.push_back(make_uniq<StarExpression>());
+        select->node = std::move(node);
+        select->named_param_map = statement->named_param_map;
+        select->query = statement->query;
+        select->stmt_location = statement->stmt_location;
+        select->stmt_length = statement->stmt_length;
+        statement = std::move(select);
+    }
+    switch (statement->type) {
+    case StatementType::SELECT_STATEMENT:
+        return PinAnchor(*statement->Cast<SelectStatement>().node);
+    case StatementType::INSERT_STATEMENT: {
+        auto &select = statement->Cast<InsertStatement>().select_statement;
+        return select ? PinAnchor(*select->node) : nullptr;
+    }
+    case StatementType::COPY_STATEMENT: {
+        auto &select = statement->Cast<CopyStatement>().info->select_statement;
+        return select ? PinAnchor(*select) : nullptr;
+    }
+    case StatementType::DELETE_STATEMENT:
+        return statement->Cast<DeleteStatement>().table.get();
+    case StatementType::UPDATE_STATEMENT:
+        return statement->Cast<UpdateStatement>().table.get();
+    case StatementType::MERGE_INTO_STATEMENT:
+        return statement->Cast<MergeIntoStatement>().target.get();
+    case StatementType::EXPLAIN_STATEMENT:
+        return PinAnchor(statement->Cast<ExplainStatement>().stmt);
+    case StatementType::CREATE_STATEMENT: {
+        auto &info = *statement->Cast<CreateStatement>().info;
+        if (info.type == CatalogType::TABLE_ENTRY) {
+            auto &query = info.Cast<CreateTableInfo>().query;
+            return query ? PinAnchor(*query->node) : nullptr;
+        }
+        if (info.type == CatalogType::VIEW_ENTRY) {
+            auto &query = info.Cast<CreateViewInfo>().query;
+            return query ? PinAnchor(*query->node) : nullptr;
+        }
+        return nullptr;
+    }
+    default:
+        return nullptr;
+    }
+}
+
+struct IndexPreparedState final : ClientContextState {
+    void Activate(PreparedStatementData &prepared) {
+        active.reset();
+        if (!prepared.unbound_statement) {
+            return;
+        }
+        auto anchor = PinAnchor(prepared.unbound_statement);
+        if (!anchor) {
+            return;
+        }
+        auto &dependencies = anchor->external_dependency;
+        if (!dependencies) {
+            dependencies = make_shared_ptr<ExternalDependency>();
+        }
+        auto existing = dependencies->GetDependency(PIN_DEPENDENCY);
+        if (existing) {
+            active = shared_ptr_cast<DependencyItem, ReferencePins>(existing);
+        } else {
+            active = make_shared_ptr<ReferencePins>();
+            // Literal queries may have bound before this execution callback.
+            if (prepared.physical_plan) {
+                active->Remember(prepared.physical_plan->Root());
+            }
+            dependencies->AddDependency(PIN_DEPENDENCY, active);
+        }
+    }
+    RebindQueryInfo
+    OnExecutePrepared(ClientContext &, PreparedStatementCallbackInfo &info, RebindQueryInfo) override {
+        Activate(info.prepared_statement);
+        return RebindQueryInfo::DO_NOT_REBIND;
+    }
+    RebindQueryInfo OnRebindPreparedStatement(ClientContext &,
+                                              BindPreparedStatementCallbackInfo &info,
+                                              RebindQueryInfo) override {
+        Activate(info.prepared_statement);
+        return RebindQueryInfo::DO_NOT_REBIND;
+    }
+    void QueryEnd() override {
+        active.reset();
+    }
+    shared_ptr<ReferencePins> active;
+};
+
+struct IndexConnectionCallback final : ExtensionCallback {
+    void OnConnectionOpened(ClientContext &context) override {
+        context.registered_state->GetOrCreate<IndexPreparedState>(PIN_DEPENDENCY);
+    }
+};
+
+void RegisterPreparedState(DatabaseInstance &db) {
+    ExtensionCallback::Register(DBConfig::GetConfig(db), make_shared_ptr<IndexConnectionCallback>());
+    // LOAD also needs the callback state on connections that already exist.
+    for (auto &context : ConnectionManager::Get(db).GetConnectionList()) {
+        context->registered_state->GetOrCreate<IndexPreparedState>(PIN_DEPENDENCY);
+    }
+}
+
 struct IndexState final : GlobalTableFunctionState {
     explicit IndexState(void *exporter) : exporter(exporter) {
     }
@@ -101,7 +277,9 @@ unique_ptr<FunctionData> BindIndex(ClientContext &context,
     }
     duckdb_logical_type result_type = nullptr;
     duckdb_vx_error error = nullptr;
-    auto request = vortex_index_bind(build, pointers.data(), pointers.size(), &result_type, &error);
+    auto prepared = context.registered_state->Get<IndexPreparedState>(PIN_DEPENDENCY);
+    auto pins = !build && prepared && prepared->active ? prepared->active->pins : nullptr;
+    auto request = vortex_index_bind(build, pointers.data(), pointers.size(), pins, &result_type, &error);
     CheckError(error);
     auto bind = make_uniq<IndexBind>(request);
     unique_ptr<LogicalType> result(reinterpret_cast<LogicalType *>(result_type));
@@ -151,6 +329,7 @@ vector<TableFunction> Functions() {
 } // namespace
 
 void RegisterVortexIndexFunctions(DatabaseInstance &db) {
+    RegisterPreparedState(db);
     auto &catalog = Catalog::GetSystemCatalog(db);
     auto transaction = CatalogTransaction::GetSystemTransaction(db);
     for (auto &function : Functions()) {
@@ -161,6 +340,7 @@ void RegisterVortexIndexFunctions(DatabaseInstance &db) {
 
 #ifdef VORTEX_VANE_DISTRIBUTED
 void RegisterVortexIndexFunctions(ExtensionLoader &loader) {
+    RegisterPreparedState(loader.GetDatabaseInstance());
     for (auto &function : Functions()) {
         loader.RegisterFunction(function);
     }

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::ffi::CStr;
+use std::ffi::CString;
 use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::process::Command;
@@ -41,8 +43,10 @@ use vortex_index::VectorSpec;
 
 use super::register_index_provider_factory;
 use crate::SESSION;
+use crate::cpp;
 use crate::duckdb::Connection;
 use crate::duckdb::Database;
+use crate::duckdb::QueryResult;
 
 const BACKEND: &str = "sql.flat.fixture";
 
@@ -216,6 +220,62 @@ fn build_sql(root: &Path, files: &[std::path::PathBuf]) -> String {
     )
 }
 
+struct Prepared<'a> {
+    statement: cpp::duckdb_prepared_statement,
+    _connection: &'a Connection,
+}
+
+impl<'a> Prepared<'a> {
+    fn new(connection: &'a Connection, sql: &str) -> VortexResult<Self> {
+        let sql = CString::new(sql).map_err(|error| vortex_err!("{error}"))?;
+        let mut prepared = Self {
+            statement: std::ptr::null_mut(),
+            _connection: connection,
+        };
+        // The live connection outlives this owned C API handle, including errors.
+        let status = unsafe {
+            cpp::duckdb_prepare(
+                connection.as_ptr(),
+                sql.as_ptr(),
+                &raw mut prepared.statement,
+            )
+        };
+        if status != cpp::duckdb_state::DuckDBSuccess {
+            let error = unsafe { cpp::duckdb_prepare_error(prepared.statement) };
+            if error.is_null() {
+                vortex_bail!("Preparing index query failed");
+            }
+            vortex_bail!("{}", unsafe { CStr::from_ptr(error) }.to_string_lossy());
+        }
+        Ok(prepared)
+    }
+
+    fn execute(&self, value: f64) -> VortexResult<QueryResult> {
+        let status = unsafe { cpp::duckdb_bind_double(self.statement, 1, value) };
+        if status != cpp::duckdb_state::DuckDBSuccess {
+            vortex_bail!("Binding index query parameter failed");
+        }
+        let mut result: cpp::duckdb_result = unsafe { std::mem::zeroed() };
+        let status = unsafe { cpp::duckdb_execute_prepared(self.statement, &raw mut result) };
+        // QueryResult owns cleanup on both successful and failed execution.
+        let result = unsafe { QueryResult::new(result) };
+        if status != cpp::duckdb_state::DuckDBSuccess {
+            let error = unsafe { cpp::duckdb_result_error(result.as_ptr()) };
+            if error.is_null() {
+                vortex_bail!("Executing prepared index query failed");
+            }
+            vortex_bail!("{}", unsafe { CStr::from_ptr(error) }.to_string_lossy());
+        }
+        Ok(result)
+    }
+}
+
+impl Drop for Prepared<'_> {
+    fn drop(&mut self) {
+        unsafe { cpp::duckdb_destroy_prepare(&raw mut self.statement) };
+    }
+}
+
 #[test]
 fn test_sql_build_reopen_ranked_take_and_no_bind_side_effects() -> VortexResult<()> {
     let root = tempfile::tempdir()?;
@@ -342,6 +402,197 @@ fn test_sql_null_vectors_fail_without_publication_and_external_access_is_checked
         ))
         .is_err()
     );
+    Ok(())
+}
+
+#[test]
+fn test_sql_invalid_vector_types_return_errors_without_aborting() -> VortexResult<()> {
+    const CHILD_TYPE: &str = "VORTEX_SQL_INDEX_TEST_VECTOR_TYPE";
+    const CHILD_ROWS: &str = "VORTEX_SQL_INDEX_TEST_VECTOR_ROWS";
+    if let Some(expression) = std::env::var_os(CHILD_TYPE) {
+        let root = tempfile::tempdir()?;
+        let conn = connection()?;
+        let file = root.path().join("invalid.vortex");
+        let rows = std::env::var(CHILD_ROWS).unwrap_or_else(|_| "128".into());
+        conn.query(&format!(
+            "COPY (SELECT {} AS embedding FROM range({rows})) TO {} (FORMAT vortex)",
+            expression.to_string_lossy(),
+            literal(&file)
+        ))?;
+        let entries = std::fs::read_dir(root.path())?.count();
+        let error = conn
+            .query(&build_sql(root.path(), &[file]))
+            .err()
+            .ok_or_else(|| vortex_err!("Invalid vector type accepted"))?;
+        assert!(error.to_string().contains("Float32"), "{error}");
+        assert!(!root.path().join("index.json").exists());
+        assert_eq!(std::fs::read_dir(root.path())?.count(), entries);
+        conn.query("SELECT 1")?;
+        return Ok(());
+    }
+    for expression in [
+        "[1::FLOAT, 2::FLOAT]",
+        "1::FLOAT",
+        "['a', 'b']::VARCHAR[2]",
+        "[true, false]::BOOLEAN[2]",
+        "[1::DOUBLE, 2::DOUBLE]::DOUBLE[2]",
+    ] {
+        for rows in [0, 128] {
+            let child = Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "index::tests::test_sql_invalid_vector_types_return_errors_without_aborting",
+                    "--nocapture",
+                ])
+                .env(CHILD_TYPE, expression)
+                .env(CHILD_ROWS, rows.to_string())
+                .output()?;
+            assert!(
+                child.status.success(),
+                "Vector type {expression} with {rows} rows failed with {}: {}{}",
+                child.status,
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr)
+            );
+        }
+    }
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case::direct("SELECT \"row\".id FROM vortex_index_search({reference}, $1, 1)")]
+#[case::cte(
+    "WITH hits AS (SELECT * FROM vortex_index_search({reference}, $1, 1)) SELECT \"row\".id FROM hits"
+)]
+#[case::scalar_subquery(
+    "SELECT (SELECT \"row\".id FROM vortex_index_search({reference}, $1, 1)) AS id"
+)]
+#[case::union(
+    "SELECT \"row\".id FROM vortex_index_search({reference}, $1, 1) UNION ALL SELECT 999::UBIGINT WHERE false"
+)]
+fn test_sql_parameterized_search_retains_reference_identity(#[case] sql: &str) -> VortexResult<()> {
+    let root = tempfile::tempdir()?;
+    let conn = connection()?;
+    let first = source(&conn, root.path(), "a.vortex", 0, 128)?;
+    let second = source(&conn, root.path(), "b.vortex", 128, 256)?;
+    let reference = root.path().join("index.json");
+    let replacement = root.path().join("replacement.json");
+    conn.query(&build_sql(root.path(), &[first]))?;
+    conn.query(
+        &build_sql(root.path(), &[second]).replace(&literal(&reference), &literal(&replacement)),
+    )?;
+    let query = sql.replace("{reference}", &literal(&reference));
+    conn.query(&format!("PREPARE indexed AS {query}"))?;
+    for _ in 0..2 {
+        let result = conn
+            .query("EXECUTE indexed([7::FLOAT, 0::FLOAT])")?
+            .into_iter()
+            .next()
+            .ok_or_else(|| vortex_err!("Missing parameterized search result"))?;
+        assert_eq!(
+            String::try_from(&*result)?,
+            "Chunk - [1 Columns]\n- FLAT UBIGINT: 1 = [ 7]\n"
+        );
+    }
+    conn.query("EXECUTE indexed([8::FLOAT, 1::FLOAT])")?;
+    let original = std::fs::read(&reference)?;
+    std::fs::write(&reference, std::fs::read(&replacement)?)?;
+    let error = conn
+        .query("EXECUTE indexed([7::FLOAT, 0::FLOAT])")
+        .err()
+        .ok_or_else(|| {
+            vortex_err!("Parameterized search silently accepted a replaced reference")
+        })?;
+    assert!(error.to_string().contains("reference changed"), "{error}");
+    // A separately prepared statement is allowed to accept the new reference.
+    conn.query(&format!("PREPARE refreshed AS {query}"))?;
+    let result = conn
+        .query("EXECUTE refreshed([7::FLOAT, 0::FLOAT])")?
+        .into_iter()
+        .next()
+        .ok_or_else(|| vortex_err!("Missing refreshed search result"))?;
+    assert_eq!(
+        String::try_from(&*result)?,
+        "Chunk - [1 Columns]\n- FLAT UBIGINT: 1 = [ 128]\n"
+    );
+    std::fs::write(&reference, original)?;
+    conn.query("EXECUTE indexed([7::FLOAT, 0::FLOAT])")?;
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case::literal(false)]
+#[case::parameterized(true)]
+fn test_sql_prepared_search_keeps_identity_across_catalog_rebind(
+    #[case] parameterized: bool,
+) -> VortexResult<()> {
+    let root = tempfile::tempdir()?;
+    let conn = connection()?;
+    let file = source(&conn, root.path(), "a.vortex", 0, 128)?;
+    conn.query(&build_sql(root.path(), &[file]))?;
+    let path = root.path().join("index.json");
+    let prepare = if parameterized {
+        format!(
+            "SELECT * FROM vortex_index_search({}, $1, 2)",
+            literal(&path)
+        )
+    } else {
+        format!(
+            "SELECT * FROM vortex_index_search({}, [7::FLOAT, 0::FLOAT], 2)",
+            literal(&path)
+        )
+    };
+    let execute = if parameterized {
+        "EXECUTE indexed([7::FLOAT, 0::FLOAT])"
+    } else {
+        "EXECUTE indexed"
+    };
+    conn.query(&format!("PREPARE indexed AS {prepare}"))?;
+    conn.query(execute)?;
+    let original = std::fs::read(&path)?;
+    let mut changed = original.clone();
+    changed.push(b' ');
+    std::fs::write(&path, changed)?;
+    conn.query("CREATE TABLE trigger_rebind(id INTEGER)")?;
+    let error = conn
+        .query(execute)
+        .err()
+        .ok_or_else(|| vortex_err!("Catalog rebind accepted a changed index reference"))?;
+    assert!(error.to_string().contains("reference changed"), "{error}");
+    std::fs::write(&path, original)?;
+    conn.query(execute)?;
+    conn.query("DEALLOCATE indexed")?;
+    conn.query(&format!("PREPARE indexed AS {prepare}"))?;
+    conn.query(execute)?;
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case::select("SELECT * FROM vortex_index_search({reference}, [$1::FLOAT, 0::FLOAT], 1)")]
+#[case::call("CALL vortex_index_search({reference}, [$1::FLOAT, 0::FLOAT], 1)")]
+fn test_c_api_prepared_search_retains_reference_identity(#[case] sql: &str) -> VortexResult<()> {
+    let root = tempfile::tempdir()?;
+    let conn = connection()?;
+    let file = source(&conn, root.path(), "a.vortex", 0, 128)?;
+    conn.query(&build_sql(root.path(), &[file]))?;
+    let reference = root.path().join("index.json");
+    let query = sql.replace("{reference}", &literal(&reference));
+    let prepared = Prepared::new(&conn, &query)?;
+    assert_eq!(prepared.execute(7.0)?.row_count(), 1);
+    assert_eq!(prepared.execute(8.0)?.row_count(), 1);
+    let original = std::fs::read(&reference)?;
+    let mut changed = original.clone();
+    changed.push(b' ');
+    std::fs::write(&reference, changed)?;
+    let error = prepared
+        .execute(7.0)
+        .err()
+        .ok_or_else(|| vortex_err!("C API prepared search accepted a changed reference"))?;
+    assert!(error.to_string().contains("reference changed"), "{error}");
+    let fresh = Prepared::new(&conn, &query)?;
+    assert_eq!(fresh.execute(7.0)?.row_count(), 1);
+    std::fs::write(&reference, original)?;
+    assert_eq!(prepared.execute(7.0)?.row_count(), 1);
     Ok(())
 }
 
