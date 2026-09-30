@@ -337,3 +337,76 @@ fn test_optimized_out_wrapper_preserves_first_bind(
     assert_eq!(nearest_id(wrapper.run()?)?, 7);
     Ok(())
 }
+
+#[rstest::rstest]
+#[case::sql_prepare(false, false, false)]
+#[case::c_api_destroyed(true, false, false)]
+#[case::c_api_retained(true, true, false)]
+#[case::deallocated_owner(false, false, true)]
+fn test_fresh_parameterized_handle_ignores_destroyed_owners(
+    #[case] c_api_prepare: bool,
+    #[case] retain_preparer: bool,
+    #[case] deallocate: bool,
+) -> VortexResult<()> {
+    let fixture = fixture()?;
+    let conn = &fixture.conn;
+    let original = std::fs::read(&fixture.reference)?;
+    let query = format!(
+        "SELECT \"row\".id FROM vortex_index_search({}, [7::FLOAT, 0::FLOAT], 1)",
+        literal(&fixture.reference)
+    );
+    let prepare = format!("PREPARE old_owner AS {query}");
+    let mut retained = None;
+    if c_api_prepare {
+        let prepared = Prepared::new(conn, &prepare)?;
+        prepared.run()?;
+        if retain_preparer {
+            retained = Some(prepared);
+        }
+    } else {
+        conn.query(&prepare)?;
+    }
+    std::fs::copy(&fixture.replacement, &fixture.reference)?;
+    let fresh = Prepared::new(conn, &query.replace("7::FLOAT", "$1::FLOAT"))?;
+    if deallocate {
+        conn.query("DEALLOCATE old_owner")?;
+    }
+    assert_eq!(nearest_id(fresh.execute(7.0)?)?, 128);
+    if !deallocate {
+        let error = conn
+            .query("EXECUTE old_owner")
+            .err()
+            .ok_or_else(|| vortex_err!("Live SQL owner lost its original identity"))?;
+        assert!(error.to_string().contains("reference changed"), "{error}");
+        std::fs::write(&fixture.reference, original)?;
+        assert_eq!(nearest_id(conn.query("EXECUTE old_owner")?)?, 7);
+        let error = fresh
+            .execute(7.0)
+            .err()
+            .ok_or_else(|| vortex_err!("Fresh handle lost its replacement identity"))?;
+        assert!(error.to_string().contains("reference changed"), "{error}");
+    }
+    drop(retained);
+    Ok(())
+}
+
+#[test]
+fn test_sql_owners_keep_independent_reference_identities() -> VortexResult<()> {
+    let fixture = fixture()?;
+    let conn = &fixture.conn;
+    let query = format!(
+        "SELECT \"row\".id FROM vortex_index_search({}, [$1::FLOAT, 0::FLOAT], 1)",
+        literal(&fixture.reference)
+    );
+    conn.query(&format!("PREPARE old_owner AS {query}"))?;
+    assert_eq!(nearest_id(conn.query("EXECUTE old_owner(7)")?)?, 7);
+    std::fs::copy(&fixture.replacement, &fixture.reference)?;
+    for index in 0..32 {
+        conn.query(&format!("PREPARE fresh_{index} AS {query}"))?;
+        assert_eq!(
+            nearest_id(conn.query(&format!("EXECUTE fresh_{index}(7)"))?)?,
+            128
+        );
+    }
+    Ok(())
+}

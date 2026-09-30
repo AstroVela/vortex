@@ -112,14 +112,22 @@ struct ReferencePins final {
     void *pins;
 };
 
+struct PreparedPinLifetime final {
+    explicit PreparedPinLifetime(shared_ptr<ReferencePins> pins) : pins(std::move(pins)) {
+    }
+    shared_ptr<ReferencePins> pins;
+};
+
 struct PreparedPinOwner final : PhysicalOperator {
-    PreparedPinOwner(PhysicalPlan &plan, const vector<LogicalType> &types, shared_ptr<ReferencePins> pins)
-        : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, types, 0), pins(std::move(pins)) {
+    PreparedPinOwner(PhysicalPlan &plan,
+                     const vector<LogicalType> &types,
+                     shared_ptr<PreparedPinLifetime> lifetime)
+        : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, types, 0), lifetime(std::move(lifetime)) {
     }
     void BuildPipelines(Pipeline &, MetaPipeline &) override {
         throw InternalException("Vortex index reference owner is not an executable plan");
     }
-    shared_ptr<ReferencePins> pins;
+    shared_ptr<PreparedPinLifetime> lifetime;
 };
 
 struct IndexPreparedState final : ClientContextState {
@@ -159,12 +167,15 @@ struct IndexPreparedState final : ClientContextState {
             prepared.physical_plan = make_uniq<PhysicalPlan>(Allocator::Get(context));
             prepared.properties.always_require_rebind = true;
         }
-        auto &owner = prepared.physical_plan->Make<PreparedPinOwner>(prepared.types, pins);
+        // Pins can be shared with an inner SQL owner. Cache validity must track
+        // this handle's plan, not shared pins that survive its destruction.
+        auto lifetime = make_shared_ptr<PreparedPinLifetime>(std::move(pins));
+        auto &owner = prepared.physical_plan->Make<PreparedPinOwner>(prepared.types, lifetime);
         if (needs_rebind) {
             prepared.physical_plan->SetRoot(owner);
         }
         PruneOwners();
-        owners[&prepared] = pins;
+        owners[&prepared] = lifetime;
     }
     void CaptureSqlPrepares(LogicalOperator &op) {
         if (!preparing || !pending) {
@@ -207,8 +218,8 @@ struct IndexPreparedState final : ClientContextState {
         PruneOwners();
         auto owner = owners.find(&prepared);
         if (owner != owners.end()) {
-            if (auto pins = owner->second.lock()) {
-                return pins;
+            if (auto lifetime = owner->second.lock()) {
+                return lifetime->pins;
             }
         }
         auto pins = make_shared_ptr<ReferencePins>();
@@ -281,7 +292,7 @@ struct IndexPreparedState final : ClientContextState {
     vector<SqlPrepareCapture> sql_prepares;
     bool preparing = false;
     bool sql_execute = false;
-    unordered_map<const PreparedStatementData *, weak_ptr<ReferencePins>> owners;
+    unordered_map<const PreparedStatementData *, weak_ptr<PreparedPinLifetime>> owners;
 };
 
 void SavePreparedPins(PlannerExtensionInput &input, BoundStatement &statement) {
