@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+mod prepared;
+
 use std::ffi::CStr;
 use std::ffi::CString;
 use std::os::unix::fs::symlink;
@@ -256,6 +258,10 @@ impl<'a> Prepared<'a> {
         if status != cpp::duckdb_state::DuckDBSuccess {
             vortex_bail!("Binding index query parameter failed");
         }
+        self.run()
+    }
+
+    fn run(&self) -> VortexResult<QueryResult> {
         let mut result: cpp::duckdb_result = unsafe { std::mem::zeroed() };
         let status = unsafe { cpp::duckdb_execute_prepared(self.statement, &raw mut result) };
         // QueryResult owns cleanup on both successful and failed execution.

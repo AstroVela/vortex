@@ -5,7 +5,9 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::ffi::c_void;
 use std::num::NonZeroUsize;
+use std::path::Path;
 use std::path::PathBuf;
+use std::ptr;
 use std::slice;
 
 use bytes::Bytes;
@@ -126,20 +128,23 @@ fn bind(build: bool, inputs: &[&ValueRef]) -> VortexResult<Request> {
 struct ReferencePins(Mutex<BTreeMap<PathBuf, String>>);
 
 impl ReferencePins {
-    fn record(&self, request: &Request) -> VortexResult<()> {
-        if let Request::Search {
-            reference,
-            identity,
-            ..
-        } = request
-        {
-            let mut pins = self.0.lock();
-            let pinned = pins
-                .entry(reference.clone())
-                .or_insert_with(|| identity.clone());
-            if pinned != identity {
+    fn record(mut groups: Vec<&Self>, reference: &Path, identity: &str) -> VortexResult<()> {
+        // A wrapper and its SQL owner can share pins. Deduplicate and lock in
+        // address order, then validate every owner before remembering a new bind.
+        groups.sort_unstable_by_key(|group| ptr::from_ref(*group));
+        groups.dedup_by(|a, b| ptr::eq(*a, *b));
+        let mut guards = groups
+            .iter()
+            .map(|group| group.0.lock())
+            .collect::<Vec<_>>();
+        for pins in &guards {
+            if pins.get(reference).is_some_and(|pinned| pinned != identity) {
                 vortex_bail!("Index reference changed after bind; prepare a new query");
             }
+        }
+        for pins in &mut guards {
+            pins.entry(reference.to_owned())
+                .or_insert_with(|| identity.to_owned());
         }
         Ok(())
     }
@@ -158,15 +163,27 @@ unsafe extern "C-unwind" fn vortex_index_pins_free(pins: *mut c_void) {
 
 #[unsafe(no_mangle)]
 unsafe extern "C-unwind" fn vortex_index_pins_record(
-    pins: *const c_void,
+    groups: *const *const c_void,
+    count: usize,
     bind: *const c_void,
     error: *mut cpp::duckdb_vx_error,
 ) -> bool {
-    // DuckDB lends the prepared plan's pins and live FunctionData during planning.
-    let pins = unsafe { &*pins.cast::<ReferencePins>() };
+    // C++ lends a nonempty slice of live prepared owners and FunctionData for
+    // this synchronous call; no owner or request is freed until it returns.
+    let groups = unsafe { slice::from_raw_parts(groups, count) }
+        .iter()
+        .map(|pins| unsafe { &*pins.cast::<ReferencePins>() })
+        .collect::<Vec<_>>();
     let request = unsafe { &*bind.cast::<Request>() };
     try_or(error, || {
-        pins.record(request)?;
+        if let Request::Search {
+            reference,
+            identity,
+            ..
+        } = request
+        {
+            ReferencePins::record(groups, reference, identity)?;
+        }
         Ok(true)
     })
 }
@@ -176,7 +193,6 @@ unsafe extern "C-unwind" fn vortex_index_bind(
     build: bool,
     inputs: *const cpp::duckdb_value,
     count: usize,
-    pins: *const c_void,
     result_type: *mut cpp::duckdb_logical_type,
     error: *mut cpp::duckdb_vx_error,
 ) -> *mut c_void {
@@ -188,11 +204,6 @@ unsafe extern "C-unwind" fn vortex_index_bind(
         .collect::<Vec<_>>();
     try_or_null(error, || {
         let request = bind(build, &inputs)?;
-        if !pins.is_null() {
-            // These pins belong to the original prepared statement, not
-            // the new FunctionData constructed by DuckDB's automatic rebind.
-            unsafe { &*pins.cast::<ReferencePins>() }.record(&request)?;
-        }
         let logical_type = LogicalType::try_from(request.result_dtype()?)?;
         unsafe { result_type.write(logical_type.into_ptr()) };
         Ok(Box::into_raw(Box::new(request)).cast())
@@ -247,4 +258,35 @@ unsafe extern "C-unwind" fn vortex_index_scan(
 #[unsafe(no_mangle)]
 unsafe extern "C-unwind" fn vortex_index_state_free(state: *mut c_void) {
     unsafe { drop(Box::from_raw(state.cast::<ArrayExporter>())) };
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use vortex::error::VortexResult;
+    use vortex::error::vortex_err;
+
+    use super::ReferencePins;
+
+    #[test]
+    fn test_rejected_bind_does_not_change_any_owner() -> VortexResult<()> {
+        let owner = ReferencePins::default();
+        let empty = ReferencePins::default();
+        let reference = Path::new("index.json");
+        ReferencePins::record(vec![&owner], reference, "original")?;
+        let error = ReferencePins::record(vec![&empty, &owner, &empty], reference, "replacement")
+            .err()
+            .ok_or_else(|| vortex_err!("Changed reference identity was accepted"))?;
+        assert!(error.to_string().contains("reference changed"), "{error}");
+        assert!(empty.0.lock().is_empty());
+        ReferencePins::record(vec![&owner, &empty, &owner], reference, "original")?;
+        for pins in [&owner, &empty] {
+            assert_eq!(
+                pins.0.lock().get(reference).map(String::as_str),
+                Some("original")
+            );
+        }
+        Ok(())
+    }
 }

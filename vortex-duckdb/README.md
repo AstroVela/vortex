@@ -162,6 +162,10 @@ first identity. Prepare a new statement to accept a replacement reference.
 Pins belong to the original prepared handle, including C API prepares of
 `CALL` table macros and `SET VARIABLE` with index subqueries. Binding an
 unexecuted relation's schema does not pin a later independent query.
+Successful and failed C API prepares of `EXECUTE` and `EXPLAIN EXECUTE` release
+their temporary pin borrows when planning ends. Index-bearing EXECUTE wrappers
+capture their own identity even when the SQL owner has a cached plan, and rebind
+before execution rather than reuse a plan borrowed from a deallocated SQL owner.
 
 The initial path requires full coverage of a frozen local source, enabled
 external access and a registered provider. SQL WHERE clauses filter returned

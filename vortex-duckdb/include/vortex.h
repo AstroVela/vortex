@@ -203,7 +203,11 @@ extern void vortex_index_pins_free(void *pins);
 #endif
 
 #if (defined(VORTEX_INDEX) && defined(VORTEX_INDEX_UNIX))
-extern bool vortex_index_pins_record(const void *pins, const void *bind, duckdb_vx_error *error);
+extern
+bool vortex_index_pins_record(const void *const *groups,
+                              size_t count,
+                              const void *bind,
+                              duckdb_vx_error *error);
 #endif
 
 #if (defined(VORTEX_INDEX) && defined(VORTEX_INDEX_UNIX))
@@ -211,7 +215,6 @@ extern
 void *vortex_index_bind(bool build,
                         const duckdb_value *inputs,
                         size_t count,
-                        const void *pins,
                         duckdb_logical_type *result_type,
                         duckdb_vx_error *error);
 #endif

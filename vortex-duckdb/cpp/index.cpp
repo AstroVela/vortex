@@ -82,6 +82,19 @@ struct IndexBind final : FunctionData {
 
 const char *const PIN_DEPENDENCY = "vortex_index_reference_pins";
 
+template <class CALLBACK>
+void VisitIndexRequests(const PhysicalOperator &op, CALLBACK &&callback) {
+    if (op.type == PhysicalOperatorType::TABLE_SCAN) {
+        auto &scan = op.Cast<PhysicalTableScan>();
+        if (scan.function.name == "vortex_index_search") {
+            callback(scan.bind_data->Cast<IndexBind>().request);
+        }
+    }
+    for (auto &child : op.GetChildren()) {
+        VisitIndexRequests(child.get(), callback);
+    }
+}
+
 struct ReferencePins final {
     ReferencePins() : pins(vortex_index_pins_new()) {
     }
@@ -89,17 +102,12 @@ struct ReferencePins final {
         vortex_index_pins_free(pins);
     }
     void Remember(const PhysicalOperator &op) {
-        if (op.type == PhysicalOperatorType::TABLE_SCAN) {
-            auto &scan = op.Cast<PhysicalTableScan>();
-            if (scan.function.name == "vortex_index_search") {
-                duckdb_vx_error error = nullptr;
-                vortex_index_pins_record(pins, scan.bind_data->Cast<IndexBind>().request, &error);
-                CheckError(error);
-            }
-        }
-        for (auto &child : op.GetChildren()) {
-            Remember(child.get());
-        }
+        VisitIndexRequests(op, [this](const void *request) {
+            duckdb_vx_error error = nullptr;
+            const void *groups[] = {pins};
+            vortex_index_pins_record(groups, 1, request, &error);
+            CheckError(error);
+        });
     }
     void *pins;
 };
@@ -118,10 +126,21 @@ struct IndexPreparedState final : ClientContextState {
     bool CanRequestRebind() override {
         // Both supported engines call this before each prepare pass, but not
         // for RelationFromQuery's standalone schema bind.
+        auto owner = std::move(execute_owner);
+        EndPrepare();
+        preparing = true;
+        if (owner) {
+            borrowed.push_back(std::move(owner));
+        }
+        return true;
+    }
+    void EndPrepare() {
+        borrowed.clear();
+        execute_owner.reset();
         pending.reset();
         sql_prepares.clear();
-        preparing = true;
-        return true;
+        sql_execute = false;
+        preparing = false;
     }
     void PruneOwners() {
         for (auto it = owners.begin(); it != owners.end();) {
@@ -148,77 +167,95 @@ struct IndexPreparedState final : ClientContextState {
         owners[&prepared] = pins;
     }
     void CaptureSqlPrepare(shared_ptr<PreparedStatementData> prepared) {
-        if (pending) {
+        if (preparing && pending) {
             // Physical planning can replace SQL PREPARE's inner physical plan.
-            // Hold the capture only until the enclosing prepare pass finalizes.
-            sql_prepares.push_back({std::move(prepared), std::move(pending)});
+            // The enclosing handle also owns the successful bind's identity.
+            sql_prepares.push_back({std::move(prepared), pending});
         }
     }
     RebindQueryInfo OnFinalizePrepare(ClientContext &context,
                                       PreparedStatementData &prepared,
                                       PreparedStatementMode) override {
-        for (auto &capture : sql_prepares) {
+        bool rebind_execute = sql_execute && pending;
+        auto captures = std::move(sql_prepares);
+        auto pins = std::move(pending);
+        EndPrepare();
+        for (auto &capture : captures) {
             Own(context, *capture.prepared, std::move(capture.pins));
         }
-        sql_prepares.clear();
-        if (pending) {
-            Own(context, prepared, std::move(pending));
+        if (pins) {
+            Own(context, prepared, std::move(pins));
         }
-        preparing = false;
+        if (rebind_execute) {
+            // A cached EXECUTE can borrow the SQL owner's physical plan without
+            // retaining it. Rebind the wrapper before using it after DEALLOCATE.
+            prepared.properties.always_require_rebind = true;
+        }
         return RebindQueryInfo::DO_NOT_REBIND;
     }
     RebindQueryInfo OnPlanningError(ClientContext &, SQLStatement &, ErrorData &) override {
-        pending.reset();
-        sql_prepares.clear();
-        preparing = false;
+        EndPrepare();
         return RebindQueryInfo::DO_NOT_REBIND;
     }
-    void Activate(ClientContext &context, PreparedStatementData &prepared) {
-        active.reset();
+    shared_ptr<ReferencePins> PinsFor(ClientContext &context, PreparedStatementData &prepared) {
         PruneOwners();
         auto owner = owners.find(&prepared);
         if (owner != owners.end()) {
-            active = owner->second.lock();
-        }
-        if (!active) {
-            active = make_shared_ptr<ReferencePins>();
-            if (prepared.physical_plan) {
-                active->Remember(prepared.physical_plan->Root());
+            if (auto pins = owner->second.lock()) {
+                return pins;
             }
-            Own(context, prepared, active);
         }
+        auto pins = make_shared_ptr<ReferencePins>();
+        if (prepared.physical_plan) {
+            pins->Remember(prepared.physical_plan->Root());
+        }
+        Own(context, prepared, pins);
+        return pins;
     }
     RebindQueryInfo
     OnExecutePrepared(ClientContext &context, PreparedStatementCallbackInfo &info, RebindQueryInfo) override {
-        Activate(context, info.prepared_statement);
+        // C API execution invokes this before CreatePreparedStatement. Only
+        // the next prepare pass may borrow this owner, never a standalone bind.
+        execute_owner = PinsFor(context, info.prepared_statement);
         return RebindQueryInfo::DO_NOT_REBIND;
     }
     RebindQueryInfo OnRebindPreparedStatement(ClientContext &context,
                                               BindPreparedStatementCallbackInfo &info,
                                               RebindQueryInfo) override {
-        Activate(context, info.prepared_statement);
+        if (preparing) {
+            // Keep both an outer C API wrapper and its inner SQL EXECUTE owner.
+            borrowed.push_back(PinsFor(context, info.prepared_statement));
+            sql_execute = true;
+            if (info.prepared_statement.physical_plan) {
+                // Cached SQL plans need no new table bind, but the enclosing
+                // prepared handle must still capture and validate their pins.
+                VisitIndexRequests(info.prepared_statement.physical_plan->Root(),
+                                   [this](const void *request) { RecordBind(request); });
+            }
+        }
         return RebindQueryInfo::DO_NOT_REBIND;
     }
     void QueryEnd() override {
-        active.reset();
-        pending.reset();
-        sql_prepares.clear();
-        preparing = false;
+        EndPrepare();
         PruneOwners();
     }
-    shared_ptr<ReferencePins> BindPins() {
-        if (active) {
-            return active;
-        }
+    void RecordBind(const void *request) {
         if (!preparing) {
-            return nullptr;
+            return;
         }
         if (!pending) {
             pending = make_shared_ptr<ReferencePins>();
         }
-        return pending;
+        vector<const void *> groups {pending->pins};
+        for (auto &owner : borrowed) {
+            groups.push_back(owner->pins);
+        }
+        duckdb_vx_error error = nullptr;
+        vortex_index_pins_record(groups.data(), groups.size(), request, &error);
+        CheckError(error);
     }
-    shared_ptr<ReferencePins> active;
+    vector<shared_ptr<ReferencePins>> borrowed;
+    shared_ptr<ReferencePins> execute_owner;
     shared_ptr<ReferencePins> pending;
     struct SqlPrepareCapture {
         shared_ptr<PreparedStatementData> prepared;
@@ -226,6 +263,7 @@ struct IndexPreparedState final : ClientContextState {
     };
     vector<SqlPrepareCapture> sql_prepares;
     bool preparing = false;
+    bool sql_execute = false;
     unordered_map<const PreparedStatementData *, weak_ptr<ReferencePins>> owners;
 };
 
@@ -284,16 +322,13 @@ unique_ptr<FunctionData> BindIndex(ClientContext &context,
     duckdb_logical_type result_type = nullptr;
     duckdb_vx_error error = nullptr;
     auto prepared = context.registered_state->Get<IndexPreparedState>(PIN_DEPENDENCY);
-    auto pins = !build && prepared ? prepared->BindPins() : nullptr;
-    auto request = vortex_index_bind(build,
-                                     pointers.data(),
-                                     pointers.size(),
-                                     pins ? pins->pins : nullptr,
-                                     &result_type,
-                                     &error);
+    auto request = vortex_index_bind(build, pointers.data(), pointers.size(), &result_type, &error);
     CheckError(error);
     auto bind = make_uniq<IndexBind>(request);
     unique_ptr<LogicalType> result(reinterpret_cast<LogicalType *>(result_type));
+    if (!build && prepared) {
+        prepared->RecordBind(request);
+    }
     for (auto &child : StructType::GetChildTypes(*result)) {
         names.push_back(child.first);
         types.push_back(child.second);
