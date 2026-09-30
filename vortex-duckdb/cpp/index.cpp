@@ -10,6 +10,7 @@
 #include "vortex.h"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/file_system.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -26,6 +27,26 @@ void CheckAccess(ClientContext &context) {
     Value enabled;
     if (!context.TryGetCurrentSetting("enable_external_access", enabled) || !enabled.GetValue<bool>()) {
         throw PermissionException("Vortex indexes require external access");
+    }
+    // Rust and native backends perform local I/O outside DuckDB's filesystem.
+    if (FileSystem::GetFileSystem(context).SubSystemIsDisabled("LocalFileSystem")) {
+        throw PermissionException("File system LocalFileSystem has been disabled by configuration");
+    }
+}
+
+void CheckStrings(const Value &value) {
+    if (value.IsNull()) {
+        return;
+    }
+    if (value.type().id() == LogicalTypeId::VARCHAR) {
+        // Validate the full VARCHAR before Rust's NUL-terminated C API extraction.
+        if (StringValue::Get(value).find('\0') != string::npos) {
+            throw InvalidInputException("Index string arguments must not contain NUL");
+        }
+    } else if (value.type().id() == LogicalTypeId::LIST) {
+        for (auto &child : ListValue::GetChildren(value)) {
+            CheckStrings(child);
+        }
     }
 }
 
@@ -75,6 +96,7 @@ unique_ptr<FunctionData> BindIndex(ClientContext &context,
     }
     vector<duckdb_value> pointers;
     for (auto &value : values) {
+        CheckStrings(value);
         pointers.push_back(reinterpret_cast<duckdb_value>(&value));
     }
     duckdb_logical_type result_type = nullptr;

@@ -35,9 +35,10 @@ use crate::exporter::ArrayExporter;
 use crate::exporter::ConversionCache;
 
 fn string(value: &ValueRef) -> VortexResult<String> {
+    // The C++ binder rejects NUL in the full VARCHAR before this C API extraction.
     match value.extract() {
-        ExtractedValue::Varchar(value) if !value.contains('\0') => Ok(value.to_string()),
-        _ => vortex_bail!("Index arguments require non-NULL UTF-8 strings without NUL"),
+        ExtractedValue::Varchar(value) => Ok(value.to_string()),
+        _ => vortex_bail!("Index arguments require non-NULL UTF-8 strings"),
     }
 }
 

@@ -346,6 +346,97 @@ fn test_sql_null_vectors_fail_without_publication_and_external_access_is_checked
 }
 
 #[test]
+fn test_sql_respects_disabled_local_filesystem_at_bind_and_execution() -> VortexResult<()> {
+    let root = tempfile::tempdir()?;
+    let conn = connection()?;
+    let file = source(&conn, root.path(), "a.vortex", 0, 128)?;
+    let build = build_sql(root.path(), std::slice::from_ref(&file));
+    conn.query(&build)?;
+    let reference = root.path().join("index.json");
+    let blocked_reference = root.path().join("blocked.json");
+    let blocked_build = build.replace(&literal(&reference), &literal(&blocked_reference));
+    let search = format!(
+        "SELECT * FROM vortex_index_search({}, [1::FLOAT, 0::FLOAT], 2)",
+        literal(&reference)
+    );
+    conn.query(&format!("PREPARE blocked_search AS {search}"))?;
+    conn.query(&format!("PREPARE blocked_build AS {blocked_build}"))?;
+    let entries = std::fs::read_dir(root.path())?.count();
+    conn.query("SET disabled_filesystems = 'LocalFileSystem'")?;
+    for sql in [
+        search.as_str(),
+        blocked_build.as_str(),
+        "EXECUTE blocked_search",
+        "EXECUTE blocked_build",
+    ] {
+        let error = conn
+            .query(sql)
+            .err()
+            .ok_or_else(|| vortex_err!("Disabled local filesystem accepted: {sql}"))?;
+        assert!(error.to_string().contains("LocalFileSystem"), "{error}");
+        assert!(!blocked_reference.exists());
+        assert_eq!(std::fs::read_dir(root.path())?.count(), entries);
+    }
+    let conn = connection()?;
+    conn.query("SET disabled_filesystems = 'PipeFileSystem'")?;
+    conn.query(&search)?;
+    conn.query(&blocked_build)?;
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case::search_reference(0)]
+#[case::search_options(1)]
+#[case::build_source(2)]
+#[case::build_reference(3)]
+#[case::build_field(4)]
+#[case::build_backend(5)]
+#[case::build_options(6)]
+fn test_sql_rejects_nul_in_every_string_argument(#[case] argument: usize) -> VortexResult<()> {
+    let root = tempfile::tempdir()?;
+    let conn = connection()?;
+    let file = source(&conn, root.path(), "a.vortex", 0, 128)?;
+    conn.query(&build_sql(root.path(), std::slice::from_ref(&file)))?;
+    let reference = root.path().join("index.json");
+    let new_reference = root.path().join("new-index.json");
+    let nul = |value: String| format!("{value} || chr(0) || 'missing'");
+    let sql = match argument {
+        0 => format!(
+            "SELECT * FROM vortex_index_search({}, [1::FLOAT, 0::FLOAT], 2)",
+            nul(literal(&reference))
+        ),
+        1 => format!(
+            "SELECT * FROM vortex_index_search({}, [1::FLOAT, 0::FLOAT], 2, backend_options := chr(0) || '{{\"unknown\":1}}')",
+            literal(&reference)
+        ),
+        _ => {
+            let mut inputs = [
+                format!("[{}]", literal(&file)),
+                literal(&new_reference),
+                "'embedding'".into(),
+                format!("'{BACKEND}'"),
+                "'{}'".into(),
+            ];
+            if argument == 2 {
+                inputs[0] = format!("[{}]", nul(literal(&file)));
+            } else {
+                inputs[argument - 2] = nul(inputs[argument - 2].clone());
+            }
+            format!("SELECT * FROM vortex_index_build({})", inputs.join(","))
+        }
+    };
+    let entries = std::fs::read_dir(root.path())?.count();
+    let error = conn
+        .query(&sql)
+        .err()
+        .ok_or_else(|| vortex_err!("NUL argument was accepted: {sql}"))?;
+    assert!(error.to_string().contains("NUL"), "{error}");
+    assert!(!new_reference.exists());
+    assert_eq!(std::fs::read_dir(root.path())?.count(), entries);
+    Ok(())
+}
+
+#[test]
 fn test_sql_cross_process_reopen_interleaved_files_and_multiple_output_chunks() -> VortexResult<()>
 {
     const CHILD_REFERENCE: &str = "VORTEX_SQL_INDEX_TEST_REFERENCE";
