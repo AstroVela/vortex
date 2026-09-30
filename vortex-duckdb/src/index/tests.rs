@@ -46,6 +46,7 @@ use crate::SESSION;
 use crate::cpp;
 use crate::duckdb::Connection;
 use crate::duckdb::Database;
+use crate::duckdb::ExtractedValue;
 use crate::duckdb::QueryResult;
 
 const BACKEND: &str = "sql.flat.fixture";
@@ -273,6 +274,22 @@ impl<'a> Prepared<'a> {
 impl Drop for Prepared<'_> {
     fn drop(&mut self) {
         unsafe { cpp::duckdb_destroy_prepare(&raw mut self.statement) };
+    }
+}
+
+fn nearest_id(result: QueryResult) -> VortexResult<u64> {
+    assert_eq!(result.row_count(), 1);
+    let chunk = result
+        .into_iter()
+        .next()
+        .ok_or_else(|| vortex_err!("Missing nearest-neighbor row"))?;
+    let value = chunk
+        .get_vector(0)
+        .get_value(0, chunk.len())
+        .ok_or_else(|| vortex_err!("Missing nearest-neighbor id"))?;
+    match value.extract() {
+        ExtractedValue::UBigInt(id) => Ok(id),
+        other => vortex_bail!("Unexpected nearest-neighbor id: {other:?}"),
     }
 }
 
@@ -593,6 +610,77 @@ fn test_c_api_prepared_search_retains_reference_identity(#[case] sql: &str) -> V
     assert_eq!(fresh.execute(7.0)?.row_count(), 1);
     std::fs::write(&reference, original)?;
     assert_eq!(prepared.execute(7.0)?.row_count(), 1);
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case::filter(
+    "SELECT \"row\".id FROM vortex_index_search({reference}, [7::FLOAT, 0::FLOAT], 1) WHERE rank >= $1"
+)]
+#[case::limit(
+    "SELECT \"row\".id FROM vortex_index_search({reference}, [7::FLOAT, 0::FLOAT], 1) LIMIT $1"
+)]
+#[case::projection(
+    "SELECT \"row\".id, $1 AS parameter FROM vortex_index_search({reference}, [7::FLOAT, 0::FLOAT], 1)"
+)]
+#[case::cte(
+    "WITH hits AS (SELECT * FROM vortex_index_search({reference}, [7::FLOAT, 0::FLOAT], 1)) SELECT \"row\".id, $1 FROM hits"
+)]
+#[case::scalar_subquery(
+    "SELECT (SELECT \"row\".id FROM vortex_index_search({reference}, [7::FLOAT, 0::FLOAT], 1)), $1"
+)]
+#[case::partially_bound(
+    "SELECT a.\"row\".id FROM vortex_index_search({reference}, [7::FLOAT, 0::FLOAT], 1) a CROSS JOIN vortex_index_search({reference}, [$1::FLOAT, 0::FLOAT], 1) b"
+)]
+fn test_first_execution_retains_initial_bind_identity(
+    #[case] sql: &str,
+    #[values(false, true)] c_api: bool,
+) -> VortexResult<()> {
+    let root = tempfile::tempdir()?;
+    let conn = connection()?;
+    let first = source(&conn, root.path(), "a.vortex", 0, 128)?;
+    let second = source(&conn, root.path(), "b.vortex", 128, 256)?;
+    let reference = root.path().join("index.json");
+    let replacement = root.path().join("replacement.json");
+    conn.query(&build_sql(root.path(), &[first]))?;
+    conn.query(
+        &build_sql(root.path(), &[second]).replace(&literal(&reference), &literal(&replacement)),
+    )?;
+    let query = sql.replace("{reference}", &literal(&reference));
+    let prepared = if c_api {
+        Some(Prepared::new(&conn, &query)?)
+    } else {
+        conn.query(&format!("PREPARE indexed AS {query}"))?;
+        None
+    };
+    let unrelated = Prepared::new(&conn, "SELECT $1")?;
+    let original = std::fs::read(&reference)?;
+    std::fs::write(&reference, std::fs::read(&replacement)?)?;
+    // No execution precedes this replacement: the successful initial bind owns
+    // the identity even if DuckDB discards its plan because of other parameters.
+    let result = match &prepared {
+        Some(prepared) => prepared.execute(1.0),
+        None => conn.query("EXECUTE indexed(1)"),
+    };
+    let error = result
+        .err()
+        .ok_or_else(|| vortex_err!("First execution accepted a replaced index reference"))?;
+    assert!(error.to_string().contains("reference changed"), "{error}");
+    assert_eq!(unrelated.execute(1.0)?.row_count(), 1);
+    // Preparing the same SQL again is independent of the original statement.
+    let fresh = Prepared::new(&conn, &query)?;
+    assert_eq!(nearest_id(fresh.execute(1.0)?)?, 128);
+    std::fs::write(&reference, original)?;
+    let result = match &prepared {
+        Some(prepared) => prepared.execute(1.0)?,
+        None => conn.query("EXECUTE indexed(1)")?,
+    };
+    assert_eq!(nearest_id(result)?, 7);
+    let error = fresh
+        .execute(1.0)
+        .err()
+        .ok_or_else(|| vortex_err!("Independent statement lost its own reference identity"))?;
+    assert!(error.to_string().contains("reference changed"), "{error}");
     Ok(())
 }
 

@@ -9,6 +9,7 @@
 #include "table_function.h"
 #include "vortex.h"
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/common/allocator.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -41,6 +42,8 @@
 #include "duckdb/parser/statement/update_statement.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/planner/extension_callback.hpp"
+#include "duckdb/planner/operator/logical_prepare.hpp"
+#include "duckdb/planner/planner_extension.hpp"
 
 using namespace duckdb;
 
@@ -118,6 +121,16 @@ struct ReferencePins final : DependencyItem {
     void *pins;
 };
 
+struct PreparedPinOwner final : PhysicalOperator {
+    PreparedPinOwner(PhysicalPlan &plan, const vector<LogicalType> &types, shared_ptr<ReferencePins> pins)
+        : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, types, 0), pins(std::move(pins)) {
+    }
+    void BuildPipelines(Pipeline &, MetaPipeline &) override {
+        throw InternalException("Vortex index reference owner is not an executable plan");
+    }
+    shared_ptr<ReferencePins> pins;
+};
+
 optional_ptr<TableRef> PinAnchor(QueryNode &node) {
     switch (node.type) {
     case QueryNodeType::SELECT_NODE:
@@ -191,8 +204,67 @@ optional_ptr<TableRef> PinAnchor(unique_ptr<SQLStatement> &statement) {
 }
 
 struct IndexPreparedState final : ClientContextState {
+    bool CanRequestRebind() override {
+        // DuckDB only invokes OnFinalizePrepare for states with this capability.
+        return true;
+    }
+    void PruneOwners() {
+        for (auto it = owners.begin(); it != owners.end();) {
+            if (it->second.expired()) {
+                it = owners.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    void Save(ClientContext &context, PreparedStatementData &prepared) {
+        if (!pending) {
+            return;
+        }
+        auto pins = std::move(pending);
+        if (prepared.unbound_statement) {
+            auto anchor = PinAnchor(prepared.unbound_statement);
+            if (!anchor) {
+                throw InternalException("Index statement has no reference dependency owner");
+            }
+            if (!anchor->external_dependency) {
+                anchor->external_dependency = make_shared_ptr<ExternalDependency>();
+            }
+            anchor->external_dependency->AddDependency(PIN_DEPENDENCY, std::move(pins));
+        } else {
+            // C API prepare assigns the unbound statement AFTER this callback.
+            // An arena-owned operator keeps the first-bind pins alive even when
+            // DuckDB discarded the query plan. A root owner is never executed.
+            bool needs_rebind = !prepared.physical_plan;
+            if (needs_rebind) {
+                prepared.physical_plan = make_uniq<PhysicalPlan>(Allocator::Get(context));
+                prepared.properties.always_require_rebind = true;
+            }
+            auto &owner = prepared.physical_plan->Make<PreparedPinOwner>(prepared.types, pins);
+            if (needs_rebind) {
+                prepared.physical_plan->SetRoot(owner);
+            }
+            PruneOwners();
+            owners[&prepared] = pins;
+        }
+    }
+    RebindQueryInfo OnFinalizePrepare(ClientContext &context,
+                                      PreparedStatementData &prepared,
+                                      PreparedStatementMode) override {
+        Save(context, prepared);
+        return RebindQueryInfo::DO_NOT_REBIND;
+    }
+    RebindQueryInfo OnPlanningError(ClientContext &, SQLStatement &, ErrorData &) override {
+        pending.reset();
+        return RebindQueryInfo::DO_NOT_REBIND;
+    }
     void Activate(PreparedStatementData &prepared) {
         active.reset();
+        PruneOwners();
+        auto owner = owners.find(&prepared);
+        if (owner != owners.end()) {
+            active = owner->second.lock();
+        }
         if (!prepared.unbound_statement) {
             return;
         }
@@ -208,10 +280,11 @@ struct IndexPreparedState final : ClientContextState {
         if (existing) {
             active = shared_ptr_cast<DependencyItem, ReferencePins>(existing);
         } else {
-            active = make_shared_ptr<ReferencePins>();
-            // Literal queries may have bound before this execution callback.
-            if (prepared.physical_plan) {
-                active->Remember(prepared.physical_plan->Root());
+            if (!active) {
+                active = make_shared_ptr<ReferencePins>();
+                if (prepared.physical_plan) {
+                    active->Remember(prepared.physical_plan->Root());
+                }
             }
             dependencies->AddDependency(PIN_DEPENDENCY, active);
         }
@@ -229,9 +302,31 @@ struct IndexPreparedState final : ClientContextState {
     }
     void QueryEnd() override {
         active.reset();
+        pending.reset();
+        PruneOwners();
+    }
+    shared_ptr<ReferencePins> BindPins() {
+        if (active) {
+            return active;
+        }
+        if (!pending) {
+            pending = make_shared_ptr<ReferencePins>();
+        }
+        return pending;
     }
     shared_ptr<ReferencePins> active;
+    shared_ptr<ReferencePins> pending;
+    unordered_map<const PreparedStatementData *, weak_ptr<ReferencePins>> owners;
 };
+
+void SavePreparedPins(PlannerExtensionInput &input, BoundStatement &statement) {
+    if (statement.plan && statement.plan->type == LogicalOperatorType::LOGICAL_PREPARE) {
+        // SQL PREPARE has its own planner, including partial binds that discarded
+        // the inner plan. Its unbound statement is already available here.
+        auto state = input.context.registered_state->Get<IndexPreparedState>(PIN_DEPENDENCY);
+        state->Save(input.context, *statement.plan->Cast<LogicalPrepare>().prepared);
+    }
+}
 
 struct IndexConnectionCallback final : ExtensionCallback {
     void OnConnectionOpened(ClientContext &context) override {
@@ -241,6 +336,9 @@ struct IndexConnectionCallback final : ExtensionCallback {
 
 void RegisterPreparedState(DatabaseInstance &db) {
     ExtensionCallback::Register(DBConfig::GetConfig(db), make_shared_ptr<IndexConnectionCallback>());
+    PlannerExtension extension;
+    extension.post_bind_function = SavePreparedPins;
+    PlannerExtension::Register(DBConfig::GetConfig(db), std::move(extension));
     // LOAD also needs the callback state on connections that already exist.
     for (auto &context : ConnectionManager::Get(db).GetConnectionList()) {
         context->registered_state->GetOrCreate<IndexPreparedState>(PIN_DEPENDENCY);
@@ -278,8 +376,13 @@ unique_ptr<FunctionData> BindIndex(ClientContext &context,
     duckdb_logical_type result_type = nullptr;
     duckdb_vx_error error = nullptr;
     auto prepared = context.registered_state->Get<IndexPreparedState>(PIN_DEPENDENCY);
-    auto pins = !build && prepared && prepared->active ? prepared->active->pins : nullptr;
-    auto request = vortex_index_bind(build, pointers.data(), pointers.size(), pins, &result_type, &error);
+    auto pins = !build && prepared ? prepared->BindPins() : nullptr;
+    auto request = vortex_index_bind(build,
+                                     pointers.data(),
+                                     pointers.size(),
+                                     pins ? pins->pins : nullptr,
+                                     &result_type,
+                                     &error);
     CheckError(error);
     auto bind = make_uniq<IndexBind>(request);
     unique_ptr<LogicalType> result(reinterpret_cast<LogicalType *>(result_type));

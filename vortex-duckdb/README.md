@@ -154,7 +154,9 @@ Each execution verifies the reference, source contents, sealed manifest and
 artifacts anew. Source replacement, deletion or corruption fails; prepared
 queries also reject changed reference bytes instead of silently adopting them.
 Reference identity is pinned per prepared statement at its first resolved bind
-and survives automatic parameter and catalog rebinding. Query vectors, `k`, and
+and survives automatic parameter and catalog rebinding, including replacement
+before the first execution when WHERE, LIMIT or projection parameters cause
+DuckDB to discard the original query plan. Query vectors, `k`, and
 backend options may change between executions; each reference path retains its
 first identity. Prepare a new statement to accept a replacement reference.
 
