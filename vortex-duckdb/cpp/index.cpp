@@ -166,11 +166,17 @@ struct IndexPreparedState final : ClientContextState {
         PruneOwners();
         owners[&prepared] = pins;
     }
-    void CaptureSqlPrepare(shared_ptr<PreparedStatementData> prepared) {
-        if (preparing && pending) {
+    void CaptureSqlPrepares(LogicalOperator &op) {
+        if (!preparing || !pending) {
+            return;
+        }
+        if (op.type == LogicalOperatorType::LOGICAL_PREPARE) {
             // Physical planning can replace SQL PREPARE's inner physical plan.
             // The enclosing handle also owns the successful bind's identity.
-            sql_prepares.push_back({std::move(prepared), pending});
+            sql_prepares.push_back({op.Cast<LogicalPrepare>().prepared, pending});
+        }
+        for (auto &child : op.children) {
+            CaptureSqlPrepares(*child);
         }
     }
     RebindQueryInfo OnFinalizePrepare(ClientContext &context,
@@ -224,14 +230,10 @@ struct IndexPreparedState final : ClientContextState {
                                               RebindQueryInfo) override {
         if (preparing) {
             // Keep both an outer C API wrapper and its inner SQL EXECUTE owner.
-            borrowed.push_back(PinsFor(context, info.prepared_statement));
+            auto owner = PinsFor(context, info.prepared_statement);
+            InheritPins(*owner);
+            borrowed.push_back(std::move(owner));
             sql_execute = true;
-            if (info.prepared_statement.physical_plan) {
-                // Cached SQL plans need no new table bind, but the enclosing
-                // prepared handle must still capture and validate their pins.
-                VisitIndexRequests(info.prepared_statement.physical_plan->Root(),
-                                   [this](const void *request) { RecordBind(request); });
-            }
         }
         return RebindQueryInfo::DO_NOT_REBIND;
     }
@@ -239,20 +241,35 @@ struct IndexPreparedState final : ClientContextState {
         EndPrepare();
         PruneOwners();
     }
+    vector<const void *> PinGroups(const ReferencePins &capture) {
+        vector<const void *> groups {capture.pins};
+        for (auto &owner : borrowed) {
+            groups.push_back(owner->pins);
+        }
+        return groups;
+    }
+    void InheritPins(const ReferencePins &source) {
+        // An optimized-away scan still has a saved identity. Copy only the
+        // inner owner's pins outward, not unrelated outer pins into the owner.
+        auto capture = pending ? pending : make_shared_ptr<ReferencePins>();
+        auto groups = PinGroups(*capture);
+        duckdb_vx_error error = nullptr;
+        bool inherited = vortex_index_pins_inherit(source.pins, groups.data(), groups.size(), &error);
+        CheckError(error);
+        if (inherited) {
+            pending = std::move(capture);
+        }
+    }
     void RecordBind(const void *request) {
         if (!preparing) {
             return;
         }
-        if (!pending) {
-            pending = make_shared_ptr<ReferencePins>();
-        }
-        vector<const void *> groups {pending->pins};
-        for (auto &owner : borrowed) {
-            groups.push_back(owner->pins);
-        }
+        auto capture = pending ? pending : make_shared_ptr<ReferencePins>();
+        auto groups = PinGroups(*capture);
         duckdb_vx_error error = nullptr;
         vortex_index_pins_record(groups.data(), groups.size(), request, &error);
         CheckError(error);
+        pending = std::move(capture);
     }
     vector<shared_ptr<ReferencePins>> borrowed;
     shared_ptr<ReferencePins> execute_owner;
@@ -268,9 +285,9 @@ struct IndexPreparedState final : ClientContextState {
 };
 
 void SavePreparedPins(PlannerExtensionInput &input, BoundStatement &statement) {
-    if (statement.plan && statement.plan->type == LogicalOperatorType::LOGICAL_PREPARE) {
+    if (statement.plan) {
         auto state = input.context.registered_state->Get<IndexPreparedState>(PIN_DEPENDENCY);
-        state->CaptureSqlPrepare(statement.plan->Cast<LogicalPrepare>().prepared);
+        state->CaptureSqlPrepares(*statement.plan);
     }
 }
 

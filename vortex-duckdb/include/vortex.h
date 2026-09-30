@@ -212,6 +212,14 @@ bool vortex_index_pins_record(const void *const *groups,
 
 #if (defined(VORTEX_INDEX) && defined(VORTEX_INDEX_UNIX))
 extern
+bool vortex_index_pins_inherit(const void *source,
+                               const void *const *groups,
+                               size_t count,
+                               duckdb_vx_error *error);
+#endif
+
+#if (defined(VORTEX_INDEX) && defined(VORTEX_INDEX_UNIX))
+extern
 void *vortex_index_bind(bool build,
                         const duckdb_value *inputs,
                         size_t count,

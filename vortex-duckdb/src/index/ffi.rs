@@ -128,7 +128,7 @@ fn bind(build: bool, inputs: &[&ValueRef]) -> VortexResult<Request> {
 struct ReferencePins(Mutex<BTreeMap<PathBuf, String>>);
 
 impl ReferencePins {
-    fn record(mut groups: Vec<&Self>, reference: &Path, identity: &str) -> VortexResult<()> {
+    fn record(mut groups: Vec<&Self>, references: &[(&Path, &str)]) -> VortexResult<()> {
         // A wrapper and its SQL owner can share pins. Deduplicate and lock in
         // address order, then validate every owner before remembering a new bind.
         groups.sort_unstable_by_key(|group| ptr::from_ref(*group));
@@ -138,15 +138,34 @@ impl ReferencePins {
             .map(|group| group.0.lock())
             .collect::<Vec<_>>();
         for pins in &guards {
-            if pins.get(reference).is_some_and(|pinned| pinned != identity) {
-                vortex_bail!("Index reference changed after bind; prepare a new query");
+            for &(reference, identity) in references {
+                if pins.get(reference).is_some_and(|pinned| pinned != identity) {
+                    vortex_bail!("Index reference changed after bind; prepare a new query");
+                }
             }
         }
         for pins in &mut guards {
-            pins.entry(reference.to_owned())
-                .or_insert_with(|| identity.to_owned());
+            for &(reference, identity) in references {
+                pins.entry(reference.to_owned())
+                    .or_insert_with(|| identity.to_owned());
+            }
         }
         Ok(())
+    }
+
+    fn inherit(&self, groups: Vec<&Self>) -> VortexResult<bool> {
+        // Identities are immutable once pinned. Release the source lock before
+        // locking destinations, which can include the source itself.
+        let pins = self.0.lock().clone();
+        if pins.is_empty() {
+            return Ok(false);
+        }
+        let references = pins
+            .iter()
+            .map(|(reference, identity)| (reference.as_path(), identity.as_str()))
+            .collect::<Vec<_>>();
+        Self::record(groups, &references)?;
+        Ok(true)
     }
 }
 
@@ -182,10 +201,27 @@ unsafe extern "C-unwind" fn vortex_index_pins_record(
             ..
         } = request
         {
-            ReferencePins::record(groups, reference, identity)?;
+            ReferencePins::record(groups, &[(reference, identity)])?;
         }
         Ok(true)
     })
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C-unwind" fn vortex_index_pins_inherit(
+    source: *const c_void,
+    groups: *const *const c_void,
+    count: usize,
+    error: *mut cpp::duckdb_vx_error,
+) -> bool {
+    // C++ keeps the source and this nonempty slice of destinations alive for
+    // the synchronous call. False without an error means the source is empty.
+    let source = unsafe { &*source.cast::<ReferencePins>() };
+    let groups = unsafe { slice::from_raw_parts(groups, count) }
+        .iter()
+        .map(|pins| unsafe { &*pins.cast::<ReferencePins>() })
+        .collect::<Vec<_>>();
+    try_or(error, || source.inherit(groups))
 }
 
 #[unsafe(no_mangle)]
@@ -274,19 +310,59 @@ mod tests {
         let owner = ReferencePins::default();
         let empty = ReferencePins::default();
         let reference = Path::new("index.json");
-        ReferencePins::record(vec![&owner], reference, "original")?;
-        let error = ReferencePins::record(vec![&empty, &owner, &empty], reference, "replacement")
-            .err()
-            .ok_or_else(|| vortex_err!("Changed reference identity was accepted"))?;
+        ReferencePins::record(vec![&owner], &[(reference, "original")])?;
+        let error =
+            ReferencePins::record(vec![&empty, &owner, &empty], &[(reference, "replacement")])
+                .err()
+                .ok_or_else(|| vortex_err!("Changed reference identity was accepted"))?;
         assert!(error.to_string().contains("reference changed"), "{error}");
         assert!(empty.0.lock().is_empty());
-        ReferencePins::record(vec![&owner, &empty, &owner], reference, "original")?;
+        ReferencePins::record(vec![&owner, &empty, &owner], &[(reference, "original")])?;
         for pins in [&owner, &empty] {
             assert_eq!(
                 pins.0.lock().get(reference).map(String::as_str),
                 Some("original")
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_rejected_inheritance_does_not_change_any_owner() -> VortexResult<()> {
+        let source = ReferencePins::default();
+        let owner = ReferencePins::default();
+        let empty = ReferencePins::default();
+        let first = Path::new("a.json");
+        let last = Path::new("z.json");
+        ReferencePins::record(vec![&source], &[(first, "first"), (last, "replacement")])?;
+        ReferencePins::record(vec![&owner], &[(last, "original")])?;
+        let original = owner.0.lock().clone();
+        let error = source
+            .inherit(vec![&empty, &owner, &empty])
+            .err()
+            .ok_or_else(|| vortex_err!("Conflicting inherited identity was accepted"))?;
+        assert!(error.to_string().contains("reference changed"), "{error}");
+        assert!(empty.0.lock().is_empty());
+        assert_eq!(*owner.0.lock(), original);
+        Ok(())
+    }
+
+    #[test]
+    fn test_inheritance_is_directional_and_deduplicates_owners() -> VortexResult<()> {
+        let source = ReferencePins::default();
+        let owner = ReferencePins::default();
+        let inherited = Path::new("inherited.json");
+        let unrelated = Path::new("unrelated.json");
+        ReferencePins::record(vec![&owner], &[(unrelated, "outer")])?;
+        assert!(!source.inherit(vec![&owner])?);
+        ReferencePins::record(vec![&source], &[(inherited, "inner")])?;
+        assert!(source.inherit(vec![&source, &owner, &owner])?);
+        assert_eq!(source.0.lock().len(), 1);
+        assert_eq!(owner.0.lock().len(), 2);
+        assert_eq!(
+            owner.0.lock().get(inherited).map(String::as_str),
+            Some("inner")
+        );
         Ok(())
     }
 }

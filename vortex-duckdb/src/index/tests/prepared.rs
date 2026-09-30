@@ -242,3 +242,98 @@ fn test_failed_rebind_does_not_pin_rejected_identity(
     }
     Ok(())
 }
+
+#[rstest::rstest]
+#[case::where_parameter("WHERE rank >= $1")]
+#[case::limit_parameter("LIMIT $1")]
+#[case::projection_parameter("")]
+fn test_nested_prepare_retains_initial_bind_identity(
+    #[case] suffix: &str,
+    #[values(false, true)] c_api: bool,
+    #[values(false, true)] explain: bool,
+) -> VortexResult<()> {
+    let fixture = fixture()?;
+    let conn = &fixture.conn;
+    let query = format!(
+        "SELECT \"row\".id{} FROM vortex_index_search({}, [7::FLOAT, 0::FLOAT], 1) {suffix}",
+        if suffix.is_empty() { ", $1" } else { "" },
+        literal(&fixture.reference)
+    );
+    let prefix = if explain { "EXPLAIN ANALYZE " } else { "" };
+    let prepare = format!("{prefix}PREPARE indexed AS {query}");
+    if c_api {
+        Prepared::new(conn, &prepare)?.run()?;
+    } else {
+        conn.query(&prepare)?;
+    }
+    conn.query("SELECT 1")?;
+    let original = std::fs::read(&fixture.reference)?;
+    std::fs::copy(&fixture.replacement, &fixture.reference)?;
+    match conn.query("EXECUTE indexed(1)") {
+        Ok(result) => vortex_bail!(
+            "Nested PREPARE lost its first-bind identity and returned id={}",
+            nearest_id(result)?
+        ),
+        Err(error) => assert!(error.to_string().contains("reference changed"), "{error}"),
+    }
+    conn.query(&format!("PREPARE fresh_indexed AS {query}"))?;
+    assert_eq!(nearest_id(conn.query("EXECUTE fresh_indexed(1)")?)?, 128);
+    std::fs::write(&fixture.reference, original)?;
+    assert_eq!(nearest_id(conn.query("EXECUTE indexed(1)")?)?, 7);
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case::where_variable("WHERE getvariable('include_hits')", "false", "true")]
+#[case::limit_variable("LIMIT getvariable('include_hits')", "0", "1")]
+fn test_optimized_out_wrapper_preserves_first_bind(
+    #[case] suffix: &str,
+    #[case] before: &str,
+    #[case] after: &str,
+    #[values(false, true)] prune: bool,
+) -> VortexResult<()> {
+    let fixture = fixture()?;
+    let conn = &fixture.conn;
+    conn.query("CREATE TABLE rebind_marker AS SELECT 1 AS marker")?;
+    conn.query(&format!(
+        "SET VARIABLE include_hits = {}",
+        if prune { before } else { after }
+    ))?;
+    let prepare = format!(
+        "PREPARE indexed AS SELECT \"row\".id FROM vortex_index_search({}, [7::FLOAT, 0::FLOAT], 1) CROSS JOIN rebind_marker {suffix}",
+        literal(&fixture.reference)
+    );
+    // Retain the old plan so this test isolates pin inheritance from DuckDB's
+    // borrowed physical-plan lifetime across DEALLOCATE.
+    let old_sql_owner = Prepared::new(conn, &prepare)?;
+    old_sql_owner.run()?;
+    let wrapper = Prepared::new(conn, "EXECUTE indexed")?;
+    if prune {
+        assert_eq!(wrapper.run()?.row_count(), 0);
+    } else {
+        assert_eq!(nearest_id(wrapper.run()?)?, 7);
+    }
+    let original = std::fs::read(&fixture.reference)?;
+    std::fs::copy(&fixture.replacement, &fixture.reference)?;
+    conn.query("DEALLOCATE indexed")?;
+    conn.query(&format!("SET VARIABLE include_hits = {after}"))?;
+    conn.query(&prepare)?;
+    conn.query("CREATE TABLE trigger_rebind(id INTEGER)")?;
+    match wrapper.run() {
+        Ok(result) => vortex_bail!(
+            "Optimized-out wrapper lost its first-bind identity and returned id={}",
+            nearest_id(result)?
+        ),
+        Err(error) => assert!(error.to_string().contains("reference changed"), "{error}"),
+    }
+    assert_eq!(
+        nearest_id(Prepared::new(conn, "EXECUTE indexed")?.run()?)?,
+        128
+    );
+    std::fs::write(&fixture.reference, original)?;
+    conn.query("DEALLOCATE indexed")?;
+    conn.query(&prepare)?;
+    conn.query("DROP TABLE trigger_rebind")?;
+    assert_eq!(nearest_id(wrapper.run()?)?, 7);
+    Ok(())
+}
