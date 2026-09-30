@@ -26,3 +26,5 @@ prefix = "extern"
 
 [defines]
 "vortex_vane_distributed" = "VORTEX_VANE_DISTRIBUTED"
+"feature = index" = "VORTEX_INDEX"
+"unix" = "VORTEX_INDEX_UNIX"

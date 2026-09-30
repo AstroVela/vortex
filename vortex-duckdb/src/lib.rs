@@ -32,17 +32,22 @@ mod convert;
 pub mod duckdb;
 mod exporter;
 mod ffi;
+#[cfg(all(feature = "index", unix))]
+pub mod index;
 mod multi_file;
 mod projection;
 mod table_function;
 
 #[rustfmt::skip]
 #[allow(rustdoc::all)]
+#[cfg(not(vortex_vane_distributed))]
 #[path = "./cpp.rs"]
 /// This module provides the FFI interface to our C++ code exposing additional functionality
 /// for DuckDB, such as custom data types and functions.
 /// cbindgen:ignore
 mod cpp;
+#[cfg(vortex_vane_distributed)]
+include!(concat!(env!("OUT_DIR"), "/vane_cpp.rs"));
 mod copy;
 #[cfg(vortex_vane_distributed)]
 mod distributed;

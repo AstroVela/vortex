@@ -37,6 +37,9 @@ using namespace duckdb;
 #ifdef VORTEX_VANE_DISTRIBUTED
 void RegisterVortexCopyFunction(ExtensionLoader &loader);
 void RegisterVortexTableFunctions(ExtensionLoader &loader);
+#ifdef VORTEX_INDEX
+void RegisterVortexIndexFunctions(ExtensionLoader &loader);
+#endif
 #endif
 
 extern "C" char *duckdb_vx_value_to_string(duckdb_value value) {
@@ -318,5 +321,8 @@ extern "C" void duckdb_vx_vane_init(void *loader_ptr) {
     RegisterVortexTableFunctions(loader);
     DBConfig::GetConfig(db).GetCallbackManager().Register(VortexOptimizerExtension());
     RegisterVortexCopyFunction(loader);
+#ifdef VORTEX_INDEX
+    RegisterVortexIndexFunctions(loader);
+#endif
 }
 #endif
