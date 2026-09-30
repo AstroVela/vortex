@@ -293,6 +293,27 @@ fn nearest_id(result: QueryResult) -> VortexResult<u64> {
     }
 }
 
+unsafe extern "C" {
+    fn vortex_index_test_bind_relation(
+        connection: cpp::duckdb_connection,
+        sql: *const std::ffi::c_char,
+    ) -> cpp::duckdb_vx_error;
+}
+
+fn bind_unexecuted_relation(connection: &Connection, sql: &str) -> VortexResult<()> {
+    let sql = CString::new(sql).map_err(|error| vortex_err!("{error}"))?;
+    // Both borrowed inputs are live while C++ creates and destroys the relation.
+    let error = unsafe { vortex_index_test_bind_relation(connection.as_ptr(), sql.as_ptr()) };
+    if !error.is_null() {
+        let message = unsafe { CStr::from_ptr(cpp::duckdb_vx_error_value(error)) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { cpp::duckdb_vx_error_free(error) };
+        vortex_bail!("{message}");
+    }
+    Ok(())
+}
+
 #[test]
 fn test_sql_build_reopen_ranked_take_and_no_bind_side_effects() -> VortexResult<()> {
     let root = tempfile::tempdir()?;
@@ -681,6 +702,145 @@ fn test_first_execution_retains_initial_bind_identity(
         .err()
         .ok_or_else(|| vortex_err!("Independent statement lost its own reference identity"))?;
     assert!(error.to_string().contains("reference changed"), "{error}");
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case::call_macro(0, true)]
+#[case::set_variable(1, true)]
+#[case::select_macro(2, false)]
+fn test_prepared_statement_forms_keep_reference_identity(
+    #[case] statement_kind: u8,
+    #[case] c_api: bool,
+    #[values(false, true)] initial_bind: bool,
+) -> VortexResult<()> {
+    let root = tempfile::tempdir()?;
+    let conn = connection()?;
+    let first = source(&conn, root.path(), "a.vortex", 0, 128)?;
+    let second = source(&conn, root.path(), "b.vortex", 128, 256)?;
+    let reference = root.path().join("index.json");
+    let replacement = root.path().join("replacement.json");
+    conn.query(&build_sql(root.path(), &[first]))?;
+    conn.query(
+        &build_sql(root.path(), &[second]).replace(&literal(&reference), &literal(&replacement)),
+    )?;
+    let search = if initial_bind {
+        format!(
+            "SELECT \"row\".id FROM vortex_index_search({}, [7::FLOAT, 0::FLOAT], 1) WHERE rank >= parameter::BIGINT",
+            literal(&reference)
+        )
+    } else {
+        format!(
+            "SELECT \"row\".id FROM vortex_index_search({}, [parameter::FLOAT, 0::FLOAT], 1)",
+            literal(&reference)
+        )
+    };
+    let set_variable = statement_kind == 1;
+    let query = if set_variable {
+        format!(
+            "SET VARIABLE nearest = ({})",
+            search.replace("parameter", "$1")
+        )
+    } else {
+        conn.query(&format!(
+            "CREATE MACRO nearest(parameter) AS TABLE {search}"
+        ))?;
+        if statement_kind == 0 {
+            "CALL nearest($1)".into()
+        } else {
+            "SELECT * FROM nearest($1)".into()
+        }
+    };
+    let prepared = if c_api {
+        Some(Prepared::new(&conn, &query)?)
+    } else {
+        conn.query(&format!("PREPARE indexed AS {query}"))?;
+        None
+    };
+    let parameter = if initial_bind { 1.0 } else { 7.0 };
+    let execute = |prepared: Option<&Prepared<'_>>, name: &str| -> VortexResult<u64> {
+        let result = match prepared {
+            Some(prepared) => prepared.execute(parameter)?,
+            None => conn.query(&format!("EXECUTE {name}({parameter})"))?,
+        };
+        if set_variable {
+            nearest_id(conn.query("SELECT getvariable('nearest')::UBIGINT")?)
+        } else {
+            nearest_id(result)
+        }
+    };
+    if !initial_bind {
+        assert_eq!(execute(prepared.as_ref(), "indexed")?, 7);
+        conn.query("CREATE TABLE trigger_rebind(id INTEGER)")?;
+        assert_eq!(execute(prepared.as_ref(), "indexed")?, 7);
+    }
+    let unrelated = Prepared::new(&conn, "SELECT $1")?;
+    let original = std::fs::read(&reference)?;
+    let changed = std::fs::read(&replacement)?;
+    std::fs::write(&reference, &changed)?;
+    let error = execute(prepared.as_ref(), "indexed")
+        .err()
+        .ok_or_else(|| vortex_err!("Prepared statement silently switched index generations"))?;
+    assert!(error.to_string().contains("reference changed"), "{error}");
+    assert_eq!(unrelated.execute(1.0)?.row_count(), 1);
+    let fresh = Prepared::new(&conn, &query)?;
+    assert_eq!(execute(Some(&fresh), "unused")?, 128);
+    std::fs::write(&reference, &original)?;
+    assert_eq!(execute(prepared.as_ref(), "indexed")?, 7);
+    std::fs::write(&reference, changed)?;
+    let error = execute(prepared.as_ref(), "indexed")
+        .err()
+        .ok_or_else(|| vortex_err!("Restored prepared statement lost its reference identity"))?;
+    assert!(error.to_string().contains("reference changed"), "{error}");
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case::query(0)]
+#[case::prepared_literal(1)]
+#[case::prepared_parameter(2)]
+fn test_unexecuted_relation_does_not_pin_independent_queries(
+    #[case] query_kind: u8,
+    #[values(false, true)] transaction: bool,
+    #[values(false, true)] failed_bind: bool,
+) -> VortexResult<()> {
+    let root = tempfile::tempdir()?;
+    let conn = connection()?;
+    let first = source(&conn, root.path(), "a.vortex", 0, 128)?;
+    let second = source(&conn, root.path(), "b.vortex", 128, 256)?;
+    let reference = root.path().join("index.json");
+    let replacement = root.path().join("replacement.json");
+    conn.query(&build_sql(root.path(), &[first]))?;
+    conn.query(
+        &build_sql(root.path(), &[second]).replace(&literal(&reference), &literal(&replacement)),
+    )?;
+    let query = format!(
+        "SELECT \"row\".id FROM vortex_index_search({}, [7::FLOAT, 0::FLOAT], 1)",
+        literal(&reference)
+    );
+    if transaction {
+        conn.query("BEGIN")?;
+    }
+    if failed_bind {
+        let error = bind_unexecuted_relation(&conn, &query.replace("\"row\".id", "missing"))
+            .err()
+            .ok_or_else(|| vortex_err!("Invalid relation projection was accepted"))?;
+        assert!(error.to_string().contains("missing"), "{error}");
+    } else {
+        bind_unexecuted_relation(&conn, &query)?;
+    }
+    std::fs::write(&reference, std::fs::read(&replacement)?)?;
+    let id = match query_kind {
+        0 => nearest_id(conn.query(&query)?)?,
+        1 => nearest_id(Prepared::new(&conn, &format!("{query} WHERE rank >= $1"))?.execute(1.0)?)?,
+        _ => nearest_id(
+            Prepared::new(&conn, &query.replace("7::FLOAT", "$1::FLOAT"))?.execute(7.0)?,
+        )?,
+    };
+    assert_eq!(id, 128);
+    if transaction {
+        conn.query("COMMIT")?;
+    }
     Ok(())
 }
 

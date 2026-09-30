@@ -159,6 +159,9 @@ before the first execution when WHERE, LIMIT or projection parameters cause
 DuckDB to discard the original query plan. Query vectors, `k`, and
 backend options may change between executions; each reference path retains its
 first identity. Prepare a new statement to accept a replacement reference.
+Pins belong to the original prepared handle, including C API prepares of
+`CALL` table macros and `SET VARIABLE` with index subqueries. Binding an
+unexecuted relation's schema does not pin a later independent query.
 
 The initial path requires full coverage of a frozen local source, enabled
 external access and a registered provider. SQL WHERE clauses filter returned

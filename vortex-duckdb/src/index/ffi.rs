@@ -152,7 +152,7 @@ extern "C-unwind" fn vortex_index_pins_new() -> *mut c_void {
 
 #[unsafe(no_mangle)]
 unsafe extern "C-unwind" fn vortex_index_pins_free(pins: *mut c_void) {
-    // The owning DuckDB dependency frees its pin set after all statement copies.
+    // The owning prepared plan frees its pin set after all active borrows end.
     unsafe { drop(Box::from_raw(pins.cast::<ReferencePins>())) };
 }
 
@@ -162,7 +162,7 @@ unsafe extern "C-unwind" fn vortex_index_pins_record(
     bind: *const c_void,
     error: *mut cpp::duckdb_vx_error,
 ) -> bool {
-    // DuckDB lends the owning dependency and live FunctionData during planning.
+    // DuckDB lends the prepared plan's pins and live FunctionData during planning.
     let pins = unsafe { &*pins.cast::<ReferencePins>() };
     let request = unsafe { &*bind.cast::<Request>() };
     try_or(error, || {
@@ -189,7 +189,7 @@ unsafe extern "C-unwind" fn vortex_index_bind(
     try_or_null(error, || {
         let request = bind(build, &inputs)?;
         if !pins.is_null() {
-            // This dependency belongs to the original prepared statement, not
+            // These pins belong to the original prepared statement, not
             // the new FunctionData constructed by DuckDB's automatic rebind.
             unsafe { &*pins.cast::<ReferencePins>() }.record(&request)?;
         }

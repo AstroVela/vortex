@@ -619,7 +619,9 @@ fn compile_cpp(duckdb_include_dir: &Path) {
         build.define("VORTEX_INDEX", "1");
         build.define("VORTEX_INDEX_UNIX", "1");
         build.file("cpp/index.cpp");
+        build.file("cpp/index_test.cpp");
         println!("cargo:rerun-if-changed=cpp/index.cpp");
+        println!("cargo:rerun-if-changed=cpp/index_test.cpp");
     }
     build.compile("vortex-duckdb-extras");
     for e in SOURCE_FILES {
