@@ -11,6 +11,7 @@
 mod ffi;
 #[cfg(test)]
 mod tests;
+mod timing;
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -75,6 +76,8 @@ use vortex_index::store::LocalGeneration;
 use vortex_index::store::LocalIndexStore;
 use vortex_index::store::LocalStoreLimits;
 
+use self::timing::Phase;
+use self::timing::SearchTiming;
 use crate::SESSION;
 
 const MAX_SOURCE_BYTES: usize = 512 * 1024 * 1024;
@@ -203,7 +206,7 @@ impl Request {
         }
     }
 
-    async fn execute(&self) -> VortexResult<StructArray> {
+    async fn execute(&self, timing: &mut SearchTiming) -> VortexResult<StructArray> {
         match self {
             Self::Build {
                 files,
@@ -223,7 +226,8 @@ impl Request {
                 if file_version(&read_regular(reference, MAX_REFERENCE_BYTES)?) != *identity {
                     vortex_bail!("Index reference changed after bind; prepare a new query");
                 }
-                search(reference, descriptor, query, *k, options.clone()).await
+                timing.mark(Phase::ReferenceCheck);
+                search(reference, descriptor, query, *k, options.clone(), timing).await
             }
         }
     }
@@ -478,6 +482,7 @@ async fn search(
     query: &[f32],
     k: NonZeroUsize,
     options: Bytes,
+    timing: &mut SearchTiming,
 ) -> VortexResult<StructArray> {
     let root = root(reference)?;
     let source = LocalFileSource::open(
@@ -496,6 +501,7 @@ async fn search(
     if metadata.uncovered_files().next().is_some() || metadata.fields.len() != 1 {
         vortex_bail!("SQL static search requires full file coverage and one vector field");
     }
+    timing.mark(Phase::SourceValidation);
     let scratch = tempfile::Builder::new()
         .prefix(".index-scratch-")
         .permissions(fs::Permissions::from_mode(0o700))
@@ -512,6 +518,7 @@ async fn search(
         vortex_bail!("SQL static search supports squared L2 only");
     }
     let filter = RowFilter::try_new(source.snapshot().clone(), None, BTreeSet::new())?;
+    timing.mark(Phase::ProviderOpen);
     let hits = vector
         .search(
             query,
@@ -523,6 +530,7 @@ async fn search(
             &filter,
         )
         .await?;
+    timing.mark(Phase::NativeSearch);
     if hits.len() > k.get() {
         vortex_bail!("Index returned more than k hits");
     }
@@ -550,10 +558,12 @@ async fn search(
         .iter()
         .map(|field| field.to_string())
         .collect::<Vec<_>>();
+    timing.mark(Phase::HitValidation);
     let taken = source.take(&rows, &fields).await?;
     if taken.rows != rows || taken.data.dtype() != &descriptor.dtype {
         vortex_bail!("Index source take did not preserve ranked rows or schema");
     }
+    timing.mark(Phase::Take);
     StructArray::try_from_iter([
         (
             "rank",
