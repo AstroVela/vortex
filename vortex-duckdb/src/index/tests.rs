@@ -3,6 +3,7 @@
 
 mod prepared;
 mod scratch;
+mod timing;
 
 use std::ffi::CStr;
 use std::ffi::CString;

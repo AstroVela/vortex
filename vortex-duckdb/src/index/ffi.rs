@@ -25,6 +25,8 @@ use super::MAX_OPTIONS_BYTES;
 use super::Request;
 use super::read_reference;
 use super::root;
+use super::timing::Phase;
+use super::timing::SearchTiming;
 use crate::RUNTIME;
 use crate::SESSION;
 use crate::cpp;
@@ -266,14 +268,17 @@ unsafe extern "C-unwind" fn vortex_index_execute(
     try_or_null(error, || {
         // Ranked take can retain nested dictionaries, chunks, or sequences.
         // Materialize only the bounded SQL result, not the source files.
+        let mut timing = SearchTiming::new(matches!(request, Request::Search { .. }));
         let mut ctx = SESSION.create_execution_ctx();
         let array = RUNTIME
-            .block_on(request.execute())?
+            .block_on(request.execute(&mut timing))?
             .into_array()
             .execute::<RecursiveCanonical>(&mut ctx)?
             .0
             .into_struct();
         let exporter = ArrayExporter::try_new(&array, &ConversionCache::default(), ctx)?;
+        timing.mark(Phase::ResultMaterialization);
+        timing.emit();
         Ok(Box::into_raw(Box::new(exporter)).cast())
     })
 }
