@@ -39,3 +39,12 @@ void vortex_spfresh_close(void *handle);
 #ifdef __cplusplus
 }
 #endif
+
+#if defined(VORTEX_SPFRESH_BENCHMARK) && defined(__cplusplus)
+namespace SPTAG::SPANN {
+template <typename T>
+class Index;
+}
+// Benchmark-only access to an opened handle; never built into the production bridge.
+SPTAG::SPANN::Index<float> &vortex_spfresh_benchmark_index(void *handle);
+#endif

@@ -25,6 +25,7 @@ use super::FACTORIES;
 use super::MAX_K;
 use super::MAX_OPTIONS_BYTES;
 use super::Request;
+use super::ValidationMode;
 use super::cache::CacheBudget;
 use super::cache::PreparedIndexCache;
 use super::read_reference;
@@ -92,7 +93,12 @@ fn bind(build: bool, inputs: &[&ValueRef]) -> VortexResult<Request> {
             backend,
             options: options(inputs[4])?,
         })
-    } else if !build && inputs.len() == 4 {
+    } else if !build && inputs.len() == 5 {
+        let validation_mode = match string(inputs[4])?.as_str() {
+            "strict" => ValidationMode::Strict,
+            "snapshot" => ValidationMode::Snapshot,
+            _ => vortex_bail!("Index validation_mode must be 'strict' or 'snapshot'"),
+        };
         let reference = PathBuf::from(string(inputs[0])?);
         let (descriptor, identity) = read_reference(&reference)?;
         let ExtractedValue::List(values) = inputs[1].extract() else {
@@ -120,8 +126,9 @@ fn bind(build: bool, inputs: &[&ValueRef]) -> VortexResult<Request> {
         Ok(Request::Search {
             reference,
             identity,
-            descriptor,
+            descriptor: Box::new(descriptor),
             cache: Weak::new(),
+            validation_mode,
             query,
             k,
             options: options(inputs[3])?,

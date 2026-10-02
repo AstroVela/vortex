@@ -355,6 +355,8 @@ unique_ptr<FunctionData> BindIndex(ClientContext &context,
     if (!build) {
         auto options = input.named_parameters.find("backend_options");
         values.push_back(options == input.named_parameters.end() ? Value("") : options->second);
+        auto mode = input.named_parameters.find("validation_mode");
+        values.push_back(mode == input.named_parameters.end() ? Value("strict") : mode->second);
     }
     vector<duckdb_value> pointers;
     for (auto &value : values) {
@@ -411,6 +413,7 @@ vector<TableFunction> Functions() {
                          BindIndex,
                          InitIndex);
     search.named_parameters["backend_options"] = LogicalType::VARCHAR;
+    search.named_parameters["validation_mode"] = LogicalType::VARCHAR;
     return {build, search};
 }
 

@@ -21,6 +21,8 @@ struct Event {
     total_ms: f64,
     phases: BTreeMap<String, f64>,
     provider_cache_hit: bool,
+    validation_mode: String,
+    snapshot_cache_hit: bool,
 }
 
 #[test]
@@ -44,6 +46,13 @@ fn test_search_timing_is_opt_in() -> VortexResult<()> {
         ))?;
         for _ in 0..2 {
             assert_eq!(nearest_id(conn.query("EXECUTE indexed(7)")?)?, 7);
+        }
+        conn.query(&format!(
+            "PREPARE indexed_snapshot AS SELECT \"row\".id FROM vortex_index_search({}, [$1::FLOAT, 0::FLOAT], 1, validation_mode := 'snapshot')",
+            literal(&root.path().join("index.json"))
+        ))?;
+        for _ in 0..2 {
+            assert_eq!(nearest_id(conn.query("EXECUTE indexed_snapshot(7)")?)?, 7);
         }
         return Ok(());
     }
@@ -72,14 +81,28 @@ fn test_search_timing_is_opt_in() -> VortexResult<()> {
             .filter_map(|line| serde_json::from_str::<Event>(line).ok())
             .filter(|event| event.event == "vortex_index_search_timing")
             .collect::<Vec<_>>();
-        assert_eq!(events.len(), if enabled { 3 } else { 0 });
+        assert_eq!(events.len(), if enabled { 5 } else { 0 });
         if enabled {
             assert_eq!(
                 events
                     .iter()
                     .map(|event| event.provider_cache_hit)
                     .collect::<Vec<_>>(),
-                vec![false, false, true]
+                vec![false, false, true, false, true]
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .map(|event| event.validation_mode.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["strict", "strict", "strict", "snapshot", "snapshot"]
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .map(|event| event.snapshot_cache_hit)
+                    .collect::<Vec<_>>(),
+                vec![false, false, false, false, true]
             );
         }
         for event in &events {

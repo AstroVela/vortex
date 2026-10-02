@@ -7,6 +7,8 @@ use std::time::Instant;
 
 use serde::Serialize;
 
+use super::ValidationMode;
+
 static ENABLED: LazyLock<bool> =
     LazyLock::new(|| std::env::var("VORTEX_INDEX_TIMING").is_ok_and(|value| value == "1"));
 
@@ -36,6 +38,8 @@ pub(super) struct SearchTiming {
     checkpoint: Option<Instant>,
     phases: Phases,
     provider_cache_hit: bool,
+    validation_mode: ValidationMode,
+    snapshot_cache_hit: bool,
 }
 
 impl SearchTiming {
@@ -46,11 +50,21 @@ impl SearchTiming {
             checkpoint: start,
             phases: Phases::default(),
             provider_cache_hit: false,
+            validation_mode: ValidationMode::Strict,
+            snapshot_cache_hit: false,
         }
     }
 
     pub(super) fn provider_cache_hit(&mut self, hit: bool) {
         self.provider_cache_hit = hit;
+    }
+
+    pub(super) fn validation_mode(&mut self, mode: ValidationMode) {
+        self.validation_mode = mode;
+    }
+
+    pub(super) fn snapshot_cache_hit(&mut self, hit: bool) {
+        self.snapshot_cache_hit = hit;
     }
 
     pub(super) fn mark(&mut self, phase: Phase) {
@@ -79,6 +93,8 @@ impl SearchTiming {
             total_ms: f64,
             phases: &'a Phases,
             provider_cache_hit: bool,
+            validation_mode: ValidationMode,
+            snapshot_cache_hit: bool,
         }
         if let (Some(start), Some(end)) = (self.start, self.checkpoint) {
             let event = Event {
@@ -87,6 +103,8 @@ impl SearchTiming {
                 total_ms: end.duration_since(start).as_secs_f64() * 1000.0,
                 phases: &self.phases,
                 provider_cache_hit: self.provider_cache_hit,
+                validation_mode: self.validation_mode,
+                snapshot_cache_hit: self.snapshot_cache_hit,
             };
             if let Ok(json) = serde_json::to_string(&event) {
                 // Diagnostic output must not change query success on a closed pipe.

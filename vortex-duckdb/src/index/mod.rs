@@ -5,10 +5,11 @@
 //!
 //! Extensions register provider factories before loading SQL functions. Each
 //! opened generation owns a private scratch lease. Prepared owners may retain
-//! bounded provider handles, but source/store validation still runs on execution.
-//! Reference files are immutable,
-//! exclusively published only after build, seal, and qualified reopen. They
-//! describe frozen whole-file coverage, not a mutable table catalog.
+//! bounded provider handles. Strict validation runs on every execution; explicit
+//! snapshot mode retains the fully verified source as well. Reference identity
+//! and DuckDB access policy remain checked on every execution. Reference files
+//! are immutable, exclusively published only after build, seal, and qualified
+//! reopen. They describe frozen whole-file coverage, not a mutable table catalog.
 
 mod cache;
 mod ffi;
@@ -167,12 +168,21 @@ enum Request {
     Search {
         reference: PathBuf,
         identity: String,
-        descriptor: Reference,
+        descriptor: Box<Reference>,
         cache: Weak<PreparedIndexCache>,
+        validation_mode: ValidationMode,
         query: Vec<f32>,
         k: NonZeroUsize,
         options: Bytes,
     },
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ValidationMode {
+    #[default]
+    Strict,
+    Snapshot,
 }
 
 impl Request {
@@ -228,6 +238,7 @@ impl Request {
                 identity,
                 descriptor,
                 cache,
+                validation_mode,
                 query,
                 k,
                 options,
@@ -236,11 +247,13 @@ impl Request {
                     vortex_bail!("Index reference changed after bind; prepare a new query");
                 }
                 timing.mark(Phase::ReferenceCheck);
+                timing.validation_mode(*validation_mode);
                 let cache = cache.upgrade();
                 search(
                     &CacheKey {
                         reference: reference.clone(),
                         identity: identity.clone(),
+                        validation_mode: *validation_mode,
                     },
                     descriptor,
                     cache.as_deref(),
@@ -508,25 +521,48 @@ async fn search(
     timing: &mut SearchTiming,
 ) -> VortexResult<StructArray> {
     let root = root(&key.reference)?;
-    let source = LocalFileSource::open(
-        descriptor.snapshot.clone(),
-        descriptor.dtype.clone(),
-        MAX_SOURCE_BYTES,
-        SESSION.clone(),
-    )
-    .await?;
-    let (store, metadata) = LocalIndexStore::open(
-        root,
-        &descriptor.generation,
-        source.snapshot(),
-        STORE_LIMITS,
-    )?;
-    if metadata.uncovered_files().next().is_some() || metadata.fields.len() != 1 {
-        vortex_bail!("SQL static search requires full file coverage and one vector field");
-    }
-    timing.mark(Phase::SourceValidation);
-    let (opened, cache_hit) =
-        PreparedIndexCache::open(cache, key, root, &metadata, Arc::new(store)).await?;
+    let snapshot_cache = (key.validation_mode == ValidationMode::Snapshot)
+        .then(|| {
+            cache.ok_or_else(|| vortex_err!("Snapshot validation requires a live prepared owner"))
+        })
+        .transpose()?;
+    let cached_snapshot = snapshot_cache.and_then(|cache| cache.snapshot(key));
+    let (source, opened, cache_hit) = if let Some(opened) = cached_snapshot {
+        let source = opened
+            .source
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| vortex_err!("Cached snapshot is missing its source"))?;
+        timing.snapshot_cache_hit(true);
+        timing.mark(Phase::SourceValidation);
+        (source, opened, true)
+    } else {
+        let source = Arc::new(
+            LocalFileSource::open(
+                descriptor.snapshot.clone(),
+                descriptor.dtype.clone(),
+                MAX_SOURCE_BYTES,
+                SESSION.clone(),
+            )
+            .await?,
+        );
+        let (store, metadata) = LocalIndexStore::open(
+            root,
+            &descriptor.generation,
+            source.snapshot(),
+            STORE_LIMITS,
+        )?;
+        if metadata.uncovered_files().next().is_some() || metadata.fields.len() != 1 {
+            vortex_bail!("SQL static search requires full file coverage and one vector field");
+        }
+        timing.mark(Phase::SourceValidation);
+        let pinned_source = snapshot_cache.map(|_| Arc::clone(&source));
+        let (opened, cache_hit) =
+            PreparedIndexCache::open(cache, key, root, &metadata, Arc::new(store), pinned_source)
+                .await?;
+        (source, opened, cache_hit)
+    };
+    let metadata = opened.index.metadata();
     timing.provider_cache_hit(cache_hit);
     let vector = opened
         .index

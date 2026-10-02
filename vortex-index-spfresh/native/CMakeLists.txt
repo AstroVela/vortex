@@ -39,6 +39,11 @@ target_link_options(vortex_spfresh_pic_check PRIVATE -Wl,--no-undefined)
 add_executable(spfresh_fixture fixture.cpp)
 target_link_libraries(spfresh_fixture PRIVATE spfresh_core)
 
+# Opt-in benchmark; uses the same loader and bridge, without changing production ABI.
+add_executable(spfresh_benchmark EXCLUDE_FROM_ALL benchmark.cpp bridge.cpp)
+target_compile_definitions(spfresh_benchmark PRIVATE VORTEX_SPFRESH_BENCHMARK)
+target_link_libraries(spfresh_benchmark PRIVATE spfresh_core)
+
 enable_testing()
 add_executable(spfresh_native_tests tests.cpp)
 target_link_libraries(spfresh_native_tests PRIVATE spfresh_core)

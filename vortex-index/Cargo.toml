@@ -19,17 +19,17 @@ default = []
 local-store = [
     "dep:base16ct",
     "dep:parking_lot",
+    "dep:ring",
     "dep:rustix",
     "dep:serde_json",
-    "dep:sha2",
     "dep:tempfile",
 ]
 file = [
     "dep:async-stream",
     "dep:base16ct",
+    "dep:ring",
     "dep:rustix",
     "dep:serde_json",
-    "dep:sha2",
     "dep:vortex-file",
     "dep:vortex-io",
     "dep:vortex-session",
@@ -43,9 +43,9 @@ base16ct = { workspace = true, optional = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 parking_lot = { workspace = true, optional = true }
+ring = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, optional = true }
-sha2 = { workspace = true, optional = true }
 vortex-array = { workspace = true }
 vortex-buffer = { workspace = true }
 vortex-error = { workspace = true }
@@ -59,12 +59,20 @@ rustix = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
+divan = { workspace = true }
 futures = { workspace = true, features = ["executor"] }
+rstest = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tempfile = { workspace = true }
 vortex-array = { workspace = true, features = ["_test-harness"] }
 vortex-edition = { workspace = true }
 vortex-layout = { workspace = true }
+
+[[bench]]
+name = "checksum"
+harness = false
+required-features = ["file"]
 
 [lints]
 workspace = true

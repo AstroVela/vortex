@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+mod snapshot;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
@@ -364,10 +366,16 @@ fn test_connection_handle_limit_falls_back_and_releases_capacity() -> VortexResu
     Ok(())
 }
 
-#[test]
-fn test_failed_provider_open_releases_scratch_and_cache_reservation() -> VortexResult<()> {
+#[rstest::rstest]
+fn test_failed_provider_open_releases_scratch_and_cache_reservation(
+    #[values("strict", "snapshot")] mode: &str,
+) -> VortexResult<()> {
     let fixture = Fixture::new()?;
-    let handle = Prepared::new(&fixture.conn, &fixture.query("$1"))?;
+    let query = format!(
+        "SELECT \"row\".id FROM vortex_index_search({}, [$1::FLOAT, 0::FLOAT], 1, validation_mode := '{mode}')",
+        literal(&fixture.reference)
+    );
+    let handle = Prepared::new(&fixture.conn, &query)?;
     let failure = fixture.root.path().join("fail-open");
     fs::write(&failure, b"fail")?;
     for _ in 0..MAX_RETAINED_HANDLES {
