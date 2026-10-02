@@ -20,6 +20,7 @@ struct Event {
     format_version: u32,
     total_ms: f64,
     phases: BTreeMap<String, f64>,
+    provider_cache_hit: bool,
 }
 
 #[test]
@@ -37,6 +38,13 @@ fn test_search_timing_is_opt_in() -> VortexResult<()> {
             ))?)?,
             7
         );
+        conn.query(&format!(
+            "PREPARE indexed AS SELECT \"row\".id FROM vortex_index_search({}, [$1::FLOAT, 0::FLOAT], 1)",
+            literal(&root.path().join("index.json"))
+        ))?;
+        for _ in 0..2 {
+            assert_eq!(nearest_id(conn.query("EXECUTE indexed(7)")?)?, 7);
+        }
         return Ok(());
     }
 
@@ -64,8 +72,17 @@ fn test_search_timing_is_opt_in() -> VortexResult<()> {
             .filter_map(|line| serde_json::from_str::<Event>(line).ok())
             .filter(|event| event.event == "vortex_index_search_timing")
             .collect::<Vec<_>>();
-        assert_eq!(events.len(), usize::from(enabled));
-        if let Some(event) = events.first() {
+        assert_eq!(events.len(), if enabled { 3 } else { 0 });
+        if enabled {
+            assert_eq!(
+                events
+                    .iter()
+                    .map(|event| event.provider_cache_hit)
+                    .collect::<Vec<_>>(),
+                vec![false, false, true]
+            );
+        }
+        for event in &events {
             assert_eq!(event.format_version, 1);
             assert_eq!(event.phases.len(), 7);
             assert!(event.total_ms.is_finite() && event.total_ms > 0.0);

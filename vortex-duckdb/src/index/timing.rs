@@ -35,6 +35,7 @@ pub(super) struct SearchTiming {
     start: Option<Instant>,
     checkpoint: Option<Instant>,
     phases: Phases,
+    provider_cache_hit: bool,
 }
 
 impl SearchTiming {
@@ -44,7 +45,12 @@ impl SearchTiming {
             start,
             checkpoint: start,
             phases: Phases::default(),
+            provider_cache_hit: false,
         }
+    }
+
+    pub(super) fn provider_cache_hit(&mut self, hit: bool) {
+        self.provider_cache_hit = hit;
     }
 
     pub(super) fn mark(&mut self, phase: Phase) {
@@ -72,6 +78,7 @@ impl SearchTiming {
             format_version: u32,
             total_ms: f64,
             phases: &'a Phases,
+            provider_cache_hit: bool,
         }
         if let (Some(start), Some(end)) = (self.start, self.checkpoint) {
             let event = Event {
@@ -79,6 +86,7 @@ impl SearchTiming {
                 format_version: 1,
                 total_ms: end.duration_since(start).as_secs_f64() * 1000.0,
                 phases: &self.phases,
+                provider_cache_hit: self.provider_cache_hit,
             };
             if let Ok(json) = serde_json::to_string(&event) {
                 // Diagnostic output must not change query success on a closed pipe.

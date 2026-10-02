@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 mod prepared;
+mod reuse;
 mod scratch;
 mod timing;
 

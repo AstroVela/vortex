@@ -9,6 +9,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::ptr;
 use std::slice;
+use std::sync::Arc;
+use std::sync::Weak;
 
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -23,6 +25,8 @@ use super::FACTORIES;
 use super::MAX_K;
 use super::MAX_OPTIONS_BYTES;
 use super::Request;
+use super::cache::CacheBudget;
+use super::cache::PreparedIndexCache;
 use super::read_reference;
 use super::root;
 use super::timing::Phase;
@@ -117,6 +121,7 @@ fn bind(build: bool, inputs: &[&ValueRef]) -> VortexResult<Request> {
             reference,
             identity,
             descriptor,
+            cache: Weak::new(),
             query,
             k,
             options: options(inputs[3])?,
@@ -126,8 +131,26 @@ fn bind(build: bool, inputs: &[&ValueRef]) -> VortexResult<Request> {
     }
 }
 
-#[derive(Default)]
-struct ReferencePins(Mutex<BTreeMap<PathBuf, String>>);
+struct ReferencePins {
+    identities: Mutex<BTreeMap<PathBuf, String>>,
+    cache: Arc<PreparedIndexCache>,
+}
+
+impl ReferencePins {
+    fn new(budget: Arc<CacheBudget>) -> Self {
+        Self {
+            identities: Mutex::default(),
+            cache: Arc::new(PreparedIndexCache::new(budget)),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Default for ReferencePins {
+    fn default() -> Self {
+        Self::new(Arc::new(CacheBudget::default()))
+    }
+}
 
 impl ReferencePins {
     fn record(mut groups: Vec<&Self>, references: &[(&Path, &str)]) -> VortexResult<()> {
@@ -137,7 +160,7 @@ impl ReferencePins {
         groups.dedup_by(|a, b| ptr::eq(*a, *b));
         let mut guards = groups
             .iter()
-            .map(|group| group.0.lock())
+            .map(|group| group.identities.lock())
             .collect::<Vec<_>>();
         for pins in &guards {
             for &(reference, identity) in references {
@@ -158,7 +181,7 @@ impl ReferencePins {
     fn inherit(&self, groups: Vec<&Self>) -> VortexResult<bool> {
         // Identities are immutable once pinned. Release the source lock before
         // locking destinations, which can include the source itself.
-        let pins = self.0.lock().clone();
+        let pins = self.identities.lock().clone();
         if pins.is_empty() {
             return Ok(false);
         }
@@ -172,8 +195,21 @@ impl ReferencePins {
 }
 
 #[unsafe(no_mangle)]
-extern "C-unwind" fn vortex_index_pins_new() -> *mut c_void {
-    Box::into_raw(Box::new(ReferencePins::default())).cast()
+extern "C-unwind" fn vortex_index_cache_budget_new() -> *mut c_void {
+    Box::into_raw(Box::new(Arc::new(CacheBudget::default()))).cast()
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C-unwind" fn vortex_index_cache_budget_free(budget: *mut c_void) {
+    // The connection owns this Arc; live prepared pins retain independent clones.
+    unsafe { drop(Box::from_raw(budget.cast::<Arc<CacheBudget>>())) };
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C-unwind" fn vortex_index_pins_new(budget: *const c_void) -> *mut c_void {
+    // The synchronous constructor borrows the connection's live budget Arc.
+    let budget = unsafe { &*budget.cast::<Arc<CacheBudget>>() };
+    Box::into_raw(Box::new(ReferencePins::new(Arc::clone(budget)))).cast()
 }
 
 #[unsafe(no_mangle)]
@@ -260,6 +296,17 @@ unsafe extern "C-unwind" fn vortex_index_bind_free(bind: *mut c_void) {
 }
 
 #[unsafe(no_mangle)]
+unsafe extern "C-unwind" fn vortex_index_bind_cache(bind: *mut c_void, pins: *const c_void) {
+    // The binder exclusively owns this fresh request and lends live prepared pins.
+    // A copied/rebound request never prolongs the prepared owner's cache lifetime.
+    let request = unsafe { &mut *bind.cast::<Request>() };
+    let pins = unsafe { &*pins.cast::<ReferencePins>() };
+    if let Request::Search { cache, .. } = request {
+        *cache = Arc::downgrade(&pins.cache);
+    }
+}
+
+#[unsafe(no_mangle)]
 unsafe extern "C-unwind" fn vortex_index_execute(
     bind: *const c_void,
     error: *mut cpp::duckdb_vx_error,
@@ -321,11 +368,11 @@ mod tests {
                 .err()
                 .ok_or_else(|| vortex_err!("Changed reference identity was accepted"))?;
         assert!(error.to_string().contains("reference changed"), "{error}");
-        assert!(empty.0.lock().is_empty());
+        assert!(empty.identities.lock().is_empty());
         ReferencePins::record(vec![&owner, &empty, &owner], &[(reference, "original")])?;
         for pins in [&owner, &empty] {
             assert_eq!(
-                pins.0.lock().get(reference).map(String::as_str),
+                pins.identities.lock().get(reference).map(String::as_str),
                 Some("original")
             );
         }
@@ -341,14 +388,14 @@ mod tests {
         let last = Path::new("z.json");
         ReferencePins::record(vec![&source], &[(first, "first"), (last, "replacement")])?;
         ReferencePins::record(vec![&owner], &[(last, "original")])?;
-        let original = owner.0.lock().clone();
+        let original = owner.identities.lock().clone();
         let error = source
             .inherit(vec![&empty, &owner, &empty])
             .err()
             .ok_or_else(|| vortex_err!("Conflicting inherited identity was accepted"))?;
         assert!(error.to_string().contains("reference changed"), "{error}");
-        assert!(empty.0.lock().is_empty());
-        assert_eq!(*owner.0.lock(), original);
+        assert!(empty.identities.lock().is_empty());
+        assert_eq!(*owner.identities.lock(), original);
         Ok(())
     }
 
@@ -362,10 +409,10 @@ mod tests {
         assert!(!source.inherit(vec![&owner])?);
         ReferencePins::record(vec![&source], &[(inherited, "inner")])?;
         assert!(source.inherit(vec![&source, &owner, &owner])?);
-        assert_eq!(source.0.lock().len(), 1);
-        assert_eq!(owner.0.lock().len(), 2);
+        assert_eq!(source.identities.lock().len(), 1);
+        assert_eq!(owner.identities.lock().len(), 2);
         assert_eq!(
-            owner.0.lock().get(inherited).map(String::as_str),
+            owner.identities.lock().get(inherited).map(String::as_str),
             Some("inner")
         );
         Ok(())
