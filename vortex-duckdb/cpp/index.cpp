@@ -82,6 +82,15 @@ struct IndexBind final : FunctionData {
 
 const char *const PIN_DEPENDENCY = "vortex_index_reference_pins";
 
+struct CacheBudget final {
+    CacheBudget() : budget(vortex_index_cache_budget_new()) {
+    }
+    ~CacheBudget() {
+        vortex_index_cache_budget_free(budget);
+    }
+    void *budget;
+};
+
 template <class CALLBACK>
 void VisitIndexRequests(const PhysicalOperator &op, CALLBACK &&callback) {
     if (op.type == PhysicalOperatorType::TABLE_SCAN) {
@@ -96,7 +105,7 @@ void VisitIndexRequests(const PhysicalOperator &op, CALLBACK &&callback) {
 }
 
 struct ReferencePins final {
-    ReferencePins() : pins(vortex_index_pins_new()) {
+    explicit ReferencePins(const CacheBudget &budget) : pins(vortex_index_pins_new(budget.budget)) {
     }
     ~ReferencePins() {
         vortex_index_pins_free(pins);
@@ -222,7 +231,7 @@ struct IndexPreparedState final : ClientContextState {
                 return lifetime->pins;
             }
         }
-        auto pins = make_shared_ptr<ReferencePins>();
+        auto pins = make_shared_ptr<ReferencePins>(cache_budget);
         if (prepared.physical_plan) {
             pins->Remember(prepared.physical_plan->Root());
         }
@@ -262,7 +271,7 @@ struct IndexPreparedState final : ClientContextState {
     void InheritPins(const ReferencePins &source) {
         // An optimized-away scan still has a saved identity. Copy only the
         // inner owner's pins outward, not unrelated outer pins into the owner.
-        auto capture = pending ? pending : make_shared_ptr<ReferencePins>();
+        auto capture = pending ? pending : make_shared_ptr<ReferencePins>(cache_budget);
         auto groups = PinGroups(*capture);
         duckdb_vx_error error = nullptr;
         bool inherited = vortex_index_pins_inherit(source.pins, groups.data(), groups.size(), &error);
@@ -271,17 +280,22 @@ struct IndexPreparedState final : ClientContextState {
             pending = std::move(capture);
         }
     }
-    void RecordBind(const void *request) {
+    void RecordBind(void *request) {
         if (!preparing) {
             return;
         }
-        auto capture = pending ? pending : make_shared_ptr<ReferencePins>();
+        auto capture = pending ? pending : make_shared_ptr<ReferencePins>(cache_budget);
         auto groups = PinGroups(*capture);
         duckdb_vx_error error = nullptr;
         vortex_index_pins_record(groups.data(), groups.size(), request, &error);
         CheckError(error);
+        // Rebinds borrow the original prepared owner's cache. Independent binds
+        // get a new cache, and the request holds only a weak reference to it.
+        auto &owner = borrowed.empty() ? *capture : *borrowed.front();
+        vortex_index_bind_cache(request, owner.pins);
         pending = std::move(capture);
     }
+    CacheBudget cache_budget;
     vector<shared_ptr<ReferencePins>> borrowed;
     shared_ptr<ReferencePins> execute_owner;
     shared_ptr<ReferencePins> pending;
@@ -341,6 +355,8 @@ unique_ptr<FunctionData> BindIndex(ClientContext &context,
     if (!build) {
         auto options = input.named_parameters.find("backend_options");
         values.push_back(options == input.named_parameters.end() ? Value("") : options->second);
+        auto mode = input.named_parameters.find("validation_mode");
+        values.push_back(mode == input.named_parameters.end() ? Value("strict") : mode->second);
     }
     vector<duckdb_value> pointers;
     for (auto &value : values) {
@@ -397,6 +413,7 @@ vector<TableFunction> Functions() {
                          BindIndex,
                          InitIndex);
     search.named_parameters["backend_options"] = LogicalType::VARCHAR;
+    search.named_parameters["validation_mode"] = LogicalType::VARCHAR;
     return {build, search};
 }
 

@@ -12,6 +12,8 @@
 //! The initial implementation requires an exact snapshot match; it does not
 //! implement transactions, compaction remapping, or automatic SQL optimization.
 
+#[cfg(any(feature = "file", all(unix, feature = "local-store")))]
+mod checksum;
 #[cfg(feature = "file")]
 pub mod file;
 mod flat;

@@ -470,6 +470,7 @@ fn test_empty_inventory_and_empty_file() -> VortexResult<()> {
             fixture.session.clone(),
         )
         .await?;
+        assert_eq!(source.pinned_bytes(), 0);
         assert!(source.take(&[], &fields(&["id"])).await?.data.is_empty());
         assert!(
             source
@@ -675,6 +676,9 @@ fn test_pinned_bytes_survive_replacement_in_place_writes_and_deletion() -> Vorte
         let source = fixture.open().await?;
         let first = &fixture.snapshot.files[0].uri;
         let second = &fixture.snapshot.files[1].uri;
+        let pinned_bytes =
+            usize::try_from(fs::metadata(first)?.len() + fs::metadata(second)?.len())?;
+        assert_eq!(source.pinned_bytes(), pinned_bytes);
         let replacement = fixture.dir.path().join("replacement.vortex");
         fs::write(&replacement, fs::read(second)?)?;
         fs::rename(&replacement, first)?;
@@ -682,6 +686,7 @@ fn test_pinned_bytes_survive_replacement_in_place_writes_and_deletion() -> Vorte
         assert!(fixture.open().await.is_err());
         fs::remove_file(first)?;
         fs::remove_file(second)?;
+        assert_eq!(source.pinned_bytes(), pinned_bytes);
         let batch = source
             .take(&[row(30, 2), row(10, 0)], &fields(&["id"]))
             .await?;

@@ -32,14 +32,11 @@ use std::sync::Arc;
 
 use async_stream::try_stream;
 use async_trait::async_trait;
-use base16ct::HexDisplay;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::stream::BoxStream;
 #[cfg(unix)]
 use rustix::fs as unix_fs;
-use sha2::Digest;
-use sha2::Sha256;
 use vortex_array::IntoArray;
 use vortex_array::arrays::ChunkedArray;
 use vortex_array::dtype::DType;
@@ -64,10 +61,11 @@ use crate::IndexSource;
 use crate::RowAddress;
 use crate::Snapshot;
 use crate::SourceBatch;
+use crate::checksum::sha256;
 
 /// SHA-256 identity of the complete encoded file, including footer and metadata.
 pub fn file_version(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", HexDisplay(&Sha256::digest(bytes)))
+    sha256(bytes)
 }
 
 /// Fingerprint of the logical schema, including field order and nullability.
@@ -91,6 +89,7 @@ pub struct LocalFileSource {
     snapshot: Arc<Snapshot>,
     dtype: DType,
     files: BTreeMap<u64, VortexFile>,
+    pinned_bytes: usize,
 }
 
 impl LocalFileSource {
@@ -191,6 +190,7 @@ impl LocalFileSource {
                     snapshot: Arc::new(snapshot),
                     dtype,
                     files,
+                    pinned_bytes: max_pinned_bytes - remaining,
                 })
             })
             .await
@@ -199,6 +199,11 @@ impl LocalFileSource {
     /// The verified, unprojected dtype shared by all files.
     pub fn dtype(&self) -> &DType {
         &self.dtype
+    }
+
+    /// Total encoded bytes retained by this source, excluding decoded data and metadata.
+    pub fn pinned_bytes(&self) -> usize {
+        self.pinned_bytes
     }
 
     fn projection(&self, fields: &[String]) -> VortexResult<BoundExpression> {

@@ -195,7 +195,15 @@ void duckdb_copy_function_copy_to_sink(const void *bind_data,
 extern void duckdb_copy_function_copy_to_finalize(void *global_data, duckdb_vx_error *error_out);
 
 #if (defined(VORTEX_INDEX) && defined(VORTEX_INDEX_UNIX))
-extern void *vortex_index_pins_new(void);
+extern void *vortex_index_cache_budget_new(void);
+#endif
+
+#if (defined(VORTEX_INDEX) && defined(VORTEX_INDEX_UNIX))
+extern void vortex_index_cache_budget_free(void *budget);
+#endif
+
+#if (defined(VORTEX_INDEX) && defined(VORTEX_INDEX_UNIX))
+extern void *vortex_index_pins_new(const void *budget);
 #endif
 
 #if (defined(VORTEX_INDEX) && defined(VORTEX_INDEX_UNIX))
@@ -233,6 +241,10 @@ extern void *vortex_index_bind_copy(const void *bind);
 
 #if (defined(VORTEX_INDEX) && defined(VORTEX_INDEX_UNIX))
 extern void vortex_index_bind_free(void *bind);
+#endif
+
+#if (defined(VORTEX_INDEX) && defined(VORTEX_INDEX_UNIX))
+extern void vortex_index_bind_cache(void *bind, const void *pins);
 #endif
 
 #if (defined(VORTEX_INDEX) && defined(VORTEX_INDEX_UNIX))

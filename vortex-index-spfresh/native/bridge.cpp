@@ -261,3 +261,9 @@ extern "C" void vortex_spfresh_close(void *opaque) {
     Workspaces workspaces;
     delete static_cast<Handle *>(opaque);
 }
+
+#ifdef VORTEX_SPFRESH_BENCHMARK
+SPTAG::SPANN::Index<float> &vortex_spfresh_benchmark_index(void *opaque) {
+    return static_cast<Handle *>(opaque)->index;
+}
+#endif

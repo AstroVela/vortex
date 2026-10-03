@@ -4,10 +4,14 @@
 //! Explicit, local static-index SQL operations (`index` feature, Unix).
 //!
 //! Extensions register provider factories before loading SQL functions. Each
-//! operation creates a private scratch lease. Reference files are immutable,
-//! exclusively published only after build, seal, and qualified reopen. They
-//! describe frozen whole-file coverage, not a mutable table catalog.
+//! opened generation owns a private scratch lease. Prepared owners may retain
+//! bounded provider handles. Strict validation runs on every execution; explicit
+//! snapshot mode retains the fully verified source as well. Reference identity
+//! and DuckDB access policy remain checked on every execution. Reference files
+//! are immutable, exclusively published only after build, seal, and qualified
+//! reopen. They describe frozen whole-file coverage, not a mutable table catalog.
 
+mod cache;
 mod ffi;
 #[cfg(test)]
 mod tests;
@@ -26,6 +30,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::Weak;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -76,6 +81,8 @@ use vortex_index::store::LocalGeneration;
 use vortex_index::store::LocalIndexStore;
 use vortex_index::store::LocalStoreLimits;
 
+use self::cache::CacheKey;
+use self::cache::PreparedIndexCache;
 use self::timing::Phase;
 use self::timing::SearchTiming;
 use crate::SESSION;
@@ -89,10 +96,11 @@ const STORE_LIMITS: LocalStoreLimits = LocalStoreLimits {
     max_manifest_bytes: MAX_REFERENCE_BYTES,
 };
 
-/// Construct an explicitly selected provider using this operation's scratch root.
+/// Construct an explicitly selected provider using this opened generation's scratch root.
 ///
 /// The root exists, is private and absolute, and remains alive until all provider
-/// handles have closed. The factory must not retain its path beyond the operation.
+/// handles have closed. Prepared owners can retain these handles across executions;
+/// the factory must not retain its path after their owner closes them.
 pub type IndexProviderFactory = fn(VortexSession, &Path) -> VortexResult<Arc<dyn IndexProvider>>;
 
 static FACTORIES: LazyLock<RwLock<BTreeMap<String, IndexProviderFactory>>> =
@@ -160,11 +168,21 @@ enum Request {
     Search {
         reference: PathBuf,
         identity: String,
-        descriptor: Reference,
+        descriptor: Box<Reference>,
+        cache: Weak<PreparedIndexCache>,
+        validation_mode: ValidationMode,
         query: Vec<f32>,
         k: NonZeroUsize,
         options: Bytes,
     },
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ValidationMode {
+    #[default]
+    Strict,
+    Snapshot,
 }
 
 impl Request {
@@ -219,6 +237,8 @@ impl Request {
                 reference,
                 identity,
                 descriptor,
+                cache,
+                validation_mode,
                 query,
                 k,
                 options,
@@ -227,7 +247,22 @@ impl Request {
                     vortex_bail!("Index reference changed after bind; prepare a new query");
                 }
                 timing.mark(Phase::ReferenceCheck);
-                search(reference, descriptor, query, *k, options.clone(), timing).await
+                timing.validation_mode(*validation_mode);
+                let cache = cache.upgrade();
+                search(
+                    &CacheKey {
+                        reference: reference.clone(),
+                        identity: identity.clone(),
+                        validation_mode: *validation_mode,
+                    },
+                    descriptor,
+                    cache.as_deref(),
+                    query,
+                    *k,
+                    options.clone(),
+                    timing,
+                )
+                .await
             }
         }
     }
@@ -477,41 +512,60 @@ async fn build(
 }
 
 async fn search(
-    reference: &Path,
+    key: &CacheKey,
     descriptor: &Reference,
+    cache: Option<&PreparedIndexCache>,
     query: &[f32],
     k: NonZeroUsize,
     options: Bytes,
     timing: &mut SearchTiming,
 ) -> VortexResult<StructArray> {
-    let root = root(reference)?;
-    let source = LocalFileSource::open(
-        descriptor.snapshot.clone(),
-        descriptor.dtype.clone(),
-        MAX_SOURCE_BYTES,
-        SESSION.clone(),
-    )
-    .await?;
-    let (store, metadata) = LocalIndexStore::open(
-        root,
-        &descriptor.generation,
-        source.snapshot(),
-        STORE_LIMITS,
-    )?;
-    if metadata.uncovered_files().next().is_some() || metadata.fields.len() != 1 {
-        vortex_bail!("SQL static search requires full file coverage and one vector field");
-    }
-    timing.mark(Phase::SourceValidation);
-    let scratch = tempfile::Builder::new()
-        .prefix(".index-scratch-")
-        .permissions(fs::Permissions::from_mode(0o700))
-        .tempdir_in(root)?;
-    let mut registry = IndexRegistry::default();
-    registry.register(provider(&metadata.backend, scratch.path())?)?;
-    let index = registry
-        .open(&metadata, source.snapshot(), Arc::new(store))
-        .await?;
-    let vector = index
+    let root = root(&key.reference)?;
+    let snapshot_cache = (key.validation_mode == ValidationMode::Snapshot)
+        .then(|| {
+            cache.ok_or_else(|| vortex_err!("Snapshot validation requires a live prepared owner"))
+        })
+        .transpose()?;
+    let cached_snapshot = snapshot_cache.and_then(|cache| cache.snapshot(key));
+    let (source, opened, cache_hit) = if let Some(opened) = cached_snapshot {
+        let source = opened
+            .source
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| vortex_err!("Cached snapshot is missing its source"))?;
+        timing.snapshot_cache_hit(true);
+        timing.mark(Phase::SourceValidation);
+        (source, opened, true)
+    } else {
+        let source = Arc::new(
+            LocalFileSource::open(
+                descriptor.snapshot.clone(),
+                descriptor.dtype.clone(),
+                MAX_SOURCE_BYTES,
+                SESSION.clone(),
+            )
+            .await?,
+        );
+        let (store, metadata) = LocalIndexStore::open(
+            root,
+            &descriptor.generation,
+            source.snapshot(),
+            STORE_LIMITS,
+        )?;
+        if metadata.uncovered_files().next().is_some() || metadata.fields.len() != 1 {
+            vortex_bail!("SQL static search requires full file coverage and one vector field");
+        }
+        timing.mark(Phase::SourceValidation);
+        let pinned_source = snapshot_cache.map(|_| Arc::clone(&source));
+        let (opened, cache_hit) =
+            PreparedIndexCache::open(cache, key, root, &metadata, Arc::new(store), pinned_source)
+                .await?;
+        (source, opened, cache_hit)
+    };
+    let metadata = opened.index.metadata();
+    timing.provider_cache_hit(cache_hit);
+    let vector = opened
+        .index
         .as_vector()
         .ok_or_else(|| vortex_err!("Index has no vector capability"))?;
     if vector.spec().metric != DistanceMetric::SquaredL2 {

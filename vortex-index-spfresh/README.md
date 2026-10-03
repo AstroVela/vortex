@@ -198,3 +198,63 @@ real multipage postings from 30,000 eight-dimensional vectors. CI runs these
 ordinary tests and all-target Clippy after the pinned native build.
 This is correctness qualification, not a large-scale latency/recall benchmark
 or NVMe/SPDK qualification.
+
+## Layered Search Benchmark
+
+Two opt-in executables measure one query per call on an already-qualified,
+frozen generation. Build native support with the command above from this
+checkout, then build the benchmark-only CMake target and Rust example:
+
+```sh
+cmake --build "$VORTEX_SPFRESH_NATIVE" --target spfresh_benchmark
+cargo build --locked -p vortex-index-spfresh --release \
+  --example bench_provider --features native
+```
+
+`spfresh_benchmark` is excluded from the default native build. Its direct-index
+accessor is compiled only into that executable, not the production bridge. It
+supports three modes on the same static index:
+
+| Mode | Timed work |
+|---|---|
+| `cpp-reset` | Direct SPANN search with SPANN/BKT workspace reset at both call boundaries |
+| `cpp-reuse` | Direct SPANN search retaining workspace on one fixed handle and thread |
+| `bridge` | Current C bridge, including per-call configuration, serialization and workspace resets |
+
+The native CLI is:
+
+```text
+spfresh_benchmark MODE NATIVE_ROOT QUERIES.f32bin ROWS K MAX_CHECK INTERNAL_RESULTS POSTING_PAGES WARMUP_ROUNDS ROUNDS OUTPUT.csv
+```
+
+`NATIVE_ROOT` contains the six imported native files. The little-endian query
+file contains u32 query count, u32 dimension, then contiguous Float32 components.
+Native open/close are reported separately from `steady_clock` query times. Result
+allocation, search, copying and destruction are inside the timer; CSV output is
+outside it. Direct modes configure the index once, whereas the bridge configures
+it per call. `cpp-reuse` is an experimental lower-bound comparison, not a change
+to production isolation or a supported multi-handle optimization.
+
+`bench_provider CONFIG.json OUTPUT.json` opens a SQL reference's generation
+through `LocalIndexStore` and `SpFreshProvider`, then times public
+`VectorIndex::search` calls with `Instant`. Its closed configuration contains:
+
+```json
+{"format_version":1,"reference":"/absolute/path/index.json","queries":[[0.0,1.0]],"k":10,"max_check":4096,"internal_results":64,"search_pages":256,"warmup_rounds":1,"rounds":3}
+```
+
+The dimension and page limit must match the generation. The example verifies
+and materializes artifacts at open, includes Provider validation/FFI/hit mapping
+in query times, and removes its private scratch after closing. It does not
+perform SQL's per-execution source/store checks or fetch original rows. Stop
+all writers for the entire comparison. Native IDs must be translated through
+`spfresh/rows.bin`; they are not dataset IDs.
+
+The outer `duckdb-vortex` repository's `scripts/bench_index_layers.py` reuses a
+completed prepared SQL benchmark fixture, qualifies SQL's effective Float32
+query inputs, runs these executables and full SQL sequentially, and checks ranked
+IDs/distances and all input/artifact hashes. Match the compiler, release profile,
+SDK and native cache across layers. The Vortex workspace release profile and
+frame-pointer flags can differ from the outer extension's profile; default builds
+are not automatically comparable. OS page caches are not evicted. These targets
+do not qualify dynamic SPFresh updates, concurrent throughput or NVMe/SPDK.

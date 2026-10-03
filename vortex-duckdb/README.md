@@ -150,8 +150,9 @@ Search returns ANN candidates with one-based `rank`, physical `file_id` and
 `row_offset`, squared-L2 `distance`, and a `row` struct containing all original
 columns fetched through `IndexSource::take`. Use `ORDER BY rank` for SQL result
 ordering. Optional `backend_options` is passed unchanged to the provider.
-Each execution verifies the reference, source contents, sealed manifest and
-artifacts anew. Source replacement, deletion or corruption fails; prepared
+The default `validation_mode := 'strict'` verifies the reference, source contents,
+sealed manifest and artifacts anew on every execution. Source replacement,
+deletion or corruption fails; prepared
 queries also reject changed reference bytes instead of silently adopting them.
 Reference identity is pinned per prepared statement at its first resolved bind
 and survives automatic parameter and catalog rebinding, including replacement
@@ -167,11 +168,58 @@ their temporary pin borrows when planning ends. Index-bearing EXECUTE wrappers
 capture their own identity even when the SQL owner has a cached plan, and rebind
 before execution rather than reuse a plan borrowed from a deallocated SQL owner.
 
+### Explicit Prepared Snapshots
+
+Opt into `validation_mode := 'snapshot'` to retain the verified in-memory source
+and generic provider handle for a prepared owner. PREPARE performs no provider
+open. The first execution verifies all source, manifest and artifact bytes;
+a successfully opened provider and its verified source are retained. Subsequent
+executions fetch rows from that same source and search the retained index.
+
+```sql
+PREPARE nearest_snapshot AS
+SELECT rank, distance, "row".id
+FROM vortex_index_search(
+    '/indexes/embedding.json', $1::FLOAT[], 10,
+    validation_mode := 'snapshot'
+)
+ORDER BY rank;
+
+EXECUTE nearest_snapshot([1,2,3,4,5,6,7,8]::FLOAT[]);
+DEALLOCATE nearest_snapshot;
+```
+
+This is an explicit immutable view, not automatic freshness detection. After
+verification and provider open, replacing, corrupting or removing the source,
+manifest or original artifacts does not change that owner's rows or index.
+Every execution still verifies the reference identity and DuckDB external/local
+filesystem access policy. A changed reference is rejected; prepare a new owner
+to accept a newly published reference and validate the new generation. This does
+not provide a DuckDB transactional or filesystem-atomic snapshot.
+
+Strict and snapshot scans use separate cache entries, even in the same owner;
+opting one scan into snapshot mode never relaxes another strict scan. Query
+vectors, `k` and provider options remain per-call inputs. Independent owners and
+connections do not share snapshots. Ad-hoc statements can use the mode but do
+not retain a snapshot across separate statements; execution requires a live
+prepared owner. Destroying or deallocating the owner releases its source and
+handles, closing native handles before removing private scratch directories.
+
+Each connection may retain eight handles, 256 MiB of sealed artifacts and
+512 MiB of encoded source bytes across its owners. These bound retained input
+bytes, not RSS, decoded arrays or transient validation allocations. Strict mode
+falls back to uncached open/search/close when a handle cannot be retained;
+snapshot mode instead reports a budget error so it cannot silently reload a
+different view. Failed opens release their reservations and scratch.
+
+### Scope And Limits
+
 The initial path requires full coverage of a frozen local source, enabled
 external access and a registered provider. SQL WHERE clauses filter returned
 candidates after ANN retrieval; they do not implement filtered top-k. The
-adapter does not rewrite exact SQL distance ordering, reuse native handles,
-support online mutation, or serialize native state to Ray workers.
+adapter does not rewrite exact SQL distance ordering, support online mutation,
+or serialize native state to Ray workers. Prepared owners can retain generic
+provider handles; native search workspace reuse is not enabled by this mode.
 Native work runs synchronously on the DuckDB query worker.
 
 Limits are 512 MiB of pinned encoded source bytes, 16 MiB of reference/manifest

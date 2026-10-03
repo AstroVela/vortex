@@ -76,6 +76,18 @@ cargo test -p vortex-index --all-features
 cargo test -p vortex-index --no-default-features --features local-store
 ```
 
+Both adapters use the same accelerated SHA-256 implementation for complete
+encoded files, manifests and streaming artifact verification. The existing
+`sha256:<lowercase hex>` identities and serialized formats are unchanged; no
+content check is replaced with a path, timestamp or length-only check. The
+`ring` dependency is enabled only by the optional file/storage features.
+The previous RustCrypto implementation is retained as a test and benchmark
+oracle for padding and IO chunk boundaries.
+
+```sh
+cargo bench -p vortex-index --features file --bench checksum
+```
+
 Native SPFresh integration and SQL wiring remain separate milestones. A native
 backend will also need constrained local artifact access; whole-object `Bytes`
 IO is not a scalable substitute for native checkpoint files or range reads.

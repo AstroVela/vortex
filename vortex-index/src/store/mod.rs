@@ -37,15 +37,12 @@ use std::path::Component;
 use std::path::Path;
 
 use async_trait::async_trait;
-use base16ct::HexDisplay;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use rustix::fs as unix_fs;
 use rustix::io::Errno;
 use serde::Deserialize;
 use serde::Serialize;
-use sha2::Digest;
-use sha2::Sha256;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
@@ -55,6 +52,8 @@ use crate::IndexMetadata;
 use crate::IndexStore;
 use crate::LocalIndexFiles;
 use crate::Snapshot;
+use crate::checksum::Sha256;
+use crate::checksum::sha256;
 use crate::metadata::validate_artifact_path;
 
 const ARTIFACTS: &str = "artifacts";
@@ -414,7 +413,7 @@ fn artifact(path: &str, bytes: &[u8]) -> VortexResult<IndexArtifact> {
     Ok(IndexArtifact {
         path: path.to_owned(),
         size: u64::try_from(bytes.len())?,
-        checksum: format!("sha256:{:x}", HexDisplay(&Sha256::digest(bytes))),
+        checksum: sha256(bytes),
     })
 }
 
@@ -483,7 +482,7 @@ fn copy_and_hash(
         Err(err) if err.kind() == ErrorKind::UnexpectedEof => {}
         Err(err) => return Err(err.into()),
     }
-    Ok(format!("sha256:{:x}", HexDisplay(&hasher.finalize())))
+    Ok(hasher.finalize())
 }
 
 mod local_files;
