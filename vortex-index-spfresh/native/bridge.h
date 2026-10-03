@@ -9,6 +9,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
 // Build into a new, private directory. Input remains live and immutable until return.
 int vortex_spfresh_build(const char *root,
                          const float *vectors,
@@ -47,4 +48,19 @@ class Index;
 }
 // Benchmark-only access to an opened handle; never built into the production bridge.
 SPTAG::SPANN::Index<float> &vortex_spfresh_benchmark_index(void *handle);
+#endif
+
+#if defined(VORTEX_SPFRESH_TESTING) && defined(__cplusplus)
+struct SpFreshWorkspaceStats {
+    const void *postings = nullptr;
+    const void *heads = nullptr;
+    uint32_t internal_results = 0;
+    uint32_t check_capacity = 0;
+    uint32_t head_check_capacity = 0;
+    uint32_t posting_buffer_bytes = 0;
+    int live_posting_workspaces = 0;
+    bool thread_detached = false;
+};
+// Test-only inspection; never built into the production bridge.
+SpFreshWorkspaceStats vortex_spfresh_test_workspaces(void *handle);
 #endif

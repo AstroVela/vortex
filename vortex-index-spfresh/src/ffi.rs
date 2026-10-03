@@ -59,7 +59,8 @@ pub(crate) struct Native {
 }
 
 // SAFETY: the C++ bridge serializes all entrypoints with a process-wide mutex and
-// clears upstream per-thread workspaces. Handles have no owner-thread affinity.
+// detaches handle-owned workspaces from upstream TLS at every call boundary.
+// Synchronous IO leaves no outstanding tasks or owner-thread affinity.
 unsafe impl Send for Native {}
 // SAFETY: shared Rust access only invokes those serialized C++ entrypoints. Drop
 // requires exclusive ownership, so no call can race handle destruction.

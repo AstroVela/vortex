@@ -133,6 +133,43 @@ head graphs, replica selection, temporary files and metadata need additional
 resources. The builder is not out-of-core. Native build is synchronous, cannot
 be interrupted by dropping an async future mid-call, and serializes with searches.
 
+### SIFT Benchmark Fixture
+
+The native-only `bench_sift_fixture` example converts a complete, ordered fvecs
+corpus to two Vortex files and builds one sealed generation through the public
+source, builder, store and provider APIs. It preserves original positional IDs
+as `id`, original Float32 embeddings, and `row-ID` labels; it does not normalize
+vectors or generate ground truth. The destination must be new and absolute.
+
+```json
+{
+  "base": "/absolute/path/sift_base.fvecs",
+  "output_dir": "/absolute/path/new-fixture",
+  "rows": 1000000,
+  "options": {
+    "format_version": 1,
+    "dimension": 128,
+    "head_count": 16384,
+    "posting_page_limit": 128,
+    "replicas": 1
+  }
+}
+```
+
+```sh
+cargo run --locked --release -p vortex-index-spfresh \
+  --example bench_sift_fixture --features native -- fixture-config.json
+```
+
+This benchmark tool explicitly allows 512 MiB of flattened vector input so a
+complete SIFT1M corpus can be measured. It does not change the production
+builder's 256 MiB default, SQL factory budgets, or provider limits. Private
+scratch directories are removed after construction. `index.json` is published
+only after sealing and a successful provider open; `build.json` records options,
+the explicit input budget, and build/seal/reopen time. Corpus conversion and
+initial source pinning are outside that timer. RSS and temporary-disk use must
+be measured separately.
+
 ## Open, Search And Lifetime
 
 Register `SpFreshProvider` explicitly. It requires `IndexStore::as_local_files`
@@ -168,16 +205,25 @@ per-query search_pages would shrink the native read buffers without reducing
 IO, so values below the page limit are rejected. The provider limits
 materialized bytes, mapping rows, batch vectors and posting-buffer allocation
 separately. Those are not a total native RSS limit or global disk quota. Each
-handle costs a full artifact copy and retains its own in-memory head index and
-row map.
+handle costs a full artifact copy and retains its own in-memory head index,
+row map, and at most one SPANN/BKT search workspace pair after a successful call.
+Posting-buffer limits bound that pair's posting buffers, not its BKT/hash overhead
+or the combined retained memory of all open handles.
 
 Open/import/search are **blocking**, despite common async trait signatures.
 Run them on blocking workers. The bridge serializes all native calls across
-handles and clears SPANN/BKT thread-local workspaces at call boundaries, since
-upstream shares them across Float32 indexes with potentially different sizes.
+handles. Search temporarily lends the owning handle's workspace pair to the
+current thread, then detaches it from upstream's shared Float32 TLS at return.
+Unchanged options reuse the pair; changes to max_check or internal_results
+discard it before searching, since upstream does not resize existing buffers.
+Failed native searches discard borrowed workspaces. Dimension, page limit and
+hash configuration cannot change on an opened handle. No global pointer-keyed
+cache or worker-specific copies survive handle destruction, even on another
+thread; a handle can migrate between serialized synchronous worker calls.
 Posting reads use the upstream synchronous path and fail on short/error reads;
 there are no outstanding native IO tasks when a call returns. This conservative
-first version favors isolation over concurrent throughput.
+version favors isolation over concurrent throughput. Open and build calls still
+clear their temporary upstream workspaces at both call boundaries.
 Do not link another incompatible SPTAG build into the same process.
 
 Artifacts and their producer remain trusted: checksums and structural checks
@@ -196,6 +242,10 @@ Initial-builder tests cover actual multi-file Vortex input, Flat recall, ranked
 take, independent build/read processes, invalid source/options, byte limits and
 real multipage postings from 30,000 eight-dimensional vectors. CI runs these
 ordinary tests and all-target Clippy after the pinned native build.
+Native workspace tests verify actual retention and reuse, isolation between
+different dimensions/page limits, increasing/decreasing capacity options with
+fresh-open parity, partial-batch error cleanup, thread migration, concurrent
+serialized calls, cross-thread destruction and complete workspace release.
 This is correctness qualification, not a large-scale latency/recall benchmark
 or NVMe/SPDK qualification.
 
@@ -219,7 +269,7 @@ supports three modes on the same static index:
 |---|---|
 | `cpp-reset` | Direct SPANN search with SPANN/BKT workspace reset at both call boundaries |
 | `cpp-reuse` | Direct SPANN search retaining workspace on one fixed handle and thread |
-| `bridge` | Current C bridge, including per-call configuration, serialization and workspace resets |
+| `bridge` | Current C bridge, including per-call configuration, serialization and handle-owned workspace reuse |
 
 The native CLI is:
 
@@ -232,8 +282,8 @@ file contains u32 query count, u32 dimension, then contiguous Float32 components
 Native open/close are reported separately from `steady_clock` query times. Result
 allocation, search, copying and destruction are inside the timer; CSV output is
 outside it. Direct modes configure the index once, whereas the bridge configures
-it per call. `cpp-reuse` is an experimental lower-bound comparison, not a change
-to production isolation or a supported multi-handle optimization.
+it per call. `cpp-reuse` is a direct single-handle/thread lower bound without the
+bridge's option and lifecycle guards; it is not a supported multi-handle entrypoint.
 
 `bench_provider CONFIG.json OUTPUT.json` opens a SQL reference's generation
 through `LocalIndexStore` and `SpFreshProvider`, then times public

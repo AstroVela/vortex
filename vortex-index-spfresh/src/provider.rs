@@ -70,8 +70,9 @@ impl Default for SpFreshLimits {
 ///
 /// Requires the `native` feature and a local-file-capable sealed store. Call open
 /// and search on a blocking worker; async signatures do not make native IO async.
-/// All native operations in this bridge are serialized across handles, and native
-/// thread-local workspaces are cleared at call boundaries. Initial construction
+/// All native operations in this bridge are serialized across handles. Each handle
+/// retains one search workspace pair, detached from thread-local storage between
+/// calls and discarded on capacity-option changes or search errors. Initial construction
 /// is opt-in via [`Self::with_builder`]; opened indexes have no mutation capability.
 /// The owner must qualify recall for its workload.
 #[derive(Debug)]

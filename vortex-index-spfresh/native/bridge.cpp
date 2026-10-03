@@ -38,6 +38,42 @@ struct Handle {
     uint32_t dimension;
     uint32_t rows;
     uint32_t posting_pages;
+    std::shared_ptr<SPTAG::SPANN::ExtraWorkSpace> spann_workspace;
+    std::shared_ptr<SPTAG::COMMON::WorkSpace> bkt_workspace;
+    uint32_t workspace_max_check = 0;
+    uint32_t workspace_internal_results = 0;
+};
+
+// A serialized, synchronous call lends this handle's buffers to the current TLS.
+// Keeping only one pair per handle also bounds retention when worker threads change.
+struct SearchWorkspaces {
+    Handle &handle;
+
+    SearchWorkspaces(Handle &owner, uint32_t max_check, uint32_t internal_results) : handle(owner) {
+        // Dimension, page size and hash configuration are fixed by the owning handle.
+        // Upstream only initializes capacities when TLS is empty, not on option changes.
+        if (handle.workspace_max_check != max_check ||
+            handle.workspace_internal_results != internal_results) {
+            handle.spann_workspace.reset();
+            handle.bkt_workspace.reset();
+        }
+        handle.workspace_max_check = max_check;
+        handle.workspace_internal_results = internal_results;
+        SPTAG::SPANN::Index<float>::m_workspace = std::move(handle.spann_workspace);
+        SPTAG::BKT::Index<float>::m_workspace = std::move(handle.bkt_workspace);
+    }
+
+    SearchWorkspaces(const SearchWorkspaces &) = delete;
+    SearchWorkspaces &operator=(const SearchWorkspaces &) = delete;
+
+    ~SearchWorkspaces() {
+        Workspaces::clear();
+    }
+
+    void retain() noexcept {
+        handle.spann_workspace = std::move(SPTAG::SPANN::Index<float>::m_workspace);
+        handle.bkt_workspace = std::move(SPTAG::BKT::Index<float>::m_workspace);
+    }
 };
 
 void check(SPTAG::ErrorCode result, const char *operation) {
@@ -226,6 +262,7 @@ extern "C" int vortex_spfresh_search(void *opaque,
             max_check > 1048576 || search_pages != handle.posting_pages) {
             throw std::runtime_error("Invalid SPFresh query options");
         }
+        SearchWorkspaces workspaces(handle, max_check, internal_results);
         const auto set = [&](const char *name, uint32_t value, const char *section) {
             check(handle.index.SetParameter(name, std::to_string(value).c_str(), section), name);
         };
@@ -253,6 +290,7 @@ extern "C" int vortex_spfresh_search(void *opaque,
                 distances[offset] = hit.Dist;
             }
         }
+        workspaces.retain();
     });
 }
 
@@ -265,5 +303,30 @@ extern "C" void vortex_spfresh_close(void *opaque) {
 #ifdef VORTEX_SPFRESH_BENCHMARK
 SPTAG::SPANN::Index<float> &vortex_spfresh_benchmark_index(void *opaque) {
     return static_cast<Handle *>(opaque)->index;
+}
+#endif
+
+#ifdef VORTEX_SPFRESH_TESTING
+SpFreshWorkspaceStats vortex_spfresh_test_workspaces(void *opaque) {
+    std::lock_guard<std::mutex> lock(native_mutex);
+    SpFreshWorkspaceStats stats;
+    stats.thread_detached =
+        !SPTAG::SPANN::Index<float>::m_workspace && !SPTAG::BKT::Index<float>::m_workspace;
+    stats.live_posting_workspaces = SPTAG::SPANN::ExtraWorkSpace::g_spaceCount.load();
+    if (opaque != nullptr) {
+        const auto &handle = *static_cast<Handle *>(opaque);
+        stats.postings = handle.spann_workspace.get();
+        stats.heads = handle.bkt_workspace.get();
+        if (handle.bkt_workspace) {
+            stats.head_check_capacity = handle.bkt_workspace->nodeCheckStatus.MaxCheck();
+        }
+        if (handle.spann_workspace) {
+            auto &workspace = *handle.spann_workspace;
+            stats.internal_results = static_cast<uint32_t>(workspace.m_pageBuffers.size());
+            stats.check_capacity = workspace.m_deduper.MaxCheck();
+            stats.posting_buffer_bytes = workspace.m_pageBuffers[0].GetPageSize();
+        }
+    }
+    return stats;
 }
 #endif
