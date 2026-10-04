@@ -1,3 +1,6 @@
+<!-- SPDX-License-Identifier: CC-BY-4.0 -->
+<!-- SPDX-FileCopyrightText: Copyright the Vortex contributors -->
+
 # Read-Only Posting View Qualification
 
 Local Linux qualification on 2026-10-04, based on Vortex
