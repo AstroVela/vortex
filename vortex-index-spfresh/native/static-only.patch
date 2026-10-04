@@ -55,6 +55,45 @@ index 915205a..0f02ef0 100644
 -#endif // _SPTAG_COMMON_DATASET_H_
 \ No newline at end of file
 +#endif // _SPTAG_COMMON_DATASET_H_
+diff --git a/AnnService/inc/Core/SPANN/ExtraStaticSearcher.h b/AnnService/inc/Core/SPANN/ExtraStaticSearcher.h
+index 345107a..1e6283a 100644
+--- a/AnnService/inc/Core/SPANN/ExtraStaticSearcher.h
++++ b/AnnService/inc/Core/SPANN/ExtraStaticSearcher.h
+@@ -260,6 +260,34 @@ namespace SPTAG
+                     }
+ #endif
+ #else // sync read
++#ifdef SPTAG_STATIC_ONLY
++                    if (!m_enableDataCompression && !m_enableDeltaEncoding && !m_enablePostingListRearrange && truth == nullptr) {
++                        const char* view = indexFile->ReadBinaryView(totalBytes, listInfo->listOffset);
++                        if (view != nullptr) {
++                            if (m_vectorInfoSize <= 0 || listInfo->listEleCount < 0 ||
++                                listInfo->pageOffset > totalBytes ||
++                                static_cast<uint64_t>(listInfo->listEleCount) >
++                                    (totalBytes - listInfo->pageOffset) / m_vectorInfoSize ||
++                                listInfo->pageOffset % alignof(ValueType) != 0) {
++                                throw std::runtime_error("Invalid borrowed posting extent");
++                            }
++                            const char* data = view + listInfo->pageOffset;
++                            for (int i = 0; i < listInfo->listEleCount; ++i) {
++                                uint64_t offsetVectorID, offsetVector;
++                                (this->*m_parsePosting)(offsetVectorID, offsetVector, i, listInfo->listEleCount);
++                                int vectorID;
++                                memcpy(&vectorID, data + offsetVectorID, sizeof(vectorID));
++                                if (p_exWorkSpace->m_deduper.CheckAndSet(vectorID)) continue;
++                                auto distance = p_index->ComputeDistance(queryResults.GetQuantizedTarget(), data + offsetVector);
++                                queryResults.AddPoint(vectorID, distance);
++                            }
++                            continue;
++                        }
++                    }
++                    if (totalBytes > p_exWorkSpace->m_pageBuffers[pi].GetPageSize()) {
++                        throw std::runtime_error("Posting exceeds copying buffer capacity");
++                    }
++#endif
+                     auto numRead = indexFile->ReadBinary(totalBytes, buffer, listInfo->listOffset);
+                     if (numRead != totalBytes) {
+                         LOG(Helper::LogLevel::LL_Error, "File %s read bytes, expected: %zu, acutal: %llu.\n", m_extraFullGraphFile.c_str(), totalBytes, numRead);
 diff --git a/AnnService/inc/Helper/AsyncFileReader.h b/AnnService/inc/Helper/AsyncFileReader.h
 index be9c5cd..399cb2b 100644
 --- a/AnnService/inc/Helper/AsyncFileReader.h
@@ -75,7 +114,7 @@ index be9c5cd..399cb2b 100644
  #ifdef _MSC_VER
  #include <tchar.h>
 diff --git a/AnnService/inc/Helper/DiskIO.h b/AnnService/inc/Helper/DiskIO.h
-index b583d38..15fd23e 100644
+index b583d38..f98ead6 100644
 --- a/AnnService/inc/Helper/DiskIO.h
 +++ b/AnnService/inc/Helper/DiskIO.h
 @@ -8,6 +8,7 @@
@@ -86,6 +125,19 @@ index b583d38..15fd23e 100644
  
  namespace SPTAG
  {
+@@ -58,6 +59,12 @@ namespace SPTAG
+ 
+             virtual std::uint64_t ReadBinary(std::uint64_t readSize, char* buffer, std::uint64_t offset = UINT64_MAX) = 0;
+ 
++#ifdef SPTAG_STATIC_ONLY
++            // Borrowed bytes remain immutable and valid until shutdown or destruction.
++            // Readers without a view keep the checked copying path.
++            virtual const char* ReadBinaryView(std::uint64_t readSize, std::uint64_t offset) { return nullptr; }
++#endif
++
+             virtual std::uint64_t WriteBinary(std::uint64_t writeSize, const char* buffer, std::uint64_t offset = UINT64_MAX) = 0;
+ 
+             virtual std::uint64_t ReadString(std::uint64_t& readSize, std::unique_ptr<char[]>& buffer, char delim = '\n', std::uint64_t offset = UINT64_MAX) = 0;
 diff --git a/AnnService/src/Core/Common/DistanceUtils.cpp b/AnnService/src/Core/Common/DistanceUtils.cpp
 index 5c86cad..c8af316 100644
 --- a/AnnService/src/Core/Common/DistanceUtils.cpp
