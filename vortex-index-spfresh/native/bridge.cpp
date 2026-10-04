@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 #include "bridge.h"
+#include "posting_io.h"
 
 #include <cmath>
 #include <cstdio>
@@ -15,9 +16,31 @@
 #include "inc/Core/SPANN/Index.h"
 #include "inc/Helper/SimpleIniReader.h"
 
+namespace SPTAG::SPANN {
+extern std::function<std::shared_ptr<Helper::DiskIO>()> f_createAsyncIO;
+}
+
 namespace {
 std::mutex native_mutex;
 std::once_flag logger_initialized;
+
+// The native boundary serializes this temporary loader-factory override.
+struct PostingReaderFactory {
+    decltype(SPTAG::SPANN::f_createAsyncIO) previous;
+    PostingReaderFactory(const PostingReaderFactory &) = delete;
+    PostingReaderFactory &operator=(const PostingReaderFactory &) = delete;
+    PostingReaderFactory() : previous(SPTAG::SPANN::f_createAsyncIO) {
+        if (vortex_spfresh::posting_views_enabled()) {
+            SPTAG::SPANN::f_createAsyncIO = [] {
+                return std::shared_ptr<SPTAG::Helper::DiskIO>(
+                    std::make_shared<vortex_spfresh::PostingFileIO>());
+            };
+        }
+    }
+    ~PostingReaderFactory() {
+        SPTAG::SPANN::f_createAsyncIO = std::move(previous);
+    }
+};
 
 // Both upstream workspaces are shared by every Float32 handle on this thread.
 struct Workspaces {
@@ -194,6 +217,7 @@ extern "C" int vortex_spfresh_open(const char *root,
             throw std::runtime_error("Invalid SPFresh bundle dimensions or page limit");
         }
         auto handle = std::make_unique<Handle>();
+        PostingReaderFactory posting_reader;
         handle->dimension = dimension;
         handle->rows = rows;
         handle->posting_pages = posting_pages;

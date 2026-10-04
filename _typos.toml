@@ -20,3 +20,10 @@ extend-exclude = ["/vortex-bench/**", "/docs/references.bib", "benchmarks/**", "
 extend-ignore-identifiers-re = [
     "Trafic", # Appears in some clickbench-related examples
 ]
+
+[type.spfresh-patch]
+extend-glob = ["static-only.patch"]
+
+[type.spfresh-patch.extend-words]
+# Preserve upstream context verbatim in the pinned, fingerprint-checked native patch.
+acutal = "acutal"

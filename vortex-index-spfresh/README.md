@@ -220,11 +220,47 @@ Failed native searches discard borrowed workspaces. Dimension, page limit and
 hash configuration cannot change on an opened handle. No global pointer-keyed
 cache or worker-specific copies survive handle destruction, even on another
 thread; a handle can migrate between serialized synchronous worker calls.
-Posting reads use the upstream synchronous path and fail on short/error reads;
-there are no outstanding native IO tasks when a call returns. This conservative
+Posting reads are synchronous; there are no outstanding native IO tasks when a
+call returns. This conservative
 version favors isolation over concurrent throughput. Open and build calls still
 clear their temporary upstream workspaces at both call boundaries.
 Do not link another incompatible SPTAG build into the same process.
+
+### Read-Only Posting Views
+
+The static bridge maps the private lease's posting file with `PROT_READ` and
+processes uncompressed, non-delta, non-rearranged postings directly from bounded
+views. It does not copy each posting into the query's page buffer. A file-size
+check before each view detects sequential truncation, preserving ordinary IO
+failure behavior without touching a truncated map. The owning
+native reader keeps the mapping alive until close; no view is retained in TLS,
+query results or a global cache. A mapped reader's copying fallback uses those
+same mapped bytes, not a second path-based open. Extent/alignment errors fail
+before processing. Writable delta decoding and truth diagnostics keep copying
+into their existing workspace buffers. This does not expand the frozen bundle
+format contract or remove its structural/checksum validation.
+
+`VORTEX_SPFRESH_POSTING_VIEW=0` selects the original checked synchronous file
+reader for new handles; `1` or an unset variable selects posting views. Other
+values fail open. This process-level qualification/rollback switch is captured
+at native open, not read per query. Do not change the process environment while
+other threads are opening handles. It is independent of SQL's validation mode:
+strict validation remains the default, and snapshot reuse still requires an
+explicit SQL opt-in.
+
+Whole-file mappings reserve address space and touched file-backed pages count
+toward RSS, even though they use the OS page cache rather than a second anonymous
+copy. Materialization and posting-buffer budgets are unchanged; they are not
+total RSS limits. Workspace buffers are retained for the copying fallback.
+Mapping failure is an open error; select the copying reader before opening to
+roll back. A posting file must not be rewritten or truncated while mapped:
+`MAP_PRIVATE` is not a snapshot of mutable files, and concurrent truncation
+after the size check can still fault.
+The provider already requires an owner-managed, immutable private lease.
+
+[Posting view qualification](POSTING_VIEW_BENCHMARK.md) records same-binary
+SIFT100K/SIFT1M Native, Provider and prepared SQL A/B results, file-backed RSS,
+copying rollback and the explicitly benchmark-only SIFT1M SQL cache budget.
 
 Artifacts and their producer remain trusted: checksums and structural checks
 are not authentication or a sandbox for upstream C++ parsers. Scratch directories
@@ -246,6 +282,12 @@ Native workspace tests verify actual retention and reuse, isolation between
 different dimensions/page limits, increasing/decreasing capacity options with
 fresh-open parity, partial-batch error cleanup, thread migration, concurrent
 serialized calls, cross-thread destruction and complete workspace release.
+Native posting tests verify multi-page zero-copy processing with counted view
+and copying calls, exact IDs/distances against the original reader, bounded
+views, nonblocking rejection of non-regular files, path replacement with an
+already-owned mapping, reader cleanup/reinitialization, invalid extents and
+alignment, native open-toggle parity, and writable/diagnostic copying fallback.
+These are ordinary tests; no new sanitizer setup is required.
 This is correctness qualification, not a large-scale latency/recall benchmark
 or NVMe/SPDK qualification.
 
@@ -262,7 +304,7 @@ cargo build --locked -p vortex-index-spfresh --release \
 ```
 
 `spfresh_benchmark` is excluded from the default native build. Its direct-index
-accessor is compiled only into that executable, not the production bridge. It
+accessor is compiled only into benchmark/test executables, not the production bridge. It
 supports three modes on the same static index:
 
 | Mode | Timed work |
