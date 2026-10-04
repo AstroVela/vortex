@@ -19,7 +19,7 @@ file(GLOB_RECURSE core CONFIGURE_DEPENDS
 list(FILTER core EXCLUDE REGEX "(DistanceUtils|SIMDUtils|InstructionUtils|ExtraSPDKController)\\.cpp$")
 add_library(spfresh_core STATIC ${core})
 target_include_directories(spfresh_core PUBLIC "${SPFRESH_SOURCE}/AnnService")
-target_include_directories(spfresh_core PRIVATE "${ZSTD_INCLUDE_DIR}")
+target_include_directories(spfresh_core PUBLIC "${ZSTD_INCLUDE_DIR}")
 target_compile_definitions(spfresh_core PUBLIC SPTAG_STATIC_ONLY SPTAG_DISABLE_NUMA)
 target_link_libraries(spfresh_core PUBLIC OpenMP::OpenMP_CXX Threads::Threads ${ZSTD_LIBRARY})
 
@@ -52,6 +52,12 @@ add_executable(spfresh_workspace_tests workspace_tests.cpp bridge.cpp)
 target_compile_definitions(spfresh_workspace_tests PRIVATE VORTEX_SPFRESH_TESTING)
 target_link_libraries(spfresh_workspace_tests PRIVATE spfresh_core)
 add_test(NAME spfresh_workspace_tests COMMAND spfresh_workspace_tests)
+
+add_executable(spfresh_posting_tests posting_tests.cpp bridge.cpp)
+target_compile_definitions(spfresh_posting_tests PRIVATE VORTEX_SPFRESH_BENCHMARK)
+target_link_libraries(spfresh_posting_tests PRIVATE spfresh_core)
+add_test(NAME spfresh_posting_tests COMMAND spfresh_posting_tests)
+set_tests_properties(spfresh_posting_tests PROPERTIES TIMEOUT 30)
 
 file(WRITE "${CMAKE_BINARY_DIR}/revision.expected" "5893eb61ee3b18610b6b00f1939be7dae1af8904\n")
 file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/static-only.patch" patch_hash)

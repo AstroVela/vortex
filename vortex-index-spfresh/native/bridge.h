@@ -6,6 +6,7 @@
 // Buffers and handle are caller-owned. Errors are NUL-terminated in 1024 bytes.
 // Only trusted, validated static Float32/L2 files in the closed bundle are accepted.
 // Calls are serialized; the caller must not close a handle still in use.
+// The private bundle must remain immutable until close, including while postings are mapped.
 #ifdef __cplusplus
 extern "C" {
 #endif
