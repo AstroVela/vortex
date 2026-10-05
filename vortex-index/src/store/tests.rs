@@ -44,6 +44,11 @@ pub(super) enum Fault {
 
 thread_local! {
     static FAULT: Cell<Option<Fault>> = const { Cell::new(None) };
+    static READ_BYTES: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+pub(super) fn record_read(bytes: u64) {
+    READ_BYTES.set(READ_BYTES.get().map(|total| total + bytes));
 }
 
 pub(super) fn inject_fault(point: Fault) -> VortexResult<()> {
@@ -470,6 +475,7 @@ fn test_failed_write_and_interrupted_seal_are_not_reopenable() -> VortexResult<(
 }
 
 mod local_files;
+mod verified_open;
 
 #[test]
 fn test_manifest_install_does_not_clobber_and_poisoned_writer_cannot_retry() -> VortexResult<()> {

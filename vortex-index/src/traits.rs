@@ -193,6 +193,9 @@ pub trait LocalIndexFiles: Send + Sync {
     /// lengths, not filesystem allocation or RSS; per-artifact limits also apply.
     /// Copies must not share writable inodes with the generation or other leases.
     /// A failed call must not expose a partially verified lease.
+    /// A store opened through verified materialization may transfer its unused
+    /// complete-inventory lease on the first matching call; the same isolation
+    /// and byte-limit requirements apply.
     fn materialize(
         &self,
         artifacts: &[IndexArtifact],
@@ -249,6 +252,17 @@ pub trait IndexProvider: Send + Sync {
 
     /// Whether this implementation can read an artifact format version.
     fn supports_version(&self, version: u32) -> bool;
+
+    /// Optional total byte limit for eagerly materializing a local generation.
+    ///
+    /// A caller may combine generation verification and private copying before
+    /// [`Self::open`], allowing the provider's first complete-inventory
+    /// [`LocalIndexFiles::materialize`] call to reuse that lease. This is an
+    /// optimization hint: providers must still validate their inputs and limits,
+    /// and must also work with stores that perform materialization on demand.
+    fn local_materialization_limit(&self) -> Option<u64> {
+        None
+    }
 
     /// Open and verify the declared artifacts without mutating the generation.
     async fn open(

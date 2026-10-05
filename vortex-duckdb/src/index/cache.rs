@@ -14,10 +14,10 @@ use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
 use vortex_index::DistanceMetric;
 use vortex_index::Index;
-use vortex_index::IndexMetadata;
 use vortex_index::IndexRegistry;
 use vortex_index::IndexStore;
 use vortex_index::file::LocalFileSource;
+use vortex_index::store::LocalIndexOpen;
 
 use super::ValidationMode;
 use super::provider;
@@ -106,8 +106,7 @@ pub(super) struct OpenedIndex {
 impl OpenedIndex {
     async fn open(
         root: &Path,
-        metadata: &IndexMetadata,
-        store: Arc<dyn IndexStore>,
+        pending: LocalIndexOpen,
         reservation: Option<Reservation>,
         source: Option<Arc<LocalFileSource>>,
     ) -> VortexResult<Arc<Self>> {
@@ -116,8 +115,15 @@ impl OpenedIndex {
             .permissions(fs::Permissions::from_mode(0o700))
             .tempdir_in(root)?;
         let mut registry = IndexRegistry::default();
-        registry.register(provider(&metadata.backend, scratch.path())?)?;
-        let index = registry.open(metadata, &metadata.snapshot, store).await?;
+        let provider = provider(&pending.metadata().backend, scratch.path())?;
+        let (store, metadata) = if let Some(limit) = provider.local_materialization_limit() {
+            pending.materialize(scratch.path(), limit)?
+        } else {
+            let (store, metadata) = pending.verify()?;
+            (Arc::new(store) as Arc<dyn IndexStore>, metadata)
+        };
+        registry.register(provider)?;
+        let index = registry.open(&metadata, &metadata.snapshot, store).await?;
         if index
             .as_vector()
             .is_none_or(|vector| vector.spec().metric != DistanceMetric::SquaredL2)
@@ -150,28 +156,28 @@ impl PreparedIndexCache {
         self.entries.lock().get(key).cloned()
     }
 
-    // Cache misses require fully verified inputs. Strict hits still verify anew;
+    // Cache misses verify before exposing a store. Strict hits still verify anew;
     // snapshot hits use the separately retained source through snapshot().
     pub async fn open(
         cache: Option<&Self>,
         key: &CacheKey,
         root: &Path,
-        metadata: &IndexMetadata,
-        store: Arc<dyn IndexStore>,
+        pending: LocalIndexOpen,
         source: Option<Arc<LocalFileSource>>,
     ) -> VortexResult<(Arc<OpenedIndex>, bool)> {
         if (key.validation_mode == ValidationMode::Snapshot) != source.is_some() {
             vortex_bail!("Index cache validation mode does not match its source");
         }
-        if let Some(cache) = cache
-            && let Some(opened) = cache.entries.lock().get(key).cloned()
-        {
-            if opened.index.metadata() != metadata {
+        let cached = cache.and_then(|cache| cache.entries.lock().get(key).cloned());
+        if let Some(opened) = cached {
+            if opened.index.metadata() != pending.metadata() {
                 vortex_bail!("Cached index metadata does not match the verified generation");
             }
+            pending.verify()?;
             return Ok((opened, true));
         }
-        let bytes = metadata
+        let bytes = pending
+            .metadata()
             .artifacts
             .iter()
             .try_fold(0_u64, |sum, artifact| sum.checked_add(artifact.size))
@@ -188,7 +194,7 @@ impl PreparedIndexCache {
                 "Prepared snapshot exceeds the connection's retained handle or byte budget"
             );
         }
-        let opened = OpenedIndex::open(root, metadata, store, reservation, source).await?;
+        let opened = OpenedIndex::open(root, pending, reservation, source).await?;
         if let Some(cache) = cache.filter(|_| retain) {
             // Concurrent misses may open twice; only one entry stays retained.
             return Ok((
