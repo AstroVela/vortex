@@ -205,6 +205,16 @@ not retain a snapshot across separate statements; execution requires a live
 prepared owner. Destroying or deallocating the owner releases its source and
 handles, closing native handles before removing private scratch directories.
 
+On a cache miss, providers advertising `local_materialization_limit()` receive
+a private store whose complete artifact inventory was verified while copying.
+Their first matching materialization reuses those files, avoiding a second full
+read and checksum pass. Providers without this hint use ordinary verified store
+opening. Strict cache hits still verify all canonical artifacts again before
+using the retained handle; snapshot hits retain their already verified view.
+The phase diagnostic's `source_validation_ms` covers source and manifest checks;
+artifact verification is now included in `provider_open_ms`, including strict
+cache hits. Compare total latency or the combined phases across this change.
+
 Each connection may retain eight handles, 256 MiB of sealed artifacts and
 512 MiB of encoded source bytes across its owners. These bound retained input
 bytes, not RSS, decoded arrays or transient validation allocations. Strict mode

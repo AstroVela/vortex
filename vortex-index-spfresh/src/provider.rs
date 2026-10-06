@@ -119,6 +119,10 @@ impl IndexProvider for SpFreshProvider {
         version == SPFRESH_FORMAT_VERSION
     }
 
+    fn local_materialization_limit(&self) -> Option<u64> {
+        Some(self.limits.max_materialized_bytes)
+    }
+
     fn builder(&self) -> Option<&dyn IndexBuilder> {
         self.builder
             .as_ref()

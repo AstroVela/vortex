@@ -51,6 +51,25 @@ the `file` source feature. The default feature set stays empty.
   generation and snapshot, then streams verification of every artifact. Later
   reads verify again before returning bytes. Missing, modified or non-regular
   files are errors, not empty results.
+- `prepare_open(root, descriptor, snapshot, limits)` authenticates the manifest
+  and snapshot without exposing a store or reading artifact contents. Inspect
+  its metadata to reserve resources, then consume it with `verify()` for the
+  ordinary sealed store or `materialize(scratch_root, max_bytes)` for a private
+  store. Materialization copies and verifies all artifacts in one streaming pass;
+  any error removes the partial copies. No unverified sealed store is returned.
+
+A materialized store is read-only and independent of later changes to the
+canonical generation. Its first complete-inventory `LocalIndexFiles::materialize`
+call into the same scratch root transfers the existing verified lease. Limits,
+inventory and directory identity are checked before transfer. Subsequent calls,
+subsets and other scratch roots receive separately copied and verified leases.
+The store and transferred lease retain the private directory until both are
+dropped; the provider must close native handles before releasing its lease.
+
+Providers can opt into this path with `IndexProvider::local_materialization_limit`.
+The hint declares a total artifact byte budget; it does not bypass backend format
+checks or require query-engine knowledge of SPFresh. Providers must also accept
+ordinary stores and keep enforcing their own limits during open.
 
 The returned `LocalGeneration` descriptor binds the manifest bytes, which in
 turn bind metadata and all artifact identities. The catalog must durably store

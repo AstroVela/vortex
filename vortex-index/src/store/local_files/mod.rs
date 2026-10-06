@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::fs::File;
 use std::fs::Permissions;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::sync::Arc;
 
 use tempfile::TempDir;
 use vortex_error::VortexResult;
@@ -68,55 +71,73 @@ impl LocalIndexFiles for LocalIndexStore {
             let State::Sealed(inventory) = &*state else {
                 vortex_bail!("Only a sealed generation can be materialized");
             };
-            let mut paths = BTreeSet::new();
-            let mut total = 0u64;
-            for artifact in artifacts {
-                if inventory.get(&artifact.path) != Some(artifact) {
-                    vortex_bail!("Artifact does not match the generation inventory");
-                }
-                if !paths.insert(&artifact.path) {
-                    vortex_bail!("Duplicate materialization path: {}", artifact.path);
-                }
-                total = total
-                    .checked_add(artifact.size)
-                    .ok_or_else(|| vortex_err!("Materialization byte count overflow"))?;
-                if total > max_bytes {
-                    vortex_bail!("Materialization exceeds the total byte limit");
-                }
-            }
+            validate_selection(inventory, artifacts, max_bytes)?;
         }
-        let root = open_root(scratch_root)?;
-        // The scratch namespace must remain owner-managed, including creation
-        // and TempDir cleanup. Native code receives copies, never canonical paths.
-        let dir = tempfile::Builder::new()
-            .prefix(".vortex-index-")
-            .permissions(Permissions::from_mode(0o700))
-            .tempdir_in(scratch_root)?;
-        let name = dir
-            .path()
-            .file_name()
-            .ok_or_else(|| vortex_err!("Missing scratch directory name"))?;
-        let directory = open_directory(&root, name)?;
-        for artifact in artifacts {
-            let (parent, name) = artifact_parent(&directory, &artifact.path, true)?;
-            let mut file = create_file(&parent, name)?;
-            verify(
-                &self.artifacts,
-                artifact,
-                self.limits.max_artifact_bytes,
-                |chunk| {
-                    file.write_all(chunk)?;
-                    Ok(())
-                },
-            )?;
-            file.set_permissions(Permissions::from_mode(0o400))?;
-        }
-        Ok(Box::new(ArtifactLease(dir)))
+        Ok(Box::new(copy_artifacts(
+            &self.artifacts,
+            artifacts,
+            scratch_root,
+            self.limits.max_artifact_bytes,
+        )?))
     }
 }
 
-#[derive(Debug)]
-struct ArtifactLease(TempDir);
+pub(super) fn validate_selection(
+    inventory: &BTreeMap<String, IndexArtifact>,
+    artifacts: &[IndexArtifact],
+    max_bytes: u64,
+) -> VortexResult<()> {
+    let mut paths = BTreeSet::new();
+    let mut total = 0u64;
+    for artifact in artifacts {
+        if inventory.get(&artifact.path) != Some(artifact) {
+            vortex_bail!("Artifact does not match the generation inventory");
+        }
+        if !paths.insert(&artifact.path) {
+            vortex_bail!("Duplicate materialization path: {}", artifact.path);
+        }
+        total = total
+            .checked_add(artifact.size)
+            .ok_or_else(|| vortex_err!("Materialization byte count overflow"))?;
+        if total > max_bytes {
+            vortex_bail!("Materialization exceeds the total byte limit");
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn copy_artifacts(
+    source: &File,
+    artifacts: &[IndexArtifact],
+    scratch_root: &Path,
+    max_artifact_bytes: usize,
+) -> VortexResult<ArtifactLease> {
+    let root = open_root(scratch_root)?;
+    // The scratch namespace must remain owner-managed, including creation
+    // and TempDir cleanup. Native code receives copies, never canonical paths.
+    let dir = tempfile::Builder::new()
+        .prefix(".vortex-index-")
+        .permissions(Permissions::from_mode(0o700))
+        .tempdir_in(scratch_root)?;
+    let name = dir
+        .path()
+        .file_name()
+        .ok_or_else(|| vortex_err!("Missing scratch directory name"))?;
+    let directory = open_directory(&root, name)?;
+    for artifact in artifacts {
+        let (parent, name) = artifact_parent(&directory, &artifact.path, true)?;
+        let mut file = create_file(&parent, name)?;
+        verify(source, artifact, max_artifact_bytes, |chunk| {
+            file.write_all(chunk)?;
+            Ok(())
+        })?;
+        file.set_permissions(Permissions::from_mode(0o400))?;
+    }
+    Ok(ArtifactLease(Arc::new(dir)))
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ArtifactLease(Arc<TempDir>);
 
 impl LocalArtifactLease for ArtifactLease {
     fn path(&self) -> &Path {

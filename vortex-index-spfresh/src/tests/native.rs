@@ -322,11 +322,20 @@ fn filter(snapshot: &Snapshot) -> VortexResult<RowFilter> {
 
 #[test]
 fn test_native_parity_batch_flat_recall_and_multifile_take() -> VortexResult<()> {
+    native_parity_batch_flat_recall_and_multifile_take(false)
+}
+
+#[test]
+fn test_materialized_native_parity_batch_flat_recall_and_multifile_take() -> VortexResult<()> {
+    native_parity_batch_flat_recall_and_multifile_take(true)
+}
+
+fn native_parity_batch_flat_recall_and_multifile_take(materialized: bool) -> VortexResult<()> {
     block_on(|handle| async move {
         let session = session(handle)?;
         let dir = tempfile::tempdir()?;
         let root = dir.path();
-        let (store, metadata, _) = prepare(root, &session).await?;
+        let (store, metadata, control) = prepare(root, &session).await?;
         let raw = Native::open(&root.join("native"), BUNDLE)?;
         let queries = [7u16, 80, 129, 242].map(|id| Buffer::from(vector(id)));
         let flat_queries = queries
@@ -338,9 +347,29 @@ fn test_native_parity_batch_flat_recall_and_multifile_take() -> VortexResult<()>
         fs::remove_dir_all(root.join("native"))?;
         fs::remove_file(root.join("input.bin"))?;
 
+        let provider = provider(root)?;
+        let store: Arc<dyn IndexStore> = if materialized {
+            drop(store);
+            let limit = provider
+                .local_materialization_limit()
+                .ok_or_else(|| vortex_err!("Missing materialization limit"))?;
+            let (store, actual) = LocalIndexStore::prepare_open(
+                root.join("store"),
+                &control.generation,
+                &control.snapshot,
+                LIMITS,
+            )?
+            .materialize(&root.join("scratch"), limit)?;
+            assert_eq!(actual, metadata);
+            fs::remove_dir_all(root.join("store"))?;
+            store
+        } else {
+            store
+        };
         let mut registry = IndexRegistry::default();
-        registry.register(Arc::new(provider(root)?))?;
+        registry.register(Arc::new(provider))?;
         let index = registry.open(&metadata, &metadata.snapshot, store).await?;
+        assert_eq!(fs::read_dir(root.join("scratch"))?.count(), 1);
         let vector_index = index
             .as_vector()
             .ok_or_else(|| vortex_err!("Missing vector capability"))?;
@@ -425,6 +454,8 @@ fn test_native_parity_batch_flat_recall_and_multifile_take() -> VortexResult<()>
             );
         }
         assert!(recall >= 36, "recall@10 below 0.9: {recall}/40");
+        drop(index);
+        assert_eq!(fs::read_dir(root.join("scratch"))?.count(), 0);
         Ok(())
     })
 }

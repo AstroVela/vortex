@@ -47,6 +47,7 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 
+pub use self::open::LocalIndexOpen;
 use crate::IndexArtifact;
 use crate::IndexMetadata;
 use crate::IndexStore;
@@ -136,35 +137,22 @@ impl LocalIndexStore {
         snapshot: &Snapshot,
         limits: LocalStoreLimits,
     ) -> VortexResult<(Self, IndexMetadata)> {
-        validate_generation(&descriptor.generation)?;
-        snapshot.validate()?;
-        if descriptor.manifest.path != MANIFEST {
-            vortex_bail!("Invalid local generation manifest path");
-        }
-        let root = open_root(root.as_ref())?;
-        let directory = open_directory(&root, OsStr::new(&descriptor.generation))?;
-        let bytes = read_bytes(&directory, &descriptor.manifest, limits.max_manifest_bytes)?;
-        let metadata: IndexMetadata = serde_json::from_slice(&bytes)
-            .map_err(|err| vortex_err!("Invalid manifest: {}", err))?;
-        metadata.validate_for(snapshot)?;
-        if metadata.generation != descriptor.generation {
-            vortex_bail!("Manifest generation does not match its descriptor");
-        }
-        let artifacts = open_directory(&directory, OsStr::new(ARTIFACTS))?;
-        for artifact in &metadata.artifacts {
-            verify(&artifacts, artifact, limits.max_artifact_bytes, |_| Ok(()))?;
-        }
-        let inventory = inventory(&metadata);
-        Ok((
-            Self {
-                directory,
-                artifacts,
-                generation: descriptor.generation.clone(),
-                limits,
-                state: Mutex::new(State::Sealed(inventory)),
-            },
-            metadata,
-        ))
+        Self::prepare_open(root, descriptor, snapshot, limits)?.verify()
+    }
+
+    /// Authenticate a manifest before choosing how to verify its artifact contents.
+    ///
+    /// This does not return an [`IndexStore`]: artifact bytes are still unverified.
+    /// The caller can inspect metadata to reserve resources, then either verify
+    /// the generation or copy and verify it in one pass with
+    /// [`LocalIndexOpen::materialize`].
+    pub fn prepare_open(
+        root: impl AsRef<Path>,
+        descriptor: &LocalGeneration,
+        snapshot: &Snapshot,
+        limits: LocalStoreLimits,
+    ) -> VortexResult<LocalIndexOpen> {
+        LocalIndexOpen::new(root.as_ref(), descriptor, snapshot, limits)
     }
 
     /// Durably seal exactly the successful writes with validated index metadata.
@@ -471,6 +459,8 @@ fn copy_and_hash(
     while remaining != 0 {
         let count = usize::try_from(remaining.min(buffer.len() as u64))?;
         source.read_exact(&mut buffer[..count])?;
+        #[cfg(test)]
+        tests::record_read(count as u64);
         remaining -= count as u64;
         hasher.update(&buffer[..count]);
         consume(&buffer[..count])?;
@@ -486,6 +476,7 @@ fn copy_and_hash(
 }
 
 mod local_files;
+mod open;
 
 #[cfg(test)]
 mod tests;

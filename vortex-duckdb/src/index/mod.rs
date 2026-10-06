@@ -546,20 +546,20 @@ async fn search(
             )
             .await?,
         );
-        let (store, metadata) = LocalIndexStore::open(
+        let pending = LocalIndexStore::prepare_open(
             root,
             &descriptor.generation,
             source.snapshot(),
             STORE_LIMITS,
         )?;
+        let metadata = pending.metadata();
         if metadata.uncovered_files().next().is_some() || metadata.fields.len() != 1 {
             vortex_bail!("SQL static search requires full file coverage and one vector field");
         }
         timing.mark(Phase::SourceValidation);
         let pinned_source = snapshot_cache.map(|_| Arc::clone(&source));
         let (opened, cache_hit) =
-            PreparedIndexCache::open(cache, key, root, &metadata, Arc::new(store), pinned_source)
-                .await?;
+            PreparedIndexCache::open(cache, key, root, pending, pinned_source).await?;
         (source, opened, cache_hit)
     };
     let metadata = opened.index.metadata();

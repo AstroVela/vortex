@@ -22,6 +22,7 @@ use vortex_index::IndexBuilder;
 use vortex_index::IndexMetadata;
 use vortex_index::IndexProvider;
 use vortex_index::IndexStore;
+use vortex_index::LocalArtifactLease;
 
 use super::BACKEND;
 use super::Prepared;
@@ -64,6 +65,10 @@ impl IndexProvider for ObservedProvider {
         version == 1
     }
 
+    fn local_materialization_limit(&self) -> Option<u64> {
+        Some(1024 * 1024)
+    }
+
     fn builder(&self) -> Option<&dyn IndexBuilder> {
         Some(&Provider)
     }
@@ -80,6 +85,17 @@ impl IndexProvider for ObservedProvider {
         {
             vortex_bail!("Fixture provider open failed");
         }
+        let lease = store
+            .as_local_files()
+            .ok_or_else(|| vortex_err!("Missing local-file store"))?
+            .materialize(&metadata.artifacts, &self.0, 1024 * 1024)?;
+        if self
+            .0
+            .parent()
+            .is_some_and(|root| root.join("fail-after-lease").exists())
+        {
+            vortex_bail!("Fixture provider open failed after lease transfer");
+        }
         let inner = Provider.open(metadata, store).await?;
         let mut counts = COUNTS.lock();
         let counts = counts.entry(metadata.generation.clone()).or_default();
@@ -87,6 +103,7 @@ impl IndexProvider for ObservedProvider {
         counts.live += 1;
         Ok(Arc::new(ObservedIndex {
             inner,
+            _lease: lease,
             scratch: self.0.clone(),
         }))
     }
@@ -95,6 +112,7 @@ impl IndexProvider for ObservedProvider {
 #[derive(Debug)]
 struct ObservedIndex {
     inner: Arc<dyn Index>,
+    _lease: Box<dyn LocalArtifactLease>,
     scratch: PathBuf,
 }
 
@@ -369,6 +387,7 @@ fn test_connection_handle_limit_falls_back_and_releases_capacity() -> VortexResu
 #[rstest::rstest]
 fn test_failed_provider_open_releases_scratch_and_cache_reservation(
     #[values("strict", "snapshot")] mode: &str,
+    #[values("fail-open", "fail-after-lease")] failure_point: &str,
 ) -> VortexResult<()> {
     let fixture = Fixture::new()?;
     let query = format!(
@@ -376,7 +395,7 @@ fn test_failed_provider_open_releases_scratch_and_cache_reservation(
         literal(&fixture.reference)
     );
     let handle = Prepared::new(&fixture.conn, &query)?;
-    let failure = fixture.root.path().join("fail-open");
+    let failure = fixture.root.path().join(failure_point);
     fs::write(&failure, b"fail")?;
     for _ in 0..MAX_RETAINED_HANDLES {
         let error = handle
