@@ -55,6 +55,9 @@ jobs:
       - name: Test backend without native dependencies
         run: cargo test --locked -p vortex-index-spfresh --no-default-features
 
+      - name: Test hnswlib metadata without native dependencies
+        run: cargo test --locked -p vortex-index-hnswlib --no-default-features
+
   sql-index:
     name: Index SQL adapter (no native backend)
     runs-on: ubuntu-24.04
@@ -116,3 +119,30 @@ jobs:
 
       - name: Native Clippy
         run: cargo clippy --locked -p vortex-index-spfresh --all-targets --all-features -- -D warnings
+
+  hnswlib:
+    name: hnswlib (real native, Linux x86_64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: ./.github/actions/setup-rust
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          key: vortex-index-hnswlib-native-v1
+          cache-on-failure: true
+      - name: Install native build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes g++ libclang-dev pkg-config
+          echo "BINDGEN_EXTRA_CLANG_ARGS=-isystem $(gcc -print-file-name=include)" >> "$GITHUB_ENV"
+      - name: Fetch pinned hnswlib
+        run: |
+          git clone https://github.com/nmslib/hnswlib.git target/hnswlib-source
+          git -C target/hnswlib-source checkout --detach d9b3608c83d83b46c96e25088cb1d729b29dcfe9
+          echo "VORTEX_HNSWLIB_SOURCE=$PWD/target/hnswlib-source" >> "$GITHUB_ENV"
+      - name: Build, reload, parity and native structure tests
+        run: cargo test --locked -p vortex-index-hnswlib --all-features --all-targets
+      - name: Native Clippy
+        run: cargo clippy --locked -p vortex-index-hnswlib --all-targets --all-features -- -D warnings

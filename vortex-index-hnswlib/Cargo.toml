@@ -1,0 +1,57 @@
+[package]
+name = "vortex-index-hnswlib"
+description = "Experimental static hnswlib backend for Vortex indexes"
+authors.workspace = true
+categories.workspace = true
+edition.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme = "README.md"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+publish = false
+
+[features]
+default = []
+native = ["dep:cc", "dep:futures", "dep:tempfile", "dep:vortex-array", "dep:vortex-session"]
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+futures = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tempfile = { workspace = true, optional = true }
+vortex-array = { workspace = true, optional = true }
+vortex-buffer.workspace = true
+vortex-error.workspace = true
+vortex-index.workspace = true
+vortex-session = { workspace = true, optional = true }
+
+[build-dependencies]
+cc = { workspace = true, optional = true }
+
+[dev-dependencies]
+futures = { workspace = true, features = ["executor"] }
+rstest.workspace = true
+tempfile.workspace = true
+vortex.workspace = true
+vortex-array = { workspace = true, features = ["_test-harness"] }
+vortex-edition.workspace = true
+vortex-file.workspace = true
+vortex-index = { workspace = true, features = ["file", "local-store"] }
+vortex-io.workspace = true
+vortex-session.workspace = true
+
+[lints]
+workspace = true
+
+[[example]]
+name = "bench_provider"
+required-features = ["native"]
+
+[[example]]
+name = "import_benchmark"
+required-features = ["native"]
