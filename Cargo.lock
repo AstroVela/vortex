@@ -10270,6 +10270,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "vortex-index-hnswlib"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "cc",
+ "futures",
+ "rstest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "vortex",
+ "vortex-array",
+ "vortex-buffer",
+ "vortex-edition",
+ "vortex-error",
+ "vortex-file",
+ "vortex-index",
+ "vortex-io",
+ "vortex-session",
+]
+
+[[package]]
 name = "vortex-index-spfresh"
 version = "0.1.0"
 dependencies = [
