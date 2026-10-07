@@ -12,8 +12,55 @@
 #include <stdexcept>
 
 namespace {
+float l2_avx_residuals(const void *left, const void *right, const void *parameter) {
+    const size_t dimension = *static_cast<const size_t *>(parameter);
+    const size_t aligned = dimension / 16 * 16;
+    const size_t tail = dimension - aligned;
+    return hnswlib::L2SqrSIMD16ExtAVX(left, right, &aligned) +
+           hnswlib::L2Sqr(static_cast<const float *>(left) + aligned,
+                          static_cast<const float *>(right) + aligned,
+                          &tail);
+}
+
+// L2Space mutates a global SIMD pointer, also read by its residual kernel. Bind
+// directly to stateless kernels; Rust checks the required AVX2 CPU support.
+class FixedL2Space final : public hnswlib::SpaceInterface<float> {
+public:
+    explicit FixedL2Space(size_t dimension) : dimension_(dimension), distance_(select(dimension)) {
+    }
+    size_t get_data_size() override {
+        return dimension_ * sizeof(float);
+    }
+    hnswlib::DISTFUNC<float> get_dist_func() override {
+        return distance_;
+    }
+    void *get_dist_func_param() override {
+        return &dimension_;
+    }
+
+private:
+    static hnswlib::DISTFUNC<float> select(size_t dimension) {
+        if (dimension % 16 == 0) {
+            return hnswlib::L2SqrSIMD16ExtAVX;
+        }
+        if (dimension % 4 == 0) {
+            return hnswlib::L2SqrSIMD4Ext;
+        }
+        if (dimension > 16) {
+            return l2_avx_residuals;
+        }
+        if (dimension > 4) {
+            return hnswlib::L2SqrSIMD4ExtResiduals;
+        }
+        return hnswlib::L2Sqr;
+    }
+
+    size_t dimension_;
+    const hnswlib::DISTFUNC<float> distance_;
+};
+
 struct Handle {
-    hnswlib::L2Space space;
+    FixedL2Space space;
     std::unique_ptr<hnswlib::HierarchicalNSW<float>> index;
     std::mutex mutex;
     Handle(const char *path, uint32_t dimension) : space(dimension) {
@@ -45,25 +92,18 @@ extern "C" int vortex_hnswlib_build(const char *path,
                                     uint32_t threads,
                                     char *error) noexcept {
     return checked(error, [&] {
-        hnswlib::L2Space space(dimension);
-        hnswlib::HierarchicalNSW<float> index(&space, rows, m, construction, seed);
-        index.addPoint(vectors, 0);
-        std::exception_ptr failure;
-        std::mutex failure_mutex;
-#pragma omp parallel for schedule(static) num_threads(threads)
-        for (uint32_t row = 1; row < rows; ++row) {
-            try {
-                index.addPoint(vectors + static_cast<size_t>(row) * dimension, row);
-            } catch (...) {
-                std::lock_guard<std::mutex> guard(failure_mutex);
-                if (!failure)
-                    failure = std::current_exception();
-            }
+        // Upstream addPoint draws from an unsynchronized per-index RNG.
+        if (threads != 1) {
+            throw std::invalid_argument("hnswlib construction requires threads=1");
         }
-        if (failure)
-            std::rethrow_exception(failure);
-        if (index.getCurrentElementCount() != rows)
+        FixedL2Space space(dimension);
+        hnswlib::HierarchicalNSW<float> index(&space, rows, m, construction, seed);
+        for (uint32_t row = 0; row < rows; ++row) {
+            index.addPoint(vectors + static_cast<size_t>(row) * dimension, row);
+        }
+        if (index.getCurrentElementCount() != rows) {
             throw std::runtime_error("Incomplete hnswlib build");
+        }
         index.saveIndex(path);
     });
 }

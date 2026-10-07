@@ -142,6 +142,17 @@ jobs:
           git clone https://github.com/nmslib/hnswlib.git target/hnswlib-source
           git -C target/hnswlib-source checkout --detach d9b3608c83d83b46c96e25088cb1d729b29dcfe9
           echo "VORTEX_HNSWLIB_SOURCE=$PWD/target/hnswlib-source" >> "$GITHUB_ENV"
+      - name: Native concurrency regression (ThreadSanitizer)
+        run: |
+          work=$(mktemp -d)
+          c++ -std=c++17 -O1 -g -fsanitize=thread -fno-omit-frame-pointer \
+            -mavx2 -mfma -mf16c -pthread -I "$VORTEX_HNSWLIB_SOURCE" \
+            vortex-index-hnswlib/native/bridge.cpp \
+            vortex-index-hnswlib/native/tests/concurrency.cpp -o "$work/concurrency"
+          # Disable only the upstream serial-build lock-order detector, not race detection.
+          # Disable ASLR for this process to avoid GCC TSan shadow-memory conflicts.
+          TSAN_OPTIONS=halt_on_error=1:detect_deadlocks=0 \
+            setarch x86_64 -R "$work/concurrency" "$work"
       - name: Build, reload, parity and native structure tests
         run: cargo test --locked -p vortex-index-hnswlib --all-features --all-targets
       - name: Native Clippy

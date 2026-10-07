@@ -50,20 +50,20 @@ pub struct HnswBuildOptions {
     pub m: u32,
     /// Construction width, m..=4096.
     pub ef_construction: u32,
-    /// Upstream random seed; parallel construction is not bitwise deterministic.
+    /// Upstream random seed.
     pub seed: u32,
-    /// Native construction threads, 1..=8; not a query setting or CPU quota.
+    /// Native construction threads, currently must be 1; not a query setting or CPU quota.
     pub threads: u32,
 }
 
 impl HnswBuildOptions {
     pub(crate) fn validate(&self) -> VortexResult<()> {
         self.bundle(1).validate()?;
-        if self.format_version != 1
-            || self.seed > i32::MAX as u32
-            || !(1..=8).contains(&self.threads)
-        {
-            vortex_bail!("Invalid hnswlib build version, seed or thread count");
+        if self.format_version != 1 || self.seed > i32::MAX as u32 {
+            vortex_bail!("Invalid hnswlib build version or seed");
+        }
+        if self.threads != 1 {
+            vortex_bail!("hnswlib construction requires threads=1");
         }
         Ok(())
     }

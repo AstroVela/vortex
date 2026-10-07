@@ -6,6 +6,7 @@ use std::fs;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Barrier;
 use std::thread;
 
 use async_trait::async_trait;
@@ -65,12 +66,16 @@ fn config() -> HnswBuildOptions {
         m: 8,
         ef_construction: 64,
         seed: 100,
-        threads: 2,
+        threads: 1,
     }
 }
 
 fn vector(id: u32) -> Vec<f32> {
-    (0..8)
+    vector_at_dimension(id, 8)
+}
+
+fn vector_at_dimension(id: u32, dimension: u32) -> Vec<f32> {
+    (0..dimension)
         .map(|component| ((id * 97 + component * 53 + id * component) % 997) as f32 / 997.0)
         .collect()
 }
@@ -438,6 +443,115 @@ fn concurrent_search_ef_is_handle_local() -> VortexResult<()> {
     })
 }
 
+#[rstest]
+#[case(1)]
+#[case(3)]
+#[case(4)]
+#[case(5)]
+#[case(8)]
+#[case(15)]
+#[case(16)]
+#[case(17)]
+#[case(20)]
+#[case(31)]
+#[case(32)]
+#[case(128)]
+#[case(129)]
+fn native_distance_kernels_match_scalar_l2(#[case] dimension: u32) -> VortexResult<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("index.bin");
+    let config = HnswBuildOptions {
+        dimension,
+        ..config()
+    };
+    let bundle = config.bundle(256);
+    let vectors = (0..256)
+        .flat_map(|id| vector_at_dimension(id, dimension))
+        .collect::<Vec<_>>();
+    Native::build(&path, &vectors, bundle, &config)?;
+    let index = Native::open(&path, bundle)?;
+    for id in [7, 257] {
+        let query = vector_at_dimension(id, dimension);
+        let hits = index.search(&query, 256, 256)?;
+        assert_eq!(hits.len(), 256);
+        assert_eq!(
+            hits.iter().map(|hit| hit.0).collect::<BTreeSet<_>>().len(),
+            256
+        );
+        for (row, distance) in hits {
+            let expected = query
+                .iter()
+                .zip(vector_at_dimension(row, dimension))
+                .map(|(left, right)| (left - right).powi(2))
+                .sum::<f32>();
+            assert!((distance - expected).abs() <= 1e-5 * expected.max(1.0));
+        }
+    }
+    Ok(())
+}
+
+#[rstest]
+#[case(17)]
+#[case(128)]
+#[case(129)]
+fn independent_build_open_and_search_can_overlap(#[case] dimension: u32) -> VortexResult<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("index.bin");
+    let config = HnswBuildOptions {
+        dimension,
+        ..config()
+    };
+    let bundle = config.bundle(256);
+    let vectors = (0..256)
+        .flat_map(|id| vector_at_dimension(id, dimension))
+        .collect::<Vec<_>>();
+    Native::build(&path, &vectors, bundle, &config)?;
+    let index = Native::open(&path, bundle)?;
+    let query = vector_at_dimension(7, dimension);
+    let expected = index.search(&query, 10, 256)?;
+    assert_eq!(expected[0], (7, 0.0));
+    let barrier = Barrier::new(4);
+    thread::scope(|scope| -> VortexResult<()> {
+        let handles = (0..4)
+            .map(|worker| {
+                let barrier = &barrier;
+                let index = &index;
+                let query = &query;
+                let expected = &expected;
+                let path = &path;
+                let root = root.path();
+                let config = &config;
+                let vectors = &vectors;
+                scope.spawn(move || -> VortexResult<()> {
+                    barrier.wait();
+                    for _ in 0..16 {
+                        if worker < 2 {
+                            let built_path = root.join(format!("built-{worker}.bin"));
+                            Native::build(&built_path, vectors, bundle, config)?;
+                            let opened = Native::open(&built_path, bundle)?;
+                            assert_eq!(opened.search(query, 10, 256)?, *expected);
+                        } else if worker == 2 {
+                            let opened = Native::open(path, bundle)?;
+                            assert_eq!(opened.search(query, 10, 256)?, *expected);
+                        } else {
+                            for _ in 0..32 {
+                                assert_eq!(index.search(query, 10, 256)?, *expected);
+                            }
+                        }
+                    }
+                    Ok(())
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| vortex_err!("Native worker panicked"))??;
+        }
+        Ok(())
+    })
+}
+
 #[test]
 fn equal_distances_are_ordered_by_physical_address() -> VortexResult<()> {
     block_on(async {
@@ -490,6 +604,9 @@ fn equal_distances_are_ordered_by_physical_address() -> VortexResult<()> {
 #[case("m", 1)]
 #[case("ef_construction", 7)]
 #[case("threads", 0)]
+#[case::parallel_two("threads", 2)]
+#[case::parallel_four("threads", 4)]
+#[case::parallel_eight("threads", 8)]
 #[case("threads", 9)]
 #[case("seed", u32::MAX)]
 #[case("unknown", 1)]

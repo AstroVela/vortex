@@ -80,7 +80,8 @@ pub(crate) struct Native {
 }
 
 // SAFETY: each handle's C++ mutex serializes ef changes and synchronous searches.
-// No native operation retains borrowed inputs or has owner-thread affinity.
+// Distance kernels have no shared mutable state. No native operation retains
+// borrowed inputs or has owner-thread affinity.
 unsafe impl Send for Native {}
 // SAFETY: the same handle mutex guards shared access; final drop cannot race borrows.
 unsafe impl Sync for Native {}

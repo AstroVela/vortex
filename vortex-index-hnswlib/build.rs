@@ -60,8 +60,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         .flag("-mavx2")
         .flag("-mfma")
         .flag("-mf16c")
-        .flag("-fopenmp")
         .compile("vortex_hnswlib_bridge");
-    println!("cargo:rustc-link-lib=gomp");
     Ok(())
 }
