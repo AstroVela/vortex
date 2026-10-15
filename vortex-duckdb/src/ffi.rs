@@ -8,7 +8,6 @@ use std::ptr;
 
 use num_traits::AsPrimitive;
 use vortex::error::VortexExpect;
-#[cfg(vortex_vane_distributed)]
 use vortex::error::vortex_err;
 
 use crate::convert::can_push_expression;
@@ -52,6 +51,8 @@ use crate::table_function::TableFunctionBind;
 use crate::table_function::TableFunctionGlobal;
 use crate::table_function::TableFunctionLocal;
 use crate::table_function::bind;
+#[cfg(not(vortex_vane_distributed))]
+use crate::table_function::bind_duckdb_file;
 use crate::table_function::cardinality;
 use crate::table_function::get_partition_data;
 use crate::table_function::init_global;
@@ -282,6 +283,28 @@ pub unsafe extern "C-unwind" fn duckdb_table_function_bind(
 
     try_or_null(error_out, || {
         let bind_data = bind(&bind_input, &mut bind_result)?;
+        Ok(Data::from(Box::new(bind_data)).as_ptr())
+    })
+}
+
+#[cfg(not(vortex_vane_distributed))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn duckdb_table_function_bind_file(
+    context: *mut c_void,
+    path: *const c_char,
+    bind_result: cpp::duckdb_vx_tfunc_bind_result,
+    error_out: *mut cpp::duckdb_vx_error,
+) -> cpp::duckdb_vx_data {
+    let mut bind_result = unsafe { BindResult::own(bind_result) };
+    try_or_null(error_out, || {
+        if path.is_null() {
+            return Err(vortex_err!("Vortex input path is null"));
+        }
+        // SAFETY: The C++ bind callback owns a terminated path and live context for this call.
+        let path = unsafe { CStr::from_ptr(path) }
+            .to_str()
+            .map_err(|_| vortex_err!("Vortex input path is not valid UTF-8"))?;
+        let bind_data = unsafe { bind_duckdb_file(context, path, &mut bind_result) }?;
         Ok(Data::from(Box::new(bind_data)).as_ptr())
     })
 }

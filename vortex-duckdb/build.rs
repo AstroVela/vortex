@@ -30,10 +30,11 @@ const BUILD_MARKER: &str = ".vx-build-complete";
 const DUCKDB_CACHE_DIR: &str = "vortex-duckdb-cache";
 const EXTRACT_MARKER: &str = ".vx-extract-complete";
 
-const SOURCE_FILES: [&str; 12] = [
+const SOURCE_FILES: [&str; 13] = [
     "cpp/vortex_duckdb.cpp",
     "cpp/copy_function.cpp",
     "cpp/file_writer.cpp",
+    "cpp/file_reader.cpp",
     "cpp/expr.cpp",
     "cpp/optimizer.cpp",
     "cpp/scalar_fn_pushdown.cpp",

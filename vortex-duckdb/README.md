@@ -70,6 +70,21 @@ VX_DUCKDB_DEBUG=1 VX_DUCKDB_SAN=1 cargo build -p vortex-duckdb
 | `VX_DUCKDB_DEBUG` | Build from source in debug mode |
 | `VX_DUCKDB_ASAN`  | Enable AddressSanitizer         |
 
+## DuckDB filesystem reads
+
+Native builds also register `_read_vortex_file(path)` for exact-file integrations
+such as Iceberg. It reads through DuckDB's client filesystem, including scoped S3
+secrets, session tokens and access restrictions. Paths are literal; this function
+does not expand globs. Projection is supported, while DuckDB evaluates row
+predicates and aggregates. The existing `read_vortex` interface is unchanged.
+
+The exact-file reader reopens on every execution so prepared statements do not
+retain old credentials or bypass later access restrictions. It reads ranges on
+the blocking I/O pool, serializes access to each file handle and checks query
+interruption around I/O. Dropped futures retain their handle until an in-flight
+blocking read finishes. Native files are expected to be immutable; the Vane
+distributed identity/fencing protocol remains a separate implementation.
+
 ## Running Tests
 
 ```bash

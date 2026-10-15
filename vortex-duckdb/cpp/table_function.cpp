@@ -1482,6 +1482,47 @@ extern "C" duckdb_state duckdb_vx_register_table_functions(duckdb_database ffi_d
             }
         }
     }
+#ifndef VORTEX_VANE_DISTRIBUTED
+    // Iceberg supplies one exact manifest path. This adapter delegates all I/O to DuckDB and
+    // leaves row predicates/aggregates in DuckDB, including its NaN and signed-zero semantics.
+    TableFunction file_scan(
+        "_read_vortex_file",
+        {LogicalType::VARCHAR},
+        function,
+        [](ClientContext &context,
+           TableFunctionBindInput &input,
+           vector<LogicalType> &types,
+           vector<string> &names) -> unique_ptr<FunctionData> {
+            if (input.inputs[0].IsNull()) {
+                throw InvalidInputException("Vortex input path cannot be NULL");
+            }
+            const auto path = input.inputs[0].GetValue<string>();
+            VortexBindResults results = {types, names};
+            duckdb_vx_error error = nullptr;
+            auto data =
+                duckdb_table_function_bind_file(&context,
+                                                path.c_str(),
+                                                reinterpret_cast<duckdb_vx_tfunc_bind_result>(&results),
+                                                &error);
+            if (error) {
+                throw BinderException(IntoErrString(error));
+            }
+            return make_uniq<VortexBindData>(unique_ptr<CData>(reinterpret_cast<CData *>(data)), types);
+        },
+        init_global,
+        init_local);
+    file_scan.projection_pushdown = true;
+    file_scan.to_string = to_string;
+    try {
+        auto transaction = CatalogTransaction::GetSystemTransaction(db);
+        CreateTableFunctionInfo info(file_scan);
+        info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+        Catalog::GetSystemCatalog(db).CreateFunction(transaction, info);
+    } catch (const std::exception &error) {
+        DUCKDB_LOG_ERROR(db, "Failed to register Vortex file reader: " + ErrorData(error).Message());
+        return DuckDBError;
+    }
+#endif
 #ifdef VORTEX_INDEX
     RegisterVortexIndexFunctions(db);
 #endif

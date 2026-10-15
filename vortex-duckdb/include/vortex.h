@@ -90,6 +90,14 @@ duckdb_vx_data duckdb_table_function_bind(duckdb_vx_tfunc_bind_input bind_input,
                                           duckdb_vx_tfunc_bind_result bind_result,
                                           duckdb_vx_error *error_out);
 
+#if !defined(VORTEX_VANE_DISTRIBUTED)
+extern
+duckdb_vx_data duckdb_table_function_bind_file(void *context,
+                                               const char *path,
+                                               duckdb_vx_tfunc_bind_result bind_result,
+                                               duckdb_vx_error *error_out);
+#endif
+
 extern duckdb_vx_data duckdb_table_function_bind_data_clone(const void *bind_data);
 
 #if defined(VORTEX_VANE_DISTRIBUTED)

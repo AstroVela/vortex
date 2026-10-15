@@ -9,6 +9,8 @@ mod data_chunk;
 mod database;
 mod ddb_string;
 mod expr;
+#[cfg(not(vortex_vane_distributed))]
+mod file_reader;
 mod file_writer;
 mod function;
 mod logical_type;
@@ -34,6 +36,8 @@ pub use data_chunk::*;
 pub use database::*;
 pub use ddb_string::*;
 pub use expr::*;
+#[cfg(not(vortex_vane_distributed))]
+pub(crate) use file_reader::*;
 pub(crate) use file_writer::*;
 pub use function::*;
 pub use logical_type::*;
