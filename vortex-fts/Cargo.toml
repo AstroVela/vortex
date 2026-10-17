@@ -1,0 +1,30 @@
+[package]
+name = "vortex-fts"
+authors = { workspace = true }
+categories = { workspace = true }
+description = "Tantivy full-text sidecar indexes for Vortex files"
+edition = { workspace = true }
+homepage = { workspace = true }
+keywords = { workspace = true }
+license = { workspace = true }
+readme = "README.md"
+repository = { workspace = true }
+rust-version = { workspace = true }
+version = { workspace = true }
+
+[lints]
+workspace = true
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+futures = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tantivy = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+vortex = { workspace = true, features = ["tokio"] }
+
+[dev-dependencies]
+vortex-array = { workspace = true, features = ["_test-harness"] }

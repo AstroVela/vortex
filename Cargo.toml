@@ -27,6 +27,7 @@ members = [
     "vortex-index",
     "vortex-index-spfresh",
     "vortex-index-hnswlib",
+    "vortex-fts",
     "vortex-ipc",
     "vortex",
     "vortex-bench",
@@ -269,6 +270,7 @@ take_mut = "0.2.2"
 tar = "0.4"
 target-lexicon = "0.13"
 temp-env = "0.3"
+tantivy = "=0.25.0"
 tempfile = "3"
 termtree = { version = "1.0" }
 test-with = "=0.16.3"
