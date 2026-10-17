@@ -3,12 +3,10 @@
 ## 目标与边界
 
 为仓库的 Vortex 文件扫描能力增加可持久化全文检索，复用 Tantivy 的分词、倒排表、
-查询解析和 BM25。实现位于独立 `vortex-fts` workspace crate；现有 crate 不依赖它，
+查询解析和 BM25。实现位于 `vortex-fts` workspace crate；DuckDB 扩展按 feature 注册后端，
 已有 Vortex 读写流程和文件格式不变。
 
-本版本覆盖单个不可变本地文件、多个顶层 UTF-8 字段、CLI、Rust API 和选择性回表。
-未实现 SQL 优化器接入、多文件检索、对象存储、增量写入、事务索引维护、中文专用
-分词以及高亮。它是可以使用和测试的独立检索组件，不会自动加速现有 SQL 查询。
+本版本包含单文件 CLI/Rust API、`vortex-index` 多文件全文后端、DuckDB SQL 以及配套 Iceberg 显式快照适配器。未实现 SQL 优化器自动改写、云端索引存储、增量事务维护、中文专用分词和高亮。下面先描述保留的单文件 API，再描述通用后端与集成。
 
 ## 数据布局与模块
 
@@ -110,3 +108,28 @@ TopDocs 的内存主要与 limit/segment 数相关，Count 需要遍历全部匹
 依赖升级必须重新执行这些测试，尤其关注 tokenizer 行为、Tantivy schema 和文件
 格式兼容性。CLI 还应运行 build/search/inspect 的进程级 smoke test，检查 JSON 和
 失败退出码。检查结果在对应 PR 中记录。
+
+
+## 通用索引能力与多文件后端
+
+`vortex-index::Index` 新增默认返回 None 的 `as_full_text()`，兼容已有 vector/scalar 后端；`FullTextIndex::search_text` 返回 `FullTextHit { row: RowAddress, score: f32 }`，分数降序。全文相关性与向量距离分开表达。
+
+`TantivyProvider`（ID `tantivy.static`，版本 1）同时实现 builder/provider。消费 `IndexSource` 的可见行流，验证行地址、覆盖范围、重复地址与上限，把所有覆盖文件写进同一个 Tantivy index。`_vortex_file_id` 和 `_vortex_row_id` 为 fast u64 字段，与原始行映射解耦于 Tantivy segment/doc ID。文档 NULL 规则与单文件实现相同。默认 analyzer 固定到 Tantivy 0.25.0。
+
+新布局为 reference JSON → LocalGeneration → 校验清单与 artifacts/tantivy/{descriptor.json,index/*}。LocalIndexStore 对 artifact 校验大小、SHA-256、路径类型和快照，打开时 materialize 到私有 lease，native handle 释放后才能删除 lease。后端 descriptor 再验证 metadata identity、schema、analyzer、文档数。构建必须 seal 并重开成功，重新验证源文件后才原子发布 reference；失败不会发布可用 reference。
+
+查询创建单个 Searcher 和全局评分 Weight，逐 segment 枚举命中文档，在加入大小为 k 的堆之前应用 RowFilter，因而不会发生“先 top-k 后过滤导致漏掉剩余候选”的错误。堆和最终排序使用 score DESC、RowAddress ASC。时间复杂度 O(命中数 × log k)，结果存储 O(k)；这是精确检索，不采用 block-max WAND 剪枝。对任意 allow/exclude 过滤，BM25 仍使用索引固定语料统计；Iceberg 删除行在建索引前移除，因此不进入该语料。
+
+## DuckDB 生命周期
+
+`vortex_fts_build(files, reference, fields)` 和 `vortex_fts_search(reference, query, k)` 复用已有 index FFI、访问策略、prepared owner、预算缓存和回表路径。build 仅在执行阶段产生副作用，EXPLAIN 不写索引。Reference 保留完整结果 dtype，bind 阶段确定 `row STRUCT` 返回类型，执行时再次验证 reference identity。
+
+缓存现在保存一般 Index，具体查询入口验证 full-text 或 squared-L2 capability。全文查询支持多个字段，向量接口仍要求单字段；两类查询不能混用。strict 模式重新验证源文件；snapshot 模式必须有 prepared owner。SQL 返回 score，不将 relevance 伪装成 distance。回表通过 IndexSource::take 保持排名顺序，并验证返回行映射和 dtype。
+
+## Iceberg 快照适配
+
+配套 Python orchestration 使用调用方连接执行原生 Iceberg scan、Vortex COPY 和全文 SQL。扫描指定 snapshot ID，复用成熟的删除可见性、字段 ID 和 schema 映射。只物化该快照的可见行，避免自行重写 position/equality-delete 规则。全表物化也让所有数据文件共享一致的 BM25 统计。
+
+发布顺序：独占创建新目录 → snapshot scan/COPY（最多读取 1000001 行，用额外一行检测超限）→ native FTS build/seal/reopen → 再核对 metadata 字节 → 原子发布 iceberg-fts.json。异常清理本次独占目录。目录中的完成标记绑定 table UUID、完整 snapshot 描述、schema 与被索引字段 ID、native reference hash。没有完成标记的目录不可查询。
+
+检索要求调用方再次指定 metadata 和 snapshot，身份不一致或快照过期即失败。业务行来自物化快照，source hash 防止物化文件被替换。读取持久快照遵循 Iceberg 的不可变文件约定，不在每次全文查询重新读取所有远端 manifest/data files。返回地址明确属于物化文件，不是 Iceberg 物理地址。该方案增加存储和全量构建开销；增量更新、自动 catalog latest 跟踪、原文件按行回表属于后续架构工作，不由当前 API 暗示支持。

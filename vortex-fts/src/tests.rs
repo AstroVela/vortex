@@ -334,3 +334,186 @@ async fn test_bm25_and_analyzer_contract() -> VortexResult<()> {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn test_provider_multifile_visibility_reopen_and_boosts() -> VortexResult<()> {
+    use std::collections::BTreeSet;
+    use std::num::NonZeroUsize;
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+    use vortex_index::IndexBuildRequest;
+    use vortex_index::IndexBuilder;
+    use vortex_index::IndexMetadata;
+    use vortex_index::IndexProvider;
+    use vortex_index::RowAddress;
+    use vortex_index::RowFilter;
+    use vortex_index::Snapshot;
+    use vortex_index::SourceFile;
+    use vortex_index::file::LocalFileSource;
+    use vortex_index::file::file_version;
+    use vortex_index::file::schema_fingerprint;
+    use vortex_index::store::LocalIndexStore;
+    use vortex_index::store::LocalStoreLimits;
+    let session = VortexSession::default();
+    let root = tempfile::tempdir()?;
+    let data = table()?;
+    let mut files = Vec::new();
+    for id in [3, 7] {
+        let path = root.path().join(format!("{id}.vortex"));
+        write_file(&session, &path, data.clone()).await?;
+        files.push(SourceFile {
+            id,
+            uri: path.to_string_lossy().into(),
+            version: file_version(&fs::read(path)?),
+            row_count: data.len() as u64,
+        });
+    }
+    let snapshot = Snapshot {
+        dataset_id: "table-uuid".into(),
+        version: "snapshot-123".into(),
+        schema_fingerprint: schema_fingerprint(data.dtype())?,
+        files,
+    };
+    let source = Arc::new(
+        LocalFileSource::open(
+            snapshot.clone(),
+            data.dtype().clone(),
+            1_000_000,
+            session.clone(),
+        )
+        .await?,
+    );
+    let provider = TantivyProvider::try_new(session, root.path().to_owned())?;
+    let store = Arc::new(LocalIndexStore::create(
+        root.path(),
+        "generation-1",
+        LocalStoreLimits {
+            max_artifact_bytes: 64 * 1024 * 1024,
+            max_manifest_bytes: 1024 * 1024,
+        },
+    )?);
+    let metadata = provider
+        .build(
+            IndexBuildRequest {
+                metadata: IndexMetadata {
+                    format_version: 1,
+                    name: "text".into(),
+                    generation: "generation-1".into(),
+                    backend: TANTIVY_ID.into(),
+                    backend_version: 1,
+                    snapshot: snapshot.clone(),
+                    fields: vec!["title".into(), "body".into()],
+                    covered_files: vec![3, 7],
+                    artifacts: vec![],
+                },
+                backend_options: Bytes::new(),
+            },
+            source,
+            Arc::clone(&store) as Arc<dyn vortex_index::IndexStore>,
+        )
+        .await?;
+    let generation = store.seal(&metadata)?;
+    drop(store);
+    let (store, metadata) = LocalIndexStore::open(
+        root.path(),
+        &generation,
+        &snapshot,
+        LocalStoreLimits {
+            max_artifact_bytes: 64 * 1024 * 1024,
+            max_manifest_bytes: 1024 * 1024,
+        },
+    )?;
+    let index = provider.open(&metadata, Arc::new(store)).await?;
+    let text = index
+        .as_full_text()
+        .ok_or_else(|| vortex_err!("missing full text"))?;
+    let all = RowFilter::try_new(snapshot.clone(), None, BTreeSet::new())?;
+    let k = NonZeroUsize::new(10).unwrap();
+    let hits = text.search_text("search", k, &Bytes::new(), &all).await?;
+    assert_eq!(hits.len(), 2);
+    assert_eq!(
+        hits[0].row,
+        RowAddress {
+            file_id: 3,
+            row_offset: 0
+        }
+    );
+    assert_eq!(
+        hits[1].row,
+        RowAddress {
+            file_id: 7,
+            row_offset: 0
+        }
+    );
+    assert_eq!(hits[0].score, hits[1].score);
+    let excluded = RowFilter::try_new(snapshot.clone(), None, BTreeSet::from([hits[0].row]))?;
+    let filtered = text
+        .search_text(
+            "search",
+            NonZeroUsize::new(1).unwrap(),
+            &Bytes::new(),
+            &excluded,
+        )
+        .await?;
+    assert_eq!(filtered, hits[1..]);
+    let allow = RowFilter::try_new(
+        snapshot.clone(),
+        Some(BTreeSet::from([hits[1].row])),
+        BTreeSet::new(),
+    )?;
+    assert_eq!(
+        text.search_text("search", k, &Bytes::new(), &allow).await?,
+        hits[1..]
+    );
+    let boost = Bytes::from_static(br#"{"field_boosts":{"title":4.0}}"#);
+    assert!(text.search_text("search", k, &boost, &all).await?[0].score > hits[0].score);
+    for options in [
+        br#"{"field_boosts":{"missing":2}}"#.as_slice(),
+        br#"{"field_boosts":{"title":0}}"#,
+        br#"{"unknown":1}"#,
+    ] {
+        assert!(
+            text.search_text("search", k, &Bytes::copy_from_slice(options), &all)
+                .await
+                .is_err()
+        );
+    }
+    let mut stale = snapshot;
+    stale.version = "new-snapshot".into();
+    assert!(
+        text.search_text(
+            "search",
+            k,
+            &Bytes::new(),
+            &RowFilter::try_new(stale, None, BTreeSet::new())?
+        )
+        .await
+        .is_err()
+    );
+    let artifact = metadata
+        .artifacts
+        .iter()
+        .find(|a| a.path.ends_with("meta.json"))
+        .ok_or_else(|| vortex_err!("meta artifact"))?;
+    fs::write(
+        root.path()
+            .join("generation-1")
+            .join("artifacts")
+            .join(&artifact.path),
+        "corrupted",
+    )?;
+    assert!(
+        LocalIndexStore::open(
+            root.path(),
+            &generation,
+            &metadata.snapshot,
+            LocalStoreLimits {
+                max_artifact_bytes: 64 * 1024 * 1024,
+                max_manifest_bytes: 1024 * 1024
+            }
+        )
+        .is_err()
+    );
+    Ok(())
+}

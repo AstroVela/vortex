@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::fmt::Debug;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -14,6 +15,7 @@ use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 
+use crate::FullTextHit;
 use crate::IndexArtifact;
 use crate::IndexMetadata;
 use crate::RowAddress;
@@ -31,6 +33,11 @@ pub trait Index: Debug + Send + Sync {
 
     /// Vector-query capability, if implemented.
     fn as_vector(&self) -> Option<&dyn VectorIndex> {
+        None
+    }
+
+    /// Full-text retrieval capability, if implemented.
+    fn as_full_text(&self) -> Option<&dyn FullTextIndex> {
         None
     }
 
@@ -275,4 +282,18 @@ pub trait IndexProvider: Send + Sync {
     fn builder(&self) -> Option<&dyn IndexBuilder> {
         None
     }
+}
+
+/// Snapshot-bound relevance search, distinct from vector distances.
+#[async_trait]
+pub trait FullTextIndex: Index {
+    /// Return at most k distinct hits ordered by descending score, then ascending row address.
+    /// Mandatory visibility restrictions must be applied before selecting top-k.
+    async fn search_text(
+        &self,
+        query: &str,
+        k: NonZeroUsize,
+        options: &Bytes,
+        filter: &RowFilter,
+    ) -> VortexResult<Vec<FullTextHit>>;
 }

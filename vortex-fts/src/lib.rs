@@ -10,6 +10,9 @@
 //! SHA-256 digest, so replacing a file with different contents requires rebuilding its index.
 
 mod manifest;
+mod provider;
+pub use provider::TANTIVY_ID;
+pub use provider::TantivyProvider;
 mod schema;
 #[cfg(test)]
 mod tests;

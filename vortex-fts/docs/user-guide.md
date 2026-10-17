@@ -2,15 +2,16 @@
 
 ## 能力与使用前提
 
-`vortex-fts` 为一个本地、不可变的 Vortex 文件建立独立全文索引目录。支持：
+`vortex-fts` 提供独立文件 CLI 和 `vortex-index` 多文件后端。DuckDB 扩展注册后可通过 SQL 建索引、查询和回表；Iceberg 配套工具提供显式快照索引。支持：
 
 - 对多个顶层 UTF-8 列同时索引，支持可空列和压缩编码。
 - 词项、短语、字段限定、布尔组合查询；按 Tantivy BM25 返回 top-k。
 - 返回总命中数和零基物理行号，通过 Rust API 选择读取原文件中的命中行。
 - 索引落盘后跨进程重新打开；查询前校验源文件内容身份。
 
-需要仓库指定的 Rust 1.91 工具链。本功能是独立 crate 和 CLI，尚未提供
-DuckDB/DataFusion SQL 函数、Python API、对象存储索引或多文件全局搜索。
+需要仓库指定的 Rust 1.91 工具链。下文原有 CLI 示例面向单文件接口；DuckDB 和 Iceberg 使用文末的集成接口。两种索引清单格式不同，不可交换。
+
+DuckDB SQL 和 Iceberg 工具都是显式调用；不会自动改写 `LIKE`、`contains` 或普通表扫描。索引保存在本地，现阶段不提供增量维护、云端索引发布或中文专用分词。
 
 ## 编译与完整示例
 
@@ -145,3 +146,54 @@ let rows = index.read_rows(&session, &source, &row_ids).await?;
 各读取一次。因此大文件查询延迟包含 O(文件字节数) 的顺序 I/O，不承诺低延迟。
 异步建索引/回表函数内部也含同步哈希与 Tantivy 操作；在线服务应放到专用工作线程
 或独立任务进程中。建议先用业务数据测量索引大小、构建吞吐和端到端查询延迟。
+
+
+## DuckDB：多文件 SQL 检索
+
+配套仓库 `AstroVela/duckdb-vortex` 编译时开启 `-DVORTEX_ENABLE_INDEX_TANTIVY=ON`，加载与 DuckDB 版本、平台匹配的扩展。Rust 对应 `index-tantivy` feature；底层 `vortex-duckdb` 使用 `index` feature。Tantivy 不需要 SPFresh/hnswlib 原生依赖。
+
+```sql
+LOAD '/absolute/path/vortex.duckdb_extension';
+COPY (SELECT 1::BIGINT id, 'Rust search' title, 'full text engine' body)
+TO '/data/a.vortex' (FORMAT vortex);
+COPY (SELECT 2::BIGINT id, 'Vortex engine' title, 'search in Rust' body)
+TO '/data/b.vortex' (FORMAT vortex);
+
+-- 父目录 /data/indexes 必须存在；reference 不得存在。
+SELECT * FROM vortex_fts_build(
+  ['/data/a.vortex', '/data/b.vortex'],
+  '/data/indexes/articles.json', ['title', 'body']);
+
+SELECT rank, score, "row".id, "row".title
+FROM vortex_fts_search('/data/indexes/articles.json', 'rust AND search', 10,
+  query_options := '{"field_boosts":{"title":2.0}}')
+ORDER BY rank;
+```
+
+建索引返回 `reference, generation, rows`。查询返回 `rank UBIGINT, file_id UBIGINT, row_offset UBIGINT, score FLOAT, row STRUCT`。rank 从 1 起，row_offset 从 0 起，file_id 按输入文件顺序从 1 起。结果按 BM25 降序、行地址升序打破平分；SQL 输出顺序请明确写 `ORDER BY rank`。一个全局 Tantivy 索引共享所有输入文件的 BM25 文档统计。
+
+只接受 1..4096 个无重复本地文件，schema 必须一致；1..16 个顶层 UTF-8 字段；源文件合计不超过 512 MiB；最多 100 万文档；索引不超过 1 GiB；`k` 为 1..10000；query 和 query_options 各不超过 64 KiB。字段名规则与 CLI 相同，另外保留 `_vortex_file_id`。field_boosts 值必须有限且大于零；未知选项报错。
+
+默认 `validation_mode := 'strict'` 每次执行验证源文件和索引身份。prepared statement 可复用已打开的后端，但仍检查 reference 和源文件。显式 `validation_mode := 'snapshot'` 仅适用于有存活 prepared owner 的调用，固定并保留已验证源数据；不会跟随文件变更。源文件被替换或 reference 被改写时，strict 查询失败，必须重建或重新 prepare。外部文件访问被禁用时不可调用。
+
+`WHERE` 作用在返回的 top-k 上；不代表“先过滤业务条件再求 top-k”。需要这种语义时，先对所需数据构建独立索引，或通过 Rust `RowFilter` 明确提供候选行集合。
+
+## Iceberg：显式快照完整检索流程
+
+配套实现位于 `AstroVela/duckdb-iceberg/tools/iceberg_fts.py`，入口是 Python `build` / `search` 和命令行，复用上面的原生 DuckDB SQL 函数。
+
+```python
+from tools.iceberg_fts import build, search
+# con 是已经 LOAD iceberg 和启用 Tantivy 的 vortex 扩展的 DuckDB 连接。
+build(con, '/warehouse/table/metadata/v7.metadata.json', 123456789,
+      '/indexes/table-snapshot-123456789', ['title', 'body'])
+hits = search(con, '/indexes/table-snapshot-123456789',
+              '/warehouse/table/metadata/v7.metadata.json', 123456789,
+              'rust AND search', 10, field_boosts={'title': 2.0})
+```
+
+快照 ID 必须明确存在于所给 metadata JSON，且快照记录包含 schema-id。工具核对 table UUID、快照、schema、字段 ID，不会把旧索引用于新的当前快照。新 metadata 仍保留相同历史快照时，可继续显式查询旧快照。
+
+建索引先调用 `iceberg_scan(..., snapshot_from_id := ...)`，由 Iceberg 扫描器完成 position/equality delete、字段 ID 映射等可见性处理，再物化为 `snapshot.vortex`。Tantivy 只看到可见行，因此被删除的文档不参与 BM25 统计。所有结果是该快照的原始列值；返回行地址属于物化 Vortex 文件，不能用于定位或删除 Iceberg 原数据行。
+
+每代索引保存完整可见快照，需要额外磁盘空间；更新必须在新目录重新构建，成功后由应用切换目录。元数据输入为本地未压缩 JSON；数据文件访问、支持格式和删除规则沿用加载的 Iceberg 扩展。Vortex 格式 Iceberg 表仍受现有 reader 的本地、v2、固定 schema、非分区等限制，FTS 不扩展这些限制。索引目录不可移动，清理时先停止使用该目录，再整体删除。完整操作与验证见配套仓库 `docs/TANTIVY_FTS_USER_GUIDE.md`。
