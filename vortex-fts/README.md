@@ -2,7 +2,7 @@
 
 `vortex-fts` builds a persistent [Tantivy 0.25](https://docs.rs/tantivy/0.25.0/tantivy/)
 sidecar for immutable Vortex data. It includes a multi-file `TantivyProvider` for
-`vortex-index`, DuckDB SQL support (with the companion extension), and a single-file Rust API and the
+`vortex-index`, DuckDB SQL support (with `vortex-duckdb/extension` in this workspace), and a single-file Rust API and the
 `vortex-fts` CLI: multi-column text indexing, field-qualified/phrase/Boolean
 queries, BM25 top-k results, and physical row IDs for Vortex row selection.
 
@@ -31,3 +31,12 @@ cargo +nightly fmt --all -- --check
 ```
 
 DuckDB SQL、多文件 provider 和 Iceberg 快照适配请参阅 [用户文档](docs/user-guide.md#duckdb多文件-sql-检索) 与 [设计文档](docs/design.md#通用索引能力与多文件后端)。
+
+
+## Single-repository integrations
+
+- [Loadable DuckDB extension](../vortex-duckdb/extension/README.md)
+- [Iceberg snapshot adapter](integrations/iceberg/README.md)
+- [Iceberg user guide](docs/iceberg-user-guide.md) and [design](docs/iceberg-design.md)
+
+All integration changes are delivered in this repository; no companion PR is required.

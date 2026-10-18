@@ -150,7 +150,19 @@ let rows = index.read_rows(&session, &source, &row_ids).await?;
 
 ## DuckDB：多文件 SQL 检索
 
-配套仓库 `AstroVela/duckdb-vortex` 编译时开启 `-DVORTEX_ENABLE_INDEX_TANTIVY=ON`，加载与 DuckDB 版本、平台匹配的扩展。Rust 对应 `index-tantivy` feature；底层 `vortex-duckdb` 使用 `index` feature。Tantivy 不需要 SPFresh/hnswlib 原生依赖。
+所有交付代码均在本仓库。`vortex-duckdb/extension` 提供包含 Vortex IO 和 Tantivy 注册的可加载扩展，依赖当前 workspace 的代码，不需要另外两个仓库的 PR。
+
+从仓库根目录构建并打包（下例为 macOS arm64、DuckDB 1.5.5）：
+
+```sh
+cargo build -p vortex-duckdb-fts-extension
+python3 vortex-duckdb/extension/package.py \
+  --library target/debug/libvortex_fts_extension.dylib \
+  --output /absolute/output/vortex.duckdb_extension \
+  --duckdb-version v1.5.5 --platform osx_arm64
+```
+
+Linux 使用 `.so`，platform 取目标 DuckDB 的 `PRAGMA platform` 结果；版本取 `SELECT version()`。输出父目录必须存在，输出文件必须不存在，文件名必须是 `vortex.duckdb_extension`。这是未签名的本地开发构建，需要 `duckdb -unsigned` 或 Python 连接配置 `allow_unsigned_extensions=true`。默认构建沿用 `vortex-duckdb` 的 DuckDB 1.5.5 下载/链接流程；打包不会消除对匹配 DuckDB 动态库的依赖，请保留其构建目录。生产分发需要按目标平台打包原生依赖与签名。加载该扩展即可使用 `read_vortex`、COPY 和全文 SQL，不要在同一连接重复加载另一个同名 Vortex 扩展。
 
 ```sql
 LOAD '/absolute/path/vortex.duckdb_extension';
@@ -180,10 +192,14 @@ ORDER BY rank;
 
 ## Iceberg：显式快照完整检索流程
 
-配套实现位于 `AstroVela/duckdb-iceberg/tools/iceberg_fts.py`，入口是 Python `build` / `search` 和命令行，复用上面的原生 DuckDB SQL 函数。
+适配器位于本仓库 `vortex-fts/integrations/iceberg/iceberg_fts.py`，入口是 Python `build` / `search` 和 CLI，复用上面的原生 DuckDB SQL。运行 Python API 前，把该目录加入 PYTHONPATH：
+
+```sh
+export PYTHONPATH="$PWD/vortex-fts/integrations/iceberg"
+```
 
 ```python
-from tools.iceberg_fts import build, search
+from iceberg_fts import build, search
 # con 是已经 LOAD iceberg 和启用 Tantivy 的 vortex 扩展的 DuckDB 连接。
 build(con, '/warehouse/table/metadata/v7.metadata.json', 123456789,
       '/indexes/table-snapshot-123456789', ['title', 'body'])
@@ -196,4 +212,4 @@ hits = search(con, '/indexes/table-snapshot-123456789',
 
 建索引先调用 `iceberg_scan(..., snapshot_from_id := ...)`，由 Iceberg 扫描器完成 position/equality delete、字段 ID 映射等可见性处理，再物化为 `snapshot.vortex`。Tantivy 只看到可见行，因此被删除的文档不参与 BM25 统计。所有结果是该快照的原始列值；返回行地址属于物化 Vortex 文件，不能用于定位或删除 Iceberg 原数据行。
 
-每代索引保存完整可见快照，需要额外磁盘空间；更新必须在新目录重新构建，成功后由应用切换目录。元数据输入为本地未压缩 JSON；数据文件访问、支持格式和删除规则沿用加载的 Iceberg 扩展。Vortex 格式 Iceberg 表仍受现有 reader 的本地、v2、固定 schema、非分区等限制，FTS 不扩展这些限制。索引目录不可移动，清理时先停止使用该目录，再整体删除。完整操作与验证见配套仓库 `docs/TANTIVY_FTS_USER_GUIDE.md`。
+每代索引保存完整可见快照，需要额外磁盘空间；更新必须在新目录重新构建，成功后由应用切换目录。元数据输入为本地未压缩 JSON；数据文件访问、支持格式和删除规则沿用加载的 Iceberg 扩展。Vortex 格式 Iceberg 表需要具备该格式能力的 Iceberg reader，并仍受该 reader 的本地、v2、固定 schema、非分区等限制，FTS 不扩展这些限制。索引目录不可移动，清理时先停止使用该目录，再整体删除。完整操作与验证见本仓库 [Iceberg 用户文档](iceberg-user-guide.md)。

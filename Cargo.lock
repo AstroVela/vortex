@@ -10329,6 +10329,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "vortex-duckdb-fts-extension"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "vortex-duckdb",
+ "vortex-error",
+ "vortex-fts",
+]
+
+[[package]]
 name = "vortex-edition"
 version = "0.1.0"
 dependencies = [

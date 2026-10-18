@@ -3,10 +3,10 @@
 ## 目标与边界
 
 为仓库的 Vortex 文件扫描能力增加可持久化全文检索，复用 Tantivy 的分词、倒排表、
-查询解析和 BM25。实现位于 `vortex-fts` workspace crate；DuckDB 扩展按 feature 注册后端，
+查询解析和 BM25。实现位于 `vortex-fts` workspace crate；本仓库 `vortex-duckdb/extension` 扩展入口注册后端，
 已有 Vortex 读写流程和文件格式不变。
 
-本版本包含单文件 CLI/Rust API、`vortex-index` 多文件全文后端、DuckDB SQL 以及配套 Iceberg 显式快照适配器。未实现 SQL 优化器自动改写、云端索引存储、增量事务维护、中文专用分词和高亮。下面先描述保留的单文件 API，再描述通用后端与集成。
+本版本包含单文件 CLI/Rust API、`vortex-index` 多文件全文后端、DuckDB SQL 以及本仓库的 Iceberg 显式快照适配器。未实现 SQL 优化器自动改写、云端索引存储、增量事务维护、中文专用分词和高亮。下面先描述保留的单文件 API，再描述通用后端与集成。
 
 ## 数据布局与模块
 
@@ -128,8 +128,15 @@ TopDocs 的内存主要与 limit/segment 数相关，Count 需要遍历全部匹
 
 ## Iceberg 快照适配
 
-配套 Python orchestration 使用调用方连接执行原生 Iceberg scan、Vortex COPY 和全文 SQL。扫描指定 snapshot ID，复用成熟的删除可见性、字段 ID 和 schema 映射。只物化该快照的可见行，避免自行重写 position/equality-delete 规则。全表物化也让所有数据文件共享一致的 BM25 统计。
+`vortex-fts/integrations/iceberg/iceberg_fts.py` 使用调用方连接执行原生 Iceberg scan、Vortex COPY 和全文 SQL。扫描指定 snapshot ID，复用成熟的删除可见性、字段 ID 和 schema 映射。只物化该快照的可见行，避免自行重写 position/equality-delete 规则。全表物化也让所有数据文件共享一致的 BM25 统计。
 
 发布顺序：独占创建新目录 → snapshot scan/COPY（最多读取 1000001 行，用额外一行检测超限）→ native FTS build/seal/reopen → 再核对 metadata 字节 → 原子发布 iceberg-fts.json。异常清理本次独占目录。目录中的完成标记绑定 table UUID、完整 snapshot 描述、schema 与被索引字段 ID、native reference hash。没有完成标记的目录不可查询。
 
 检索要求调用方再次指定 metadata 和 snapshot，身份不一致或快照过期即失败。业务行来自物化快照，source hash 防止物化文件被替换。读取持久快照遵循 Iceberg 的不可变文件约定，不在每次全文查询重新读取所有远端 manifest/data files。返回地址明确属于物化文件，不是 Iceberg 物理地址。该方案增加存储和全量构建开销；增量更新、自动 catalog latest 跟踪、原文件按行回表属于后续架构工作，不由当前 API 暗示支持。
+
+
+## 单仓库交付与扩展加载
+
+本 PR 的交付边界仅为 `AstroVela/vortex`。`vortex-duckdb/extension` 是 workspace 内的 cdylib crate，直接依赖本地 `vortex-duckdb` 与 `vortex-fts`，在 `vortex_duckdb_cpp_init` 中注册 provider，再初始化 Vortex SQL。C++ helper 从 DuckDB 1.5 的 `ExtensionLoader` 取得 DatabaseInstance；头文件通过父 crate 的 `DEP_DUCKDB_INCLUDE_DIR` 传递，避免包装层使用另一份不匹配的 headers。`package.py` 追加未签名 CPP ABI footer，实际 LOAD 测试验证文件名、入口和 ABI。
+
+Iceberg 工具、metadata 测试、REST 测试 catalog 和 equality-delete 数据夹具均在 `vortex-fts/integrations/iceberg`。测试不需要其他仓库 checkout，也不依赖被关闭的配套 PR。Iceberg 扩展是运行依赖；适配器复用其标准扫描能力，而不复制 Iceberg reader 实现。自定义 Vortex 格式 reader 的支持范围由调用方加载的 Iceberg 二进制决定。
