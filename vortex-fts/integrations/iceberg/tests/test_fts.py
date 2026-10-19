@@ -123,6 +123,36 @@ class NativeIntegration(unittest.TestCase):
         os.chdir(Path(__file__).resolve().parent / "fixtures")
         self.addCleanup(os.chdir, original)
 
+    @unittest.skipUnless(os.environ.get("VORTEX_EXTENSION") and os.environ.get("ICEBERG_EXTENSION"),
+                         "set native extension paths to test the Python CLI")
+    def test_cli_stdout_is_json(self):
+        with connection() as conn, tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            table = root / "table"
+            conn.execute(f"COPY (SELECT 1::BIGINT id, 'rust search' title) TO {fts._literal(str(table))} (FORMAT iceberg)").fetchall()
+            metadata = next((table / "metadata").glob("*.metadata.json"))
+            snapshot = json.loads(metadata.read_text())["current-snapshot-id"]
+            command = [sys.executable, str(Path(fts.__file__).resolve()),
+                       "--vortex-extension", os.environ["VORTEX_EXTENSION"],
+                       "--iceberg-extension", os.environ["ICEBERG_EXTENSION"]]
+            arguments = ["--metadata", str(metadata), "--snapshot", str(snapshot),
+                         "--index", str(root / "index")]
+            built = subprocess.run(command + ["build"] + arguments + ["--fields", "title"],
+                                   text=True, capture_output=True, timeout=60)
+            self.assertEqual(built.returncode, 0, built.stderr)
+            self.assertEqual(json.loads(built.stdout)["rows"], 1)
+            searched = subprocess.run(command + ["search"] + arguments + ["--query", "rust"],
+                                      text=True, capture_output=True, timeout=60)
+            self.assertEqual(searched.returncode, 0, searched.stderr)
+            hits = json.loads(searched.stdout)
+            self.assertEqual(len(hits), 1)
+            self.assertEqual(hits[0][4], {"id": 1, "title": "rust search"})
+            failed = subprocess.run(command + ["search"] + arguments + ["--query", "missing:rust"],
+                                    text=True, capture_output=True, timeout=60)
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertEqual(failed.stdout, "")
+            self.assertTrue(failed.stderr)
+
     def test_visible_rows_across_equality_delete_snapshots(self):
         with connection() as conn, tempfile.TemporaryDirectory() as directory:
             metadata = Path("data/persistent/equality_deletes/warehouse/mydb/mytable/metadata/v7.metadata.json").resolve()

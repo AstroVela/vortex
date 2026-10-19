@@ -335,6 +335,7 @@ async fn test_bm25_and_analyzer_contract() -> VortexResult<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_provider_multifile_visibility_reopen_and_boosts() -> VortexResult<()> {
     use std::collections::BTreeSet;
@@ -356,11 +357,12 @@ async fn test_provider_multifile_visibility_reopen_and_boosts() -> VortexResult<
     use vortex_index::store::LocalIndexStore;
     use vortex_index::store::LocalStoreLimits;
     let session = VortexSession::default();
-    let root = tempfile::tempdir()?;
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().canonicalize()?;
     let data = table()?;
     let mut files = Vec::new();
     for id in [3, 7] {
-        let path = root.path().join(format!("{id}.vortex"));
+        let path = root.join(format!("{id}.vortex"));
         write_file(&session, &path, data.clone()).await?;
         files.push(SourceFile {
             id,
@@ -384,9 +386,9 @@ async fn test_provider_multifile_visibility_reopen_and_boosts() -> VortexResult<
         )
         .await?,
     );
-    let provider = TantivyProvider::try_new(session, root.path().to_owned())?;
+    let provider = TantivyProvider::try_new(session, root.clone())?;
     let store = Arc::new(LocalIndexStore::create(
-        root.path(),
+        &root,
         "generation-1",
         LocalStoreLimits {
             max_artifact_bytes: 64 * 1024 * 1024,
@@ -416,7 +418,7 @@ async fn test_provider_multifile_visibility_reopen_and_boosts() -> VortexResult<
     let generation = store.seal(&metadata)?;
     drop(store);
     let (store, metadata) = LocalIndexStore::open(
-        root.path(),
+        &root,
         &generation,
         &snapshot,
         LocalStoreLimits {
@@ -497,15 +499,14 @@ async fn test_provider_multifile_visibility_reopen_and_boosts() -> VortexResult<
         .find(|a| a.path.ends_with("meta.json"))
         .ok_or_else(|| vortex_err!("meta artifact"))?;
     fs::write(
-        root.path()
-            .join("generation-1")
+        root.join("generation-1")
             .join("artifacts")
             .join(&artifact.path),
         "corrupted",
     )?;
     assert!(
         LocalIndexStore::open(
-            root.path(),
+            &root,
             &generation,
             &metadata.snapshot,
             LocalStoreLimits {

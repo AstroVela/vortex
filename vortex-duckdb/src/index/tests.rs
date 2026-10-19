@@ -1068,10 +1068,11 @@ fn test_tantivy_sql_multifile_ranked_rows_and_validation() -> VortexResult<()> {
         )?))
     })?;
     let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
     let conn = connection()?;
-    let a = dir.path().join("a.vortex");
-    let b = dir.path().join("b.vortex");
-    let reference = dir.path().join("fts.json");
+    let a = root.join("a.vortex");
+    let b = root.join("b.vortex");
+    let reference = root.join("fts.json");
     for (path, id) in [(&a, 10), (&b, 20)] {
         conn.query(&format!("COPY (SELECT {id}::UBIGINT AS id, 'rust search' AS title, 'full text engine' AS body UNION ALL SELECT ({id}+1)::UBIGINT, NULL, 'other') TO {} (FORMAT vortex)", literal(path)))?;
     }
