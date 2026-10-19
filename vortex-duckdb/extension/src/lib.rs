@@ -9,8 +9,16 @@ use std::sync::Arc;
 
 use vortex_error::VortexExpect;
 
-unsafe extern "C" {
-    fn vortex_fts_loader_database(loader: *mut c_void) -> *mut c_void;
+unsafe extern "C-unwind" {
+    fn vortex_fts_initialize(
+        loader: *mut c_void,
+        initialize: unsafe extern "C-unwind" fn(*mut c_void),
+    );
+}
+
+unsafe extern "C-unwind" fn initialize_database(database: *mut c_void) {
+    // The C++ bridge supplies a live C API DatabaseWrapper for this callback.
+    unsafe { vortex_duckdb::initialize_extension_from_raw(database) };
 }
 
 /// Register Vortex IO and Tantivy full-text SQL through DuckDB's C++ loader ABI.
@@ -31,10 +39,8 @@ pub unsafe extern "C-unwind" fn vortex_duckdb_cpp_init(loader: *mut c_void) {
         },
     )
     .vortex_expect("Failed to register Tantivy provider");
-    // The loader is supplied by DuckDB's matching C++ ABI. The helper only
-    // borrows it to obtain the database that owns the registered functions.
-    let database = unsafe { vortex_fts_loader_database(loader) };
-    unsafe { vortex_duckdb::initialize_extension_from_raw(database) };
+    // The bridge keeps the C API wrapper alive until all registration completes.
+    unsafe { vortex_fts_initialize(loader, initialize_database) };
 }
 
 /// Return the linked DuckDB library version for extension tooling.
