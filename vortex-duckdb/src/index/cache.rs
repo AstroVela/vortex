@@ -12,7 +12,6 @@ use parking_lot::Mutex;
 use tempfile::TempDir;
 use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
-use vortex_index::DistanceMetric;
 use vortex_index::Index;
 use vortex_index::IndexRegistry;
 use vortex_index::IndexStore;
@@ -124,12 +123,6 @@ impl OpenedIndex {
         };
         registry.register(provider)?;
         let index = registry.open(&metadata, &metadata.snapshot, store).await?;
-        if index
-            .as_vector()
-            .is_none_or(|vector| vector.spec().metric != DistanceMetric::SquaredL2)
-        {
-            vortex_bail!("SQL static search requires a squared L2 vector index");
-        }
         Ok(Arc::new(Self {
             index,
             source,

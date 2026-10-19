@@ -412,12 +412,22 @@ fn test_fifo_read_is_nonblocking() -> VortexResult<()> {
 }
 
 fn assert_rejects_fifo<T>(path: &Path, read: impl FnOnce() -> VortexResult<T>) -> VortexResult<()> {
+    #[cfg(not(target_os = "macos"))]
     unix_fs::mkfifoat(
         unix_fs::CWD,
         path,
         unix_fs::Mode::RUSR | unix_fs::Mode::WUSR,
     )
     .map_err(|err| vortex_err!("{}", err))?;
+    #[cfg(target_os = "macos")]
+    if !std::process::Command::new("mkfifo")
+        .arg(path)
+        .status()?
+        .success()
+    {
+        return Err(vortex_err!("mkfifo failed"));
+    }
+
     let path = path.to_owned();
     let (done, wait) = mpsc::channel();
     let watchdog = thread::spawn(move || -> VortexResult<bool> {

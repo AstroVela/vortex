@@ -95,7 +95,7 @@ template <class CALLBACK>
 void VisitIndexRequests(const PhysicalOperator &op, CALLBACK &&callback) {
     if (op.type == PhysicalOperatorType::TABLE_SCAN) {
         auto &scan = op.Cast<PhysicalTableScan>();
-        if (scan.function.name == "vortex_index_search") {
+        if ((scan.function.name == "vortex_index_search" || scan.function.name == "vortex_fts_search")) {
             callback(scan.bind_data->Cast<IndexBind>().request);
         }
     }
@@ -350,10 +350,17 @@ unique_ptr<FunctionData> BindIndex(ClientContext &context,
                                    vector<LogicalType> &types,
                                    vector<string> &names) {
     CheckAccess(context);
-    const bool build = input.table_function.name == "vortex_index_build";
+    const bool full_text =
+        input.table_function.name == "vortex_fts_build" || input.table_function.name == "vortex_fts_search";
+    const bool build =
+        input.table_function.name == "vortex_index_build" || input.table_function.name == "vortex_fts_build";
     auto values = input.inputs;
+    if (build && full_text) {
+        values.push_back(Value("tantivy.static"));
+        values.push_back(Value(""));
+    }
     if (!build) {
-        auto options = input.named_parameters.find("backend_options");
+        auto options = input.named_parameters.find(full_text ? "query_options" : "backend_options");
         values.push_back(options == input.named_parameters.end() ? Value("") : options->second);
         auto mode = input.named_parameters.find("validation_mode");
         values.push_back(mode == input.named_parameters.end() ? Value("strict") : mode->second);
@@ -366,7 +373,8 @@ unique_ptr<FunctionData> BindIndex(ClientContext &context,
     duckdb_logical_type result_type = nullptr;
     duckdb_vx_error error = nullptr;
     auto prepared = context.registered_state->Get<IndexPreparedState>(PIN_DEPENDENCY);
-    auto request = vortex_index_bind(build, pointers.data(), pointers.size(), &result_type, &error);
+    auto request =
+        vortex_index_bind(build, full_text, pointers.data(), pointers.size(), &result_type, &error);
     CheckError(error);
     auto bind = make_uniq<IndexBind>(request);
     unique_ptr<LogicalType> result(reinterpret_cast<LogicalType *>(result_type));
@@ -414,7 +422,21 @@ vector<TableFunction> Functions() {
                          InitIndex);
     search.named_parameters["backend_options"] = LogicalType::VARCHAR;
     search.named_parameters["validation_mode"] = LogicalType::VARCHAR;
-    return {build, search};
+    TableFunction fts_build("vortex_fts_build",
+                            {LogicalType::LIST(LogicalType::VARCHAR),
+                             LogicalType::VARCHAR,
+                             LogicalType::LIST(LogicalType::VARCHAR)},
+                            ScanIndex,
+                            BindIndex,
+                            InitIndex);
+    TableFunction fts_search("vortex_fts_search",
+                             {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT},
+                             ScanIndex,
+                             BindIndex,
+                             InitIndex);
+    fts_search.named_parameters["query_options"] = LogicalType::VARCHAR;
+    fts_search.named_parameters["validation_mode"] = LogicalType::VARCHAR;
+    return {build, search, fts_build, fts_search};
 }
 
 } // namespace

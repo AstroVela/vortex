@@ -246,12 +246,21 @@ fn test_fifo_open_rejects_without_waiting_for_writer() -> VortexResult<()> {
         fixture.snapshot.files.truncate(1);
         let path = fixture.snapshot.files[0].uri.clone();
         fs::remove_file(&path)?;
+        #[cfg(not(target_os = "macos"))]
         unix_fs::mkfifoat(
             unix_fs::CWD,
             path.as_str(),
             unix_fs::Mode::RUSR | unix_fs::Mode::WUSR,
         )
         .map_err(std::io::Error::from)?;
+        #[cfg(target_os = "macos")]
+        if !std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()?
+            .success()
+        {
+            return Err(vortex_err!("mkfifo failed"));
+        }
 
         let (finished, receiver) = mpsc::channel();
         // Release a blocking opener on regression, keeping the test suite live.

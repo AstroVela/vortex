@@ -229,6 +229,7 @@ bool vortex_index_pins_inherit(const void *source,
 #if (defined(VORTEX_INDEX) && defined(VORTEX_INDEX_UNIX))
 extern
 void *vortex_index_bind(bool build,
+                        bool full_text,
                         const duckdb_value *inputs,
                         size_t count,
                         duckdb_logical_type *result_type,

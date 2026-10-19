@@ -1030,14 +1030,25 @@ fn test_sql_preserves_build_identity_and_rejects_manifest_artifact_changes() -> 
 #[test]
 fn test_index_inputs_reject_non_regular_files_and_symlinks() -> VortexResult<()> {
     let root = tempfile::tempdir()?;
-    let fifo = root.path().join("fifo");
-    rustix::fs::mkfifoat(
-        rustix::fs::CWD,
-        &fifo,
-        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-    )
-    .map_err(|error| vortex_err!("{error}"))?;
-    assert!(super::read_regular(&fifo, 1024).is_err());
+    #[cfg(not(target_os = "macos"))]
+    {
+        let fifo = root.path().join("fifo");
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .map_err(|error| vortex_err!("{error}"))?;
+        assert!(super::read_regular(&fifo, 1024).is_err());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let fifo = root.path().join("fifo");
+        if !Command::new("mkfifo").arg(&fifo).status()?.success() {
+            vortex_bail!("mkfifo failed");
+        }
+        assert!(super::read_regular(&fifo, 1024).is_err());
+    }
     let file = root.path().join("file");
     std::fs::write(&file, b"regular")?;
     let link = root.path().join("link");
@@ -1045,5 +1056,66 @@ fn test_index_inputs_reject_non_regular_files_and_symlinks() -> VortexResult<()>
     assert!(super::read_regular(&link, 1024).is_err());
     assert!(super::read_regular(root.path(), 1024).is_err());
     assert!(super::read_regular(&file, 2).is_err());
+    Ok(())
+}
+
+#[test]
+fn test_tantivy_sql_multifile_ranked_rows_and_validation() -> VortexResult<()> {
+    register_index_provider_factory(vortex_fts::TANTIVY_ID, |session, scratch| {
+        Ok(Arc::new(vortex_fts::TantivyProvider::try_new(
+            session,
+            scratch.to_path_buf(),
+        )?))
+    })?;
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    let conn = connection()?;
+    let a = root.join("a.vortex");
+    let b = root.join("b.vortex");
+    let reference = root.join("fts.json");
+    for (path, id) in [(&a, 10), (&b, 20)] {
+        conn.query(&format!("COPY (SELECT {id}::UBIGINT AS id, 'rust search' AS title, 'full text engine' AS body UNION ALL SELECT ({id}+1)::UBIGINT, NULL, 'other') TO {} (FORMAT vortex)", literal(path)))?;
+    }
+    let build = format!(
+        "SELECT * FROM vortex_fts_build([{}, {}], {}, ['title','body'])",
+        literal(&a),
+        literal(&b),
+        literal(&reference)
+    );
+    conn.query(&format!("EXPLAIN {build}"))?;
+    assert!(!reference.exists());
+    conn.query(&build)?;
+    assert!(conn.query(&build).is_err());
+    let query = format!(
+        "SELECT count(*)::UBIGINT AS id FROM vortex_fts_search({}, 'rust', 10)",
+        literal(&reference)
+    );
+    assert_eq!(nearest_id(conn.query(&query)?)?, 2);
+    let query = format!(
+        "SELECT \"row\".id FROM vortex_fts_search({}, 'rust', 1)",
+        literal(&reference)
+    );
+    assert_eq!(nearest_id(conn.query(&query)?)?, 10);
+    conn.query(&format!("PREPARE fts AS {query}"))?;
+    assert_eq!(nearest_id(conn.query("EXECUTE fts")?)?, 10);
+    for query in ["unknown:rust", "\"unfinished"] {
+        assert!(
+            conn.query(&format!(
+                "SELECT * FROM vortex_fts_search({}, '{}', 1)",
+                literal(&reference),
+                query
+            ))
+            .is_err()
+        );
+    }
+    assert!(
+        conn.query(&format!(
+            "SELECT * FROM vortex_fts_search({}, 'rust', 0)",
+            literal(&reference)
+        ))
+        .is_err()
+    );
+    std::fs::write(&a, b"changed")?;
+    assert!(conn.query("EXECUTE fts").is_err());
     Ok(())
 }

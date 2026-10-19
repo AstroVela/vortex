@@ -77,7 +77,7 @@ fn init_tracing() {
     ONCE.get_or_init(|| {
         drop(
             tracing_subscriber::fmt()
-                .with_writer(std::io::stdout)
+                .with_writer(std::io::stderr)
                 .try_init(),
         );
     });

@@ -27,11 +27,13 @@ members = [
     "vortex-index",
     "vortex-index-spfresh",
     "vortex-index-hnswlib",
+    "vortex-fts",
     "vortex-ipc",
     "vortex",
     "vortex-bench",
     "vortex-datafusion",
     "vortex-duckdb",
+    "vortex-duckdb/extension",
     "vortex-cuda",
     "vortex-cuda/cub",
     "vortex-cuda/ffi",
@@ -269,6 +271,7 @@ take_mut = "0.2.2"
 tar = "0.4"
 target-lexicon = "0.13"
 temp-env = "0.3"
+tantivy = "=0.25.0"
 tempfile = "3"
 termtree = { version = "1.0" }
 test-with = "=0.16.3"
@@ -338,6 +341,7 @@ vortex-zstd = { version = "0.1.0", path = "./encodings/zstd", default-features =
 # END crates published by this project
 
 # No version constraints for unpublished crates.
+vortex-fts = { path = "vortex-fts" }
 vortex-index = { path = "./vortex-index", default-features = false }
 vortex-index-hnswlib = { path = "./vortex-index-hnswlib", default-features = false }
 vortex-bench = { path = "./vortex-bench", default-features = false }
