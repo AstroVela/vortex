@@ -23,5 +23,5 @@ local REST fixture and bundled equality-delete data, so no other repository
 checkout is needed. `ICEBERG_VORTEX_FORMAT=1` enables an additional test only for
 Iceberg readers that support Vortex data files. Skipped tests are not passes.
 
-See the [user guide](../../docs/iceberg-user-guide.md) and
-[design](../../docs/iceberg-design.md).
+See the [user guide](https://github.com/AstroVela/vortex/pull/20#iceberg-fts-user-guide) and
+[design](https://github.com/AstroVela/vortex/pull/20#iceberg-fts-design).

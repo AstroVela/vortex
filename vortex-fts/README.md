@@ -17,8 +17,8 @@ remain immutable during use. Every search validates a full source SHA-256 digest
 this intentionally adds a sequential source-file read and is not a low-latency
 large-file search API. The implementation does not modify the Vortex file format.
 
-- [用户文档 / User guide](docs/user-guide.md)
-- [设计文档 / Design](docs/design.md)
+- [用户文档 / User guide](https://github.com/AstroVela/vortex/pull/20#fts-user-guide)
+- [设计文档 / Design](https://github.com/AstroVela/vortex/pull/20#fts-design)
 - [Executable Rust example](examples/quickstart.rs)
 
 ## Development
@@ -30,13 +30,13 @@ cargo clippy -p vortex-fts --all-targets --all-features
 cargo +nightly fmt --all -- --check
 ```
 
-DuckDB SQL、多文件 provider 和 Iceberg 快照适配请参阅 [用户文档](docs/user-guide.md#duckdb多文件-sql-检索) 与 [设计文档](docs/design.md#通用索引能力与多文件后端)。
+DuckDB SQL、多文件 provider 和 Iceberg 快照适配请参阅 [用户文档](https://github.com/AstroVela/vortex/pull/20#fts-user-guide) 与 [设计文档](https://github.com/AstroVela/vortex/pull/20#fts-design)。
 
 
 ## Single-repository integrations
 
 - [Loadable DuckDB extension](../vortex-duckdb/extension/README.md)
 - [Iceberg snapshot adapter](integrations/iceberg/README.md)
-- [Iceberg user guide](docs/iceberg-user-guide.md) and [design](docs/iceberg-design.md)
+- [Iceberg user guide](https://github.com/AstroVela/vortex/pull/20#iceberg-fts-user-guide) and [design](https://github.com/AstroVela/vortex/pull/20#iceberg-fts-design)
 
 All integration changes are delivered in this repository; no companion PR is required.

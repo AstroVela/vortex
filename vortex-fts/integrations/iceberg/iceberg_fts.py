@@ -6,7 +6,8 @@
 The connection must have iceberg and a Tantivy-enabled vortex extension loaded.
 Only immutable, explicit metadata JSON files and snapshot IDs are accepted. The
 index stores the snapshot's visible rows; row addresses refer to this materialized
-Vortex file, not to Iceberg data files. See vortex-fts/docs/iceberg-user-guide.md.
+Vortex file, not to Iceberg data files.
+See https://github.com/AstroVela/vortex/pull/20#iceberg-fts-user-guide.
 """
 from __future__ import annotations
 

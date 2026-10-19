@@ -29,5 +29,5 @@ Custom native builds must provide matching source/library/linker configuration;
 this wrapper does not qualify arbitrary DuckDB/Vane ABIs. Do not load another
 Vortex extension into the same database.
 
-See the [user guide](../../vortex-fts/docs/user-guide.md) and
-[design](../../vortex-fts/docs/design.md).
+See the [user guide](https://github.com/AstroVela/vortex/pull/20#fts-user-guide) and
+[design](https://github.com/AstroVela/vortex/pull/20#fts-design).
