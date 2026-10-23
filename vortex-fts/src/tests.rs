@@ -431,6 +431,20 @@ async fn test_provider_multifile_visibility_reopen_and_boosts() -> VortexResult<
         .as_full_text()
         .ok_or_else(|| vortex_err!("missing full text"))?;
     let all = RowFilter::try_new(snapshot.clone(), None, BTreeSet::new())?;
+    assert!(index.as_attributes().is_none());
+    let text_rows = text.filter_text("search", &all).await?;
+    assert!(text_rows.includes(RowAddress {
+        file_id: 3,
+        row_offset: 0
+    }));
+    assert!(text_rows.includes(RowAddress {
+        file_id: 7,
+        row_offset: 0
+    }));
+    assert!(!text_rows.includes(RowAddress {
+        file_id: 3,
+        row_offset: 1
+    }));
     let k = NonZeroUsize::new(10).unwrap();
     let hits = text.search_text("search", k, &Bytes::new(), &all).await?;
     assert_eq!(hits.len(), 2);
@@ -518,3 +532,5 @@ async fn test_provider_multifile_visibility_reopen_and_boosts() -> VortexResult<
     );
     Ok(())
 }
+
+mod attributes;

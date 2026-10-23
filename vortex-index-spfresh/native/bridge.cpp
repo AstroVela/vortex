@@ -279,12 +279,47 @@ extern "C" int vortex_spfresh_search(void *opaque,
                                      int32_t *ids,
                                      float *distances,
                                      char *error) {
+    return vortex_spfresh_search_filtered(opaque,
+                                          queries,
+                                          dimension,
+                                          count,
+                                          k,
+                                          max_check,
+                                          internal_results,
+                                          search_pages,
+                                          nullptr,
+                                          0,
+                                          ids,
+                                          distances,
+                                          error);
+}
+
+extern "C" int vortex_spfresh_search_filtered(void *opaque,
+                                              const float *queries,
+                                              uint32_t dimension,
+                                              uint32_t count,
+                                              uint32_t k,
+                                              uint32_t max_check,
+                                              uint32_t internal_results,
+                                              uint32_t search_pages,
+                                              const uint8_t *allowed,
+                                              uint32_t allowed_bytes,
+                                              int32_t *ids,
+                                              float *distances,
+                                              char *error) {
     return boundary(error, [&] {
         auto &handle = *static_cast<Handle *>(opaque);
         if (dimension != handle.dimension || count == 0 || k == 0 || k > handle.rows ||
             internal_results < k || internal_results > 4096 || max_check < internal_results ||
             max_check > 1048576 || search_pages != handle.posting_pages) {
             throw std::runtime_error("Invalid SPFresh query options");
+        }
+        const uint32_t mask_bytes = (handle.rows + 7) / 8;
+        if ((allowed == nullptr && allowed_bytes != 0) ||
+            (allowed != nullptr &&
+             (allowed_bytes != mask_bytes ||
+              (handle.rows % 8 != 0 && (allowed[mask_bytes - 1] >> (handle.rows % 8)) != 0)))) {
+            throw std::runtime_error("Invalid SPFresh allowed-ID bitmap");
         }
         SearchWorkspaces workspaces(handle, max_check, internal_results);
         const auto set = [&](const char *name, uint32_t value, const char *section) {
@@ -302,11 +337,13 @@ extern "C" int vortex_spfresh_search(void *opaque,
                 }
             }
             SPTAG::QueryResult result(vector, static_cast<int>(k), false);
-            check(handle.index.SearchIndex(result), "SearchIndex");
+            check(handle.index.SearchIndexFiltered(result, allowed, handle.rows), "SearchIndexFiltered");
             for (uint32_t rank = 0; rank < k; ++rank) {
                 const auto &hit = *result.GetResult(static_cast<int>(rank));
                 if (hit.VID < -1 || hit.VID >= static_cast<int>(handle.rows) ||
-                    (hit.VID >= 0 && (!std::isfinite(hit.Dist) || hit.Dist < 0))) {
+                    (hit.VID >= 0 &&
+                     (!std::isfinite(hit.Dist) || hit.Dist < 0 ||
+                      (allowed != nullptr && (allowed[hit.VID / 8] & (uint8_t(1) << (hit.VID % 8))) == 0)))) {
                     throw std::runtime_error("Invalid native search result");
                 }
                 const auto offset = static_cast<size_t>(query) * k + rank;

@@ -10622,6 +10622,7 @@ dependencies = [
  "vortex-edition",
  "vortex-error",
  "vortex-file",
+ "vortex-fts",
  "vortex-index",
  "vortex-io",
  "vortex-layout",

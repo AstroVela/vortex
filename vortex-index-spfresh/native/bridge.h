@@ -37,6 +37,21 @@ int vortex_spfresh_search(void *handle,
                           int32_t *ids,
                           float *distances,
                           char *error);
+// Optional dense native-ID bitmask: null/zero permits all; otherwise exactly ceil(rows/8)
+// bytes. Bits outside the row domain must be zero. Borrowed only until return.
+int vortex_spfresh_search_filtered(void *handle,
+                                   const float *queries,
+                                   uint32_t dimension,
+                                   uint32_t count,
+                                   uint32_t k,
+                                   uint32_t max_check,
+                                   uint32_t internal_results,
+                                   uint32_t search_pages,
+                                   const uint8_t *allowed,
+                                   uint32_t allowed_bytes,
+                                   int32_t *ids,
+                                   float *distances,
+                                   char *error);
 void vortex_spfresh_close(void *handle);
 #ifdef __cplusplus
 }

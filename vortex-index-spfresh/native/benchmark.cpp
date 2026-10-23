@@ -56,10 +56,10 @@ struct Close {
 
 int main(int argc, char **argv) {
     try {
-        if (argc != 12) {
+        if (argc != 12 && argc != 13) {
             throw std::runtime_error(
                 "Usage: spfresh_benchmark MODE NATIVE_ROOT QUERIES.f32bin ROWS K MAX_CHECK "
-                "INTERNAL_RESULTS POSTING_PAGES WARMUP_ROUNDS ROUNDS OUTPUT.csv");
+                "INTERNAL_RESULTS POSTING_PAGES WARMUP_ROUNDS ROUNDS OUTPUT.csv [FILTER_STRIDE]");
         }
         const std::string mode(argv[1]);
         const auto rows = number(argv[4]);
@@ -69,11 +69,23 @@ int main(int argc, char **argv) {
         const auto pages = number(argv[8]);
         const auto warmup = number(argv[9]);
         const auto rounds = number(argv[10]);
-        if ((mode != "cpp-reset" && mode != "cpp-reuse" && mode != "bridge") || k == 0 || k > rows ||
-            k > 4096 || internal_results < k || internal_results > 4096 || max_check < internal_results ||
+        const bool bridge = mode == "bridge" || mode == "bridge-filter";
+        const uint32_t stride = argc == 13 ? number(argv[12]) : 0;
+        if ((mode == "bridge-filter" && stride == 0) || (mode != "bridge-filter" && argc != 12)) {
+            throw std::runtime_error("Only bridge-filter requires FILTER_STRIDE > 0");
+        }
+        if ((mode != "cpp-reset" && mode != "cpp-reuse" && !bridge) || k == 0 || k > rows || k > 4096 ||
+            internal_results < k || internal_results > 4096 || max_check < internal_results ||
             max_check > 1048576 || pages == 0 || pages > 4096 || rounds == 0 || rounds > 100 ||
             warmup > 100 || uint64_t(pages) * internal_results * 4096 > 256 * 1024 * 1024) {
             throw std::runtime_error("Invalid benchmark options");
+        }
+        std::vector<uint8_t> allowed;
+        if (mode == "bridge-filter") {
+            allowed.resize((uint64_t(rows) + 7) / 8);
+            for (uint64_t id = 0; id < rows; id += stride) {
+                allowed[id / 8] |= uint8_t(1) << (id % 8);
+            }
         }
         std::ifstream input(argv[3], std::ios::binary);
         uint32_t count = 0;
@@ -110,7 +122,7 @@ int main(int argc, char **argv) {
         std::unique_ptr<void, Close> handle(opaque);
         output << "open,,,,,," << elapsed(start) << '\n';
         auto &index = vortex_spfresh_benchmark_index(handle.get());
-        if (mode != "bridge") {
+        if (!bridge) {
             for (const char *section : {"BuildHead", "BuildSSDIndex"}) {
                 check(index.SetParameter("MaxCheck", std::to_string(max_check).c_str(), section));
             }
@@ -126,18 +138,20 @@ int main(int argc, char **argv) {
             for (uint32_t query = 0; query < count; ++query) {
                 const float *vector = queries.data() + size_t(query) * dimension;
                 start = Clock::now();
-                if (mode == "bridge") {
-                    if (vortex_spfresh_search(handle.get(),
-                                              vector,
-                                              dimension,
-                                              1,
-                                              k,
-                                              max_check,
-                                              internal_results,
-                                              pages,
-                                              ids.data(),
-                                              distances.data(),
-                                              error) != 0) {
+                if (bridge) {
+                    if (vortex_spfresh_search_filtered(handle.get(),
+                                                       vector,
+                                                       dimension,
+                                                       1,
+                                                       k,
+                                                       max_check,
+                                                       internal_results,
+                                                       pages,
+                                                       allowed.empty() ? nullptr : allowed.data(),
+                                                       static_cast<uint32_t>(allowed.size()),
+                                                       ids.data(),
+                                                       distances.data(),
+                                                       error) != 0) {
                         throw std::runtime_error(error);
                     }
                 } else {
