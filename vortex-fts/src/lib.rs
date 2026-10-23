@@ -11,7 +11,9 @@
 
 mod manifest;
 mod provider;
+pub use provider::AttributeType;
 pub use provider::TANTIVY_ID;
+pub use provider::TantivyBuildOptions;
 pub use provider::TantivyProvider;
 mod schema;
 #[cfg(test)]

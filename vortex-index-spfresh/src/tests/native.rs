@@ -35,8 +35,14 @@ use vortex_edition::EditionSessionExt;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 use vortex_file::WriteOptionsSessionExt;
+use vortex_fts::AttributeType;
+use vortex_fts::TANTIVY_ID;
+use vortex_fts::TantivyBuildOptions;
+use vortex_fts::TantivyProvider;
 use vortex_index::FlatIndex;
 use vortex_index::IndexArtifact;
+use vortex_index::IndexBuildRequest;
+use vortex_index::IndexBuilder;
 use vortex_index::IndexMetadata;
 use vortex_index::IndexProvider;
 use vortex_index::IndexRegistry;
@@ -52,6 +58,8 @@ use vortex_index::Snapshot;
 use vortex_index::SourceFile;
 use vortex_index::VectorIndex;
 use vortex_index::VectorSearchOptions;
+use vortex_index::attributes::AttributePredicate;
+use vortex_index::attributes::AttributeValue;
 use vortex_index::file::LocalFileSource;
 use vortex_index::file::file_version;
 use vortex_index::file::schema_fingerprint;
@@ -174,7 +182,7 @@ fn data(ids: &[u16]) -> VortexResult<StructArray> {
     StructArray::try_new(
         ["id", "embedding"].into(),
         vec![
-            Buffer::from_iter(ids.iter().map(|id| i32::from(*id))).into_array(),
+            Buffer::from_iter(ids.iter().map(|id| i64::from(*id))).into_array(),
             FixedSizeListArray::try_new(
                 Buffer::from_iter(ids.iter().flat_map(|id| vector(*id))).into_array(),
                 8,
@@ -374,7 +382,7 @@ fn native_parity_batch_flat_recall_and_multifile_take(materialized: bool) -> Vor
             .as_vector()
             .ok_or_else(|| vortex_err!("Missing vector capability"))?;
         assert!(!vector_index.supports_exact());
-        assert!(!vector_index.supports_filter());
+        assert!(vector_index.supports_filter());
         let filter = filter(&metadata.snapshot)?;
         let results = vector_index
             .search_batch(&queries, &options(10)?, &filter)
@@ -493,8 +501,9 @@ fn test_query_rejections_and_empty_batch() -> VortexResult<()> {
         assert!(
             index
                 .search(&vector(7), &options(5)?, &restricted)
-                .await
-                .is_err()
+                .await?
+                .iter()
+                .all(|hit| hit.row != rows()[0])
         );
         let allow_none = RowFilter::try_new(
             metadata.snapshot.clone(),
@@ -504,8 +513,8 @@ fn test_query_rejections_and_empty_batch() -> VortexResult<()> {
         assert!(
             index
                 .search(&vector(7), &options(5)?, &allow_none)
-                .await
-                .is_err()
+                .await?
+                .is_empty()
         );
         let mut different = metadata.snapshot.clone();
         different.version = "new".into();
@@ -840,6 +849,124 @@ fn test_inventory_metadata_limits_and_corruption() -> VortexResult<()> {
             assert!(provider.open(&invalid, bad).await.is_err());
             assert_eq!(fs::read_dir(root.join("scratch"))?.count(), 0);
         }
+        Ok(())
+    })
+}
+
+#[test]
+fn test_tantivy_prefilter_before_top_k_and_workspace_reuse() -> VortexResult<()> {
+    block_on(|handle| async move {
+        let session = session(handle)?;
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let (store, metadata, _) = prepare(root, &session).await?;
+        let opened = provider(root)?.open(&metadata, store).await?;
+        let index = opened
+            .as_vector()
+            .ok_or_else(|| vortex_err!("Missing vectors"))?;
+        let visible = filter(&metadata.snapshot)?;
+        let mut wide = options(256)?;
+        wide.backend_options =
+            Bytes::from_static(br#"{"max_check":4096,"internal_results":256,"search_pages":12}"#);
+        let query = vector(7);
+        let all = index.search(&query, &wide, &visible).await?;
+        assert!(all.len() > 10);
+        let selected: BTreeSet<_> = all.iter().skip(5).map(|hit| hit.row).collect();
+        let source = Arc::new(
+            LocalFileSource::open(
+                metadata.snapshot.clone(),
+                data(&[0])?.dtype().clone(),
+                BUDGET,
+                session.clone(),
+            )
+            .await?,
+        );
+        let text_provider = TantivyProvider::try_new(session.clone(), root.to_owned())?;
+        let attr_store = Arc::new(LocalIndexStore::create(root, "attributes", LIMITS)?);
+        let config = TantivyBuildOptions {
+            text_fields: vec![],
+            attribute_fields: [("id".into(), AttributeType::Int)].into(),
+        };
+        let attr_metadata = text_provider
+            .build(
+                IndexBuildRequest {
+                    metadata: IndexMetadata {
+                        format_version: 1,
+                        name: "attributes".into(),
+                        generation: "attributes".into(),
+                        backend: TANTIVY_ID.into(),
+                        backend_version: 2,
+                        snapshot: metadata.snapshot.clone(),
+                        fields: vec!["id".into()],
+                        covered_files: metadata.covered_files.clone(),
+                        artifacts: vec![],
+                    },
+                    backend_options: Bytes::from(
+                        serde_json::to_vec(&config).map_err(|err| vortex_err!("{err}"))?,
+                    ),
+                },
+                source,
+                Arc::clone(&attr_store) as Arc<dyn IndexStore>,
+            )
+            .await?;
+        let generation = attr_store.seal(&attr_metadata)?;
+        drop(attr_store);
+        let (store, attr_metadata) =
+            LocalIndexStore::open(root, &generation, &metadata.snapshot, LIMITS)?;
+        let attributes = text_provider.open(&attr_metadata, Arc::new(store)).await?;
+        let selected_ids = rows()
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| selected.contains(row))
+            .map(|(id, _)| Ok(AttributeValue::Int(i64::try_from(id)?)))
+            .collect::<VortexResult<Vec<_>>>()?;
+        let allowed = attributes
+            .as_attributes()
+            .ok_or_else(|| vortex_err!("Missing attributes"))?
+            .filter(&AttributePredicate::In("id".into(), selected_ids), &visible)
+            .await?;
+        let small = VectorSearchOptions {
+            k: NonZeroUsize::new(5).unwrap(),
+            ..wide.clone()
+        };
+        let expected = all.iter().skip(5).take(5).cloned().collect::<Vec<_>>();
+        assert_eq!(index.search(&query, &small, &allowed).await?, expected);
+        let batch = index
+            .search_batch(
+                &[Buffer::from(query.clone()), Buffer::from(query.clone())],
+                &small,
+                &allowed,
+            )
+            .await?;
+        assert_eq!(batch, vec![expected.clone(), expected]);
+        // Filter memory is gone before a retained workspace is reused.
+        drop(allowed);
+        assert_eq!(index.search(&query, &wide, &visible).await?, all);
+        let single = RowFilter::try_new(
+            metadata.snapshot.clone(),
+            Some([all[8].row].into()),
+            BTreeSet::new(),
+        )?;
+        assert_eq!(
+            index.search(&query, &small, &single).await?,
+            vec![all[8].clone()]
+        );
+        let empty = RowFilter::try_new(
+            metadata.snapshot.clone(),
+            Some(BTreeSet::new()),
+            BTreeSet::new(),
+        )?;
+        assert_eq!(
+            index
+                .search_batch(
+                    &[Buffer::from(query.clone()), Buffer::from(query)],
+                    &small,
+                    &empty
+                )
+                .await?,
+            vec![vec![], vec![]]
+        );
+        assert!(index.search(&[f32::NAN; 8], &small, &empty).await.is_err());
         Ok(())
     })
 }

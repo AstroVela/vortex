@@ -56,10 +56,18 @@ index 915205a..0f02ef0 100644
 \ No newline at end of file
 +#endif // _SPTAG_COMMON_DATASET_H_
 diff --git a/AnnService/inc/Core/SPANN/ExtraStaticSearcher.h b/AnnService/inc/Core/SPANN/ExtraStaticSearcher.h
-index 345107a..1e6283a 100644
+index 345107a..858f168 100644
 --- a/AnnService/inc/Core/SPANN/ExtraStaticSearcher.h
 +++ b/AnnService/inc/Core/SPANN/ExtraStaticSearcher.h
-@@ -260,6 +260,34 @@ namespace SPTAG
+@@ -106,6 +106,7 @@ namespace SPTAG
+             uint64_t offsetVectorID, offsetVector;\
+             (this->*m_parsePosting)(offsetVectorID, offsetVector, i, listInfo->listEleCount);\
+             int vectorID = *(reinterpret_cast<int*>(p_postingListFullData + offsetVectorID));\
++            if (!p_exWorkSpace->Allows(vectorID)) continue; \
+             if (p_exWorkSpace->m_deduper.CheckAndSet(vectorID)) continue; \
+             (this->*m_parseEncoding)(p_index, listInfo, (ValueType*)(p_postingListFullData + offsetVector));\
+             auto distance2leaf = p_index->ComputeDistance(queryResults.GetQuantizedTarget(), p_postingListFullData + offsetVector); \
+@@ -260,6 +261,35 @@ namespace SPTAG
                      }
  #endif
  #else // sync read
@@ -80,6 +88,7 @@ index 345107a..1e6283a 100644
 +                                (this->*m_parsePosting)(offsetVectorID, offsetVector, i, listInfo->listEleCount);
 +                                int vectorID;
 +                                memcpy(&vectorID, data + offsetVectorID, sizeof(vectorID));
++                                if (!p_exWorkSpace->Allows(vectorID)) continue;
 +                                if (p_exWorkSpace->m_deduper.CheckAndSet(vectorID)) continue;
 +                                auto distance = p_index->ComputeDistance(queryResults.GetQuantizedTarget(), data + offsetVector);
 +                                queryResults.AddPoint(vectorID, distance);
@@ -94,6 +103,44 @@ index 345107a..1e6283a 100644
                      auto numRead = indexFile->ReadBinary(totalBytes, buffer, listInfo->listOffset);
                      if (numRead != totalBytes) {
                          LOG(Helper::LogLevel::LL_Error, "File %s read bytes, expected: %zu, acutal: %llu.\n", m_extraFullGraphFile.c_str(), totalBytes, numRead);
+diff --git a/AnnService/inc/Core/SPANN/IExtraSearcher.h b/AnnService/inc/Core/SPANN/IExtraSearcher.h
+index 2f056ec..03f36db 100644
+--- a/AnnService/inc/Core/SPANN/IExtraSearcher.h
++++ b/AnnService/inc/Core/SPANN/IExtraSearcher.h
+@@ -231,6 +231,19 @@ namespace SPTAG {
+ 
+             std::vector<int> m_postingIDs;
+ 
++#ifdef SPTAG_STATIC_ONLY
++            const uint8_t* m_allowed = nullptr;
++            uint32_t m_allowedRows = 0;
++#endif
++            bool Allows(int id) const {
++#ifdef SPTAG_STATIC_ONLY
++                return m_allowed == nullptr || (id >= 0 && static_cast<uint32_t>(id) < m_allowedRows &&
++                    (m_allowed[id / 8] & (uint8_t(1) << (id % 8))) != 0);
++#else
++                return true;
++#endif
++            }
++
+             COMMON::OptHashPosVector m_deduper;
+ 
+             Helper::RequestQueue m_processIocp;
+diff --git a/AnnService/inc/Core/SPANN/Index.h b/AnnService/inc/Core/SPANN/Index.h
+index 2f0ca35..0ad3455 100644
+--- a/AnnService/inc/Core/SPANN/Index.h
++++ b/AnnService/inc/Core/SPANN/Index.h
+@@ -125,6 +125,9 @@ namespace SPTAG
+             ErrorCode BuildIndex(const void* p_data, SizeType p_vectorNum, DimensionType p_dimension, bool p_normalized = false, bool p_shareOwnership = false);
+             ErrorCode BuildIndex(bool p_normalized = false);
+             ErrorCode SearchIndex(QueryResult &p_query, bool p_searchDeleted = false) const;
++#ifdef SPTAG_STATIC_ONLY
++            ErrorCode SearchIndexFiltered(QueryResult &p_query, const uint8_t* allowed, uint32_t rows) const;
++#endif
+             ErrorCode SearchDiskIndex(QueryResult& p_query, SearchStats* p_stats = nullptr) const;
+             ErrorCode DebugSearchDiskIndex(QueryResult& p_query, int p_subInternalResultNum, int p_internalResultNum,
+                 SearchStats* p_stats = nullptr, std::set<int>* truth = nullptr, std::map<int, std::set<int>>* found = nullptr) const;
 diff --git a/AnnService/inc/Helper/AsyncFileReader.h b/AnnService/inc/Helper/AsyncFileReader.h
 index be9c5cd..399cb2b 100644
 --- a/AnnService/inc/Helper/AsyncFileReader.h
@@ -397,7 +444,7 @@ index e1ef2cf..ee338eb 100644
                  LOG(Helper::LogLevel::LL_Info, "Using AVX512 InstructionSet!\n");
              else if (HW_AVX2)
 diff --git a/AnnService/src/Core/SPANN/SPANNIndex.cpp b/AnnService/src/Core/SPANN/SPANNIndex.cpp
-index 76f835a..bb698f2 100644
+index 76f835a..c450402 100644
 --- a/AnnService/src/Core/SPANN/SPANNIndex.cpp
 +++ b/AnnService/src/Core/SPANN/SPANNIndex.cpp
 @@ -4,7 +4,9 @@
@@ -476,7 +523,19 @@ index 76f835a..bb698f2 100644
  
              return ErrorCode::Success;
          }
-@@ -318,10 +332,14 @@ namespace SPTAG
+@@ -314,14 +328,26 @@ namespace SPTAG
+ 
+         template<typename T>
+         ErrorCode Index<T>::SearchIndex(QueryResult &p_query, bool p_searchDeleted) const
++#ifdef SPTAG_STATIC_ONLY
++        {
++            return SearchIndexFiltered(p_query, nullptr, 0);
++        }
++
++        template<typename T>
++        ErrorCode Index<T>::SearchIndexFiltered(QueryResult &p_query, const uint8_t* allowed, uint32_t rows) const
++#endif
+         {
              if (!m_bReady) return ErrorCode::EmptyIndex;
  
              COMMON::QueryResultSet<T>* p_queryResults;
@@ -492,7 +551,41 @@ index 76f835a..bb698f2 100644
  
              m_index->SearchIndex(*p_queryResults);
  
-@@ -361,7 +379,6 @@ namespace SPTAG
+@@ -330,6 +356,15 @@ namespace SPTAG
+                     m_workspace.reset(new ExtraWorkSpace());
+                     m_workspace->Initialize(m_options.m_maxCheck, m_options.m_hashExp, m_options.m_searchInternalResultNum, min(m_options.m_postingPageLimit, m_options.m_searchPostingPageLimit + 1) << PageSizeEx, m_options.m_enableDataCompression);
+                 }
++#ifdef SPTAG_STATIC_ONLY
++                // Borrow only for this call, including exception paths and retained workspaces.
++                struct FilterScope {
++                    ExtraWorkSpace& workspace;
++                    ~FilterScope() { workspace.m_allowed = nullptr; workspace.m_allowedRows = 0; }
++                } filterScope{*m_workspace};
++                m_workspace->m_allowed = allowed;
++                m_workspace->m_allowedRows = rows;
++#endif
+                 m_workspace->m_deduper.clear();
+                 m_workspace->m_postingIDs.clear();
+ 
+@@ -354,6 +389,17 @@ namespace SPTAG
+                     m_workspace->m_postingIDs.emplace_back(postingID);
+                 }
+ 
++#ifdef SPTAG_STATIC_ONLY
++                if (allowed != nullptr) {
++                    // Centroids still route to postings even when the corresponding row is excluded.
++                    for (int i = 0; i < p_queryResults->GetResultNum(); ++i) {
++                        auto res = p_queryResults->GetResult(i);
++                        if (!m_workspace->Allows(res->VID)) { res->VID = -1; res->Dist = MaxDist; }
++                    }
++                    // SortResult assumes a max heap; invalidating sorted head hits destroys that invariant.
++                    std::sort(p_queryResults->GetResults(), p_queryResults->GetResults() + p_queryResults->GetResultNum(), COMMON::Compare);
++                }
++#endif
+                 if (m_vectorTranslateMap.get() != nullptr) p_queryResults->Reverse();
+                 m_extraSearcher->SearchIndex(m_workspace.get(), *p_queryResults, m_index, nullptr);
+                 p_queryResults->SortResult();
+@@ -361,7 +407,6 @@ namespace SPTAG
  
              if (p_query.GetResultNum() < m_options.m_searchInternalResultNum) {
                  std::copy(p_queryResults->GetResults(), p_queryResults->GetResults() + p_query.GetResultNum(), p_query.GetResults());
@@ -500,7 +593,7 @@ index 76f835a..bb698f2 100644
              }
  
              if (p_query.WithMeta() && nullptr != m_pMetadata)
-@@ -845,6 +862,7 @@ namespace SPTAG
+@@ -845,6 +890,7 @@ namespace SPTAG
                  m_index->SetParameter("HashTableExponent", std::to_string(m_options.m_hashExp));
                  m_index->UpdateIndex();
  
@@ -508,7 +601,7 @@ index 76f835a..bb698f2 100644
                  if (m_options.m_useKV)
                  {
                      if (m_options.m_inPlace) {
-@@ -863,7 +881,9 @@ namespace SPTAG
+@@ -863,7 +909,9 @@ namespace SPTAG
                          m_extraSearcher.reset(new ExtraDynamicSearcher<T>(m_options.m_spdkMappingPath.c_str(), m_options.m_dim, m_options.m_postingPageLimit, m_options.m_useDirectIO, m_options.m_latencyLimit, m_options.m_mergeThreshold, true, m_options.m_spdkBatchSize));
                      }  
                  }
@@ -519,7 +612,7 @@ index 76f835a..bb698f2 100644
                      if (m_pQuantizer) {
                          m_extraSearcher.reset(new ExtraStaticSearcher<std::uint8_t>());
                      }
-@@ -1134,5 +1154,3 @@ template class SPTAG::SPANN::Index<Type>; \
+@@ -1134,5 +1182,3 @@ template class SPTAG::SPANN::Index<Type>; \
  
  #include "inc/Core/DefinitionList.h"
  #undef DefineVectorValueType

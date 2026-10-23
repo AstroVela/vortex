@@ -185,9 +185,8 @@ variables or dynamically named posting shards. Only fixed files exist in the
 lease. The opened native handle is destroyed before its lease. Deleting the
 source or canonical generation cannot change an already-open reader.
 
-Search supports Approximate only, with unrestricted filters bound to exactly the
-indexed snapshot. Exact, allow/exclude masks and unknown backend options fail
-explicitly. k is 1..=4096 and is capped to the covered row count. Results are
+Search supports Approximate with allow/exclude filters bound to exactly the
+indexed snapshot. Exact search and unknown backend options fail explicitly. k is 1..=4096 and is capped to the covered row count. Results are
 deduplicated and sorted by squared distance then physical row address.
 Batch search preserves query order; empty batches still validate options/filter.
 
@@ -350,3 +349,60 @@ SDK and native cache across layers. The Vortex workspace release profile and
 frame-pointer flags can differ from the outer extension's profile; default builds
 are not automatically comparable. OS page caches are not evicted. These targets
 do not qualify dynamic SPFresh updates, concurrent throughput or NVMe/SPDK.
+
+
+## External attribute filtering
+
+Use the existing `vortex-fts::TantivyProvider` for both text and attribute
+inverted indexes. [Tantivy prefilters](../vortex-fts/README.md#tantivy-prefilters-for-vector-search)
+produce complete `RowFilter` allow-lists from typed attribute predicates or
+full-text queries. Pass the filter to `VectorIndex::search` or `search_batch`;
+`supports_filter()` is true. Text and attributes share a Tantivy generation;
+SPFresh retains a separate vector generation on the identical source snapshot.
+
+The provider converts allowed physical addresses to a dense native-ID bitmap
+once per batch, using this generation's validated `rows.bin` mapping. This takes
+O(index rows × row-filter lookup) time and ceil(rows / 8) temporary bytes.
+An empty intersection returns no hits after validating the request. The C ABI
+borrows the bitmap only for the synchronous call. Unrestricted calls use no mask.
+
+Centroid navigation remains unfiltered. Translated head hits are filtered before
+the result heap is used for posting refinement. Both mapped and copying posting
+paths check the bitmap before deduplication, vector decoding and distance
+calculation. Excluded rows never consume result slots. A scope guard clears
+borrowed mask pointers on success and failure, including retained workspaces.
+The existing unfiltered C ABI remains available; the additive
+`vortex_spfresh_search_filtered` accepts a bitmap of exactly ceil(rows / 8) bytes,
+with unused high bits zero, or null/zero for no restriction.
+
+Filtering restricts candidates in the postings reached by ANN. Selective filters
+can still return fewer than k hits or miss nearer matching rows in unvisited
+postings; qualify recall and increase `internal_results`/`max_check` as needed.
+There is no exhaustive fallback or automatic probe expansion. Search remains
+approximate, with the existing 4096-result/probe bound. Snapshot changes still
+require new static generations; no LIRE update path is added.
+
+The native patch changed, so build in a **new** native directory before enabling
+`native`. Tests in `workspace_tests.cpp` cover mapped/copying paths, rejected
+nearest neighbors, empty/singleton masks, malformed bitmap lengths and workspace
+reuse. The Rust native tests build and reopen a real Tantivy attribute generation,
+then exercise Tantivy -> row filter -> native search across multiple files whose
+Tantivy document order differs from SPFresh's native ID order.
+
+```sh
+bash vortex-index-spfresh/native/build.sh /absolute/new/spfresh-filter-native
+export VORTEX_SPFRESH_NATIVE=/absolute/new/spfresh-filter-native/build
+cargo test -p vortex-index-spfresh --features native
+cargo clippy -p vortex-index-spfresh --all-targets --all-features
+```
+
+The existing native benchmark also accepts `bridge-filter` with a final
+`FILTER_STRIDE` argument: 1 allows all IDs, 10 allows every tenth ID, and 100
+allows every hundredth ID. The bitmap is prepared outside the timed section.
+Compare `bridge` against `bridge-filter ... 1` for all-allowed overhead, then
+measure selective filters separately and evaluate filtered recall independently.
+These synthetic native-ID masks are benchmark inputs, not attribute predicates.
+
+```text
+spfresh_benchmark bridge-filter NATIVE_ROOT QUERIES.f32bin ROWS K MAX_CHECK INTERNAL_RESULTS POSTING_PAGES WARMUP_ROUNDS ROUNDS OUTPUT.csv FILTER_STRIDE
+```
