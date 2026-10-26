@@ -10560,6 +10560,7 @@ dependencies = [
  "bytes",
  "codspeed-divan-compat",
  "futures",
+ "object_store",
  "parking_lot",
  "ring",
  "rstest",
