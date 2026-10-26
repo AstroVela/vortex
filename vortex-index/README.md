@@ -16,10 +16,10 @@ counts and a shared schema. Use `file::file_version` and
 `file::schema_fingerprint` to prepare those identities. The catalog must supply
 trusted expected identities; opening never adopts the files' current versions.
 
-Paths must be absolute native filesystem paths, not URLs. Every row is visible;
-deletion masks and table transactions are not implemented. Projected `scan`
-preserves physical addresses, and `take` groups selections per file before
-restoring request order and duplicate rows. Empty projections are supported.
+Paths must be absolute native filesystem paths, not URLs. This source exposes
+every physical row; use `snapshot::VisibleSource` for table-owned visibility.
+Projected `scan` preserves physical addresses, and `take` groups selections per
+file before restoring request order and duplicate rows. Empty projections are supported.
 
 The source copies and pins **all encoded file bytes in memory** at open time,
 subject to an explicit total byte budget. This prevents subsequent replacement,
@@ -29,6 +29,93 @@ bounded integration tests and local prototypes, not out-of-core workloads.
 
 ```sh
 cargo test -p vortex-index --features file
+```
+
+## Explicit base and delta queries
+
+Enable `file,snapshot` to query local Vortex files through `LocalFileSource`,
+`VisibleSource`, `SnapshotIndex` and `SnapshotVectorSearch`. The caller supplies
+an explicit file inventory, visibility mask, base generations and delta file IDs;
+no cloud storage or running catalog service is required for this local path.
+The local source retains its encoded-file memory budget described above.
+
+Vortex remains a general columnar format: payload columns keep their existing
+types, and vector indexes remain optional derived data. The application/table
+layer owns logical IDs, deletion markers and superseded row versions. The query
+layer operates on those supplied snapshots; it does not create or commit updates.
+
+1. Wrap the pinned source in `VisibleSource` with the complete current `RowFilter`.
+   Invisible rows are excluded from scans and rejected by `take`; physical row
+   offsets never change when rows are filtered.
+2. Supply each opened base generation as a `SnapshotIndex`, together with its
+   **original build visibility** and backend query options. Persist that visibility
+   alongside the generation; substituting today's mask can omit newly visible rows.
+3. Pass the base generations and an **explicit list of delta file IDs** to
+   `SnapshotVectorSearch::try_new`. Every snapshot file must occur exactly once
+   in base coverage or in that delta list. An initial delta-only snapshot must
+   explicitly list all its files.
+4. Search applies current visibility and the query predicate before each base
+   index's top-k. It scans only the declared delta vector columns and merges
+   results using a bounded top-k heap. Retrieve other columns afterward through
+   `search.source().take(...)`, preserving hit order and duplicates.
+
+Base generations can span successive table snapshots only while their covered
+file descriptors (ID, local path, version and row count) remain identical
+and current visibility is a subset of build visibility. A new delta file or a
+deletion does not itself require rebuilding unchanged base files. Changing a base
+file or making previously hidden rows visible requires a new generation/plan.
+
+There is **no automatic scan fallback**. Stale generations, uncovered files,
+overlapping coverage, unsupported capabilities, corrupt artifacts and IO failures
+are errors. An exact query requires every base index to support exact search;
+a restricted query requires filter support. Approximate queries may use ANN
+generations but never relax visibility. SQL predicate planning and evaluation of
+predicates over new delta rows remain the caller's responsibility; an old
+attribute/text allow-list must not omit matching delta rows.
+
+The current vector path supports finite, non-null `FixedSizeList<Float32>` and
+squared L2, with a shared schema fingerprint. It does not implement schema
+evolution or promise backward compatibility for these experimental APIs or
+catalog representations. Validation of identities and visibility is required for
+correctness, independently of format/API compatibility.
+
+## Future table publication and recovery integration
+
+Local queries can run against explicitly supplied snapshots. When a durable
+table/catalog layer is added, it must own the following protocol. These are
+integration requirements, not a publication, recovery or compaction service
+implemented by this crate.
+
+1. Write immutable source files and collect their expected identities. Publish
+   one atomic table revision containing the source snapshot, complete visibility,
+   base generation references and explicit delta inventory. Data and visibility
+   changes always get a new snapshot version, including deletion-only changes.
+2. Build a generation against pinned source files and build visibility. Complete
+   and verify every artifact before sealing it. Persist the trusted generation
+   descriptor, build snapshot and build visibility together. A sealed generation
+   is not published merely because its files exist.
+3. Attach it with a catalog compare-and-swap against the revision used to plan the
+   build, atomically replacing the relevant delta/base entries. On conflict, load
+   the current revision and validate a new plan before another publication attempt.
+   Readers pin a complete revision and never combine its data with another
+   revision's visibility or index references.
+4. Background compaction writes new columnar files and matching indexes before
+   atomically replacing base entries. Old physical row addresses are never carried
+   into rewritten files. Retain old source files and artifacts until no retained
+   snapshot/reader references them; cleanup belongs to the table's GC policy.
+5. After a crash, reopen only catalog-referenced sealed descriptors and pinned
+   files. Unpublished builds are orphans, never candidates discovered by listing
+   directories. Missing or corrupt published state fails explicitly; recovery
+   repairs or republishes a complete revision instead of switching to latest data
+   or silently scanning.
+
+Tests exercise real local Vortex files, multiple base generations, explicit delta
+scans, deletion visibility, ordered payload retrieval and rejection without
+fallback. The snapshot query tests do not qualify a future table/catalog layer's
+crash durability.
+
+```sh
+cargo test -p vortex-index --features file,snapshot
 ```
 
 ## Local generation store
@@ -107,9 +194,9 @@ oracle for padding and IO chunk boundaries.
 cargo bench -p vortex-index --features file --bench checksum
 ```
 
-Native SPFresh integration and SQL wiring remain separate milestones. A native
-backend will also need constrained local artifact access; whole-object `Bytes`
-IO is not a scalable substitute for native checkpoint files or range reads.
+The [SPFresh provider](../vortex-index-spfresh/README.md) uses constrained local
+artifact access. SQL wiring remains separate; whole-object `Bytes` IO is not a
+scalable substitute for native checkpoint file access.
 
 The crate has no DuckDB, SPFresh, SPTAG, or SPDK dependency. No code was imported
 from the earlier `vendor/vortex-index` prototype. See the
@@ -132,6 +219,7 @@ file coverage are errors; the allow-list must not silently omit unindexed files.
 SPFresh translates the resulting physical addresses through its own row map.
 The two indexes may have different internal ID orders for the same snapshot.
 
-Data, attribute, deletion-visibility and compaction changes require compatible
-new static generations on a new snapshot. Catalog publication and SQL predicate
-planning remain the caller's responsibility.
+Attribute/text providers still require the exact snapshot supplied to them.
+The base/delta vector layer does not automatically extend their allow-lists to
+new files. Catalog publication and SQL predicate planning remain the caller's
+responsibility.

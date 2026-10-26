@@ -9,8 +9,9 @@
 //! Indexes are optional derived data, bound to an immutable source snapshot.
 //! Neither a backend's numeric identifiers nor scan partition numbers are public
 //! row identities. See [`RowAddress`] and [`Snapshot`] for the addressing contract.
-//! The initial implementation requires an exact snapshot match; it does not
-//! implement transactions, compaction remapping, or automatic SQL optimization.
+//! Providers require an exact build-snapshot match. The optional `snapshot` module
+//! composes validated static base coverage with explicitly selected delta files.
+//! Transactions, compaction scheduling and SQL optimization belong to the table/engine.
 
 pub mod attributes;
 #[cfg(any(feature = "file", all(unix, feature = "local-store")))]
@@ -21,6 +22,8 @@ mod flat;
 mod metadata;
 mod query;
 mod registry;
+#[cfg(feature = "snapshot")]
+pub mod snapshot;
 #[cfg(all(unix, feature = "local-store"))]
 pub mod store;
 mod traits;

@@ -4,7 +4,8 @@
 //! Content-verified local Vortex files, available with the `file` feature.
 //!
 //! This initial adapter pins the complete encoded files in memory. It is intended
-//! for bounded, frozen collections without deletion masks, not out-of-core ANN.
+//! for bounded, frozen collections, not out-of-core ANN. With the `snapshot`
+//! feature, `VisibleSource` can apply table-owned deletion/version visibility.
 //!
 //! ```no_run
 //! use vortex_array::dtype::DType;
@@ -340,4 +341,4 @@ impl IndexSource for LocalFileSource {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

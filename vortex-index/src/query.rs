@@ -108,6 +108,70 @@ impl RowFilter {
     pub fn is_restricted(&self) -> bool {
         self.allow.is_some() || !self.exclude.is_empty()
     }
+
+    /// Intersect predicates/visibility from the same snapshot. Exclusions always win.
+    pub fn intersection(&self, other: &Self) -> VortexResult<Self> {
+        if self.snapshot != other.snapshot {
+            vortex_bail!("Cannot intersect row filters from different snapshots");
+        }
+        let allow = match (&self.allow, &other.allow) {
+            (Some(left), Some(right)) => Some(left.intersection(right).copied().collect()),
+            (Some(rows), None) | (None, Some(rows)) => Some(rows.clone()),
+            (None, None) => None,
+        };
+        Self::try_new(
+            self.snapshot.clone(),
+            allow,
+            self.exclude.union(&other.exclude).copied().collect(),
+        )
+    }
+
+    #[cfg(feature = "snapshot")]
+    pub(crate) fn covered_subset_of(&self, old: &Self, files: &[u64]) -> bool {
+        let covered = |row: &RowAddress| files.binary_search(&row.file_id).is_ok();
+        if let Some(allow) = &self.allow {
+            return allow
+                .iter()
+                .filter(|row| covered(row) && self.includes(**row))
+                .all(|row| old.includes(*row));
+        }
+        if let Some(allow) = &old.allow {
+            // Count visible rows rather than enumerating every physical row. The
+            // caller has already proved that covered file identities are equal.
+            return files.iter().all(|id| {
+                let Some(file) = self.snapshot.file(*id) else {
+                    return false;
+                };
+                let visible = file.row_count
+                    - self.exclude.iter().filter(|row| row.file_id == *id).count() as u64;
+                let shared = allow
+                    .iter()
+                    .filter(|row| row.file_id == *id && old.includes(**row) && self.includes(**row))
+                    .count() as u64;
+                visible == shared
+            });
+        }
+        old.exclude
+            .iter()
+            .filter(|row| covered(row))
+            .all(|row| !self.includes(*row))
+    }
+
+    #[cfg(feature = "snapshot")]
+    pub(crate) fn for_index_snapshot(
+        &self,
+        snapshot: Snapshot,
+        files: &[u64],
+    ) -> VortexResult<Self> {
+        let covered = |row: &&RowAddress| files.binary_search(&row.file_id).is_ok();
+        Self::try_new(
+            snapshot,
+            self.allow
+                .as_ref()
+                .map(|rows| rows.iter().filter(covered).copied().collect()),
+            self.exclude.iter().filter(covered).copied().collect(),
+        )
+    }
 }
 
 /// Meaning of a scalar index's candidate set within its declared coverage.

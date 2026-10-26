@@ -80,7 +80,7 @@ fn fields(names: &[&str]) -> Vec<String> {
     names.iter().map(|name| (*name).to_owned()).collect()
 }
 
-fn data(ids: &[i32]) -> VortexResult<StructArray> {
+pub(crate) fn data(ids: &[i32]) -> VortexResult<StructArray> {
     let elements = ids
         .iter()
         .map(|id| {
@@ -108,7 +108,7 @@ fn data(ids: &[i32]) -> VortexResult<StructArray> {
     )
 }
 
-async fn write_file(
+pub(crate) async fn write_file(
     session: &VortexSession,
     dir: &Path,
     id: u64,
@@ -134,7 +134,7 @@ async fn write_file(
     })
 }
 
-fn test_session(handle: Handle) -> VortexResult<VortexSession> {
+pub(crate) fn test_session(handle: Handle) -> VortexResult<VortexSession> {
     let session = array_session()
         .with::<LayoutSession>()
         .with::<RuntimeSession>()
