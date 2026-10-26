@@ -17,9 +17,9 @@ counts and a shared schema. Use `file::file_version` and
 trusted expected identities; opening never adopts the files' current versions.
 
 Paths must be absolute native filesystem paths, not URLs. This source exposes
-every physical row; use `snapshot::VisibleSource` for table-owned visibility. Projected `scan`
-preserves physical addresses, and `take` groups selections per file before
-restoring request order and duplicate rows. Empty projections are supported.
+every physical row; use `snapshot::VisibleSource` for table-owned visibility.
+Projected `scan` preserves physical addresses, and `take` groups selections per
+file before restoring request order and duplicate rows. Empty projections are supported.
 
 The source copies and pins **all encoded file bytes in memory** at open time,
 subject to an explicit total byte budget. This prevents subsequent replacement,
@@ -31,45 +31,18 @@ bounded integration tests and local prototypes, not out-of-core workloads.
 cargo test -p vortex-index --features file
 ```
 
-## Cloud source
-
-Enable `cloud` for `cloud::ObjectStoreFileSource`. The caller resolves credentials
-and an `Arc<dyn object_store::ObjectStore>` (for example using `vortex-cloud`).
-`open` takes the expected `Snapshot`, schema, store, store URI prefix, session and
-`CloudSourceOptions`. The session needs the file's encodings/layouts and a live runtime.
-
-Publish each `SourceFile` with a store-qualified URI such as
-`s3://bucket/data/part.vortex`, a version from `cloud::object_version(ObjectMeta)`,
-and its physical row count. The URI is the exact store prefix (`s3://bucket/` in
-this example) followed by a literal object key; this API does not URL-decode it.
-For a prefixed store, include that prefix in its identity. Keep the namespace
-bound to the same store; version tokens alone are not unique across stores.
-
-Opening validates the catalog's identities, schema and row counts. Footer reads
-and subsequent range reads request and verify the recorded version/ETag and size.
-Historical object versions remain readable if the store retains them. For an
-ETag-only object, replacement makes subsequent uncached reads fail. Already
-cached bytes still belong to the pinned snapshot. The adapter never adopts a
-new object version or retries against an unpinned latest object. ETags are opaque
-conditional-read tokens, not content checksums. Stores must provide strong
-version/conditional-read semantics and immutable streamed responses.
-
-Projected scans and ordered `take` use Vortex's layout readers. Opening does not
-eagerly download large files; column pruning depends on the file layout. Range
-sizes, per-file read concurrency, file count and optional per-file segment caches
-have explicit budgets. A source and its caches can be shared across queries;
-cache identities are isolated between files and independently opened sources.
-These budgets do not bound decoded batches or total process memory.
-
-This reads **Vortex source columns**. Native SPFresh checkpoint/posting files
-still use their provider's local materialization and are not remote range readers.
-
 ## Explicit base and delta queries
 
-Enable `snapshot` for `VisibleSource`, `SnapshotIndex` and `SnapshotVectorSearch`.
+Enable `file,snapshot` to query local Vortex files through `LocalFileSource`,
+`VisibleSource`, `SnapshotIndex` and `SnapshotVectorSearch`. The caller supplies
+an explicit file inventory, visibility mask, base generations and delta file IDs;
+no cloud storage or running catalog service is required for this local path.
+The local source retains its encoded-file memory budget described above.
+
 Vortex remains a general columnar format: payload columns keep their existing
-types, and vector indexes remain optional derived data. The table/catalog owns
-logical IDs, commits, deletion markers and superseded row versions.
+types, and vector indexes remain optional derived data. The application/table
+layer owns logical IDs, deletion markers and superseded row versions. The query
+layer operates on those supplied snapshots; it does not create or commit updates.
 
 1. Wrap the pinned source in `VisibleSource` with the complete current `RowFilter`.
    Invisible rows are excluded from scans and rejected by `take`; physical row
@@ -87,7 +60,7 @@ logical IDs, commits, deletion markers and superseded row versions.
    `search.source().take(...)`, preserving hit order and duplicates.
 
 Base generations can span successive table snapshots only while their covered
-file descriptors (ID, qualified location, version and row count) remain identical
+file descriptors (ID, local path, version and row count) remain identical
 and current visibility is a subset of build visibility. A new delta file or a
 deletion does not itself require rebuilding unchanged base files. Changing a base
 file or making previously hidden rows visible requires a new generation/plan.
@@ -106,12 +79,14 @@ evolution or promise backward compatibility for these experimental APIs or
 catalog representations. Validation of identities and visibility is required for
 correctness, independently of format/API compatibility.
 
-## Table publication and recovery contract
+## Future table publication and recovery integration
 
-The caller integrates these primitives with its existing catalog; this crate
-does not introduce another WAL, catalog or transaction coordinator.
+Local queries can run against explicitly supplied snapshots. When a durable
+table/catalog layer is added, it must own the following protocol. These are
+integration requirements, not a publication, recovery or compaction service
+implemented by this crate.
 
-1. Write immutable source objects and collect their expected identities. Publish
+1. Write immutable source files and collect their expected identities. Publish
    one atomic table revision containing the source snapshot, complete visibility,
    base generation references and explicit delta inventory. Data and visibility
    changes always get a new snapshot version, including deletion-only changes.
@@ -126,22 +101,21 @@ does not introduce another WAL, catalog or transaction coordinator.
    revision's visibility or index references.
 4. Background compaction writes new columnar files and matching indexes before
    atomically replacing base entries. Old physical row addresses are never carried
-   into rewritten files. Retain old objects and artifacts until no retained
+   into rewritten files. Retain old source files and artifacts until no retained
    snapshot/reader references them; cleanup belongs to the table's GC policy.
 5. After a crash, reopen only catalog-referenced sealed descriptors and pinned
-   objects. Unpublished builds are orphans, never candidates discovered by listing
+   files. Unpublished builds are orphans, never candidates discovered by listing
    directories. Missing or corrupt published state fails explicitly; recovery
    repairs or republishes a complete revision instead of switching to latest data
-   or silently scanning. Cloud caches are disposable and are not recovery state.
+   or silently scanning.
 
-Tests exercise real Vortex files on an in-memory object store, version/ETag
-conditions, replacement during reads, malformed range responses, projected IO,
-base/delta merging, deletion visibility and explicit rejection without fallback.
-They do not qualify live S3/GCS/Azure behavior or a particular external catalog's
+Tests exercise real local Vortex files, multiple base generations, explicit delta
+scans, deletion visibility, ordered payload retrieval and rejection without
+fallback. The snapshot query tests do not qualify a future table/catalog layer's
 crash durability.
 
 ```sh
-cargo test -p vortex-index --all-features
+cargo test -p vortex-index --features file,snapshot
 ```
 
 ## Local generation store
@@ -222,7 +196,7 @@ cargo bench -p vortex-index --features file --bench checksum
 
 The [SPFresh provider](../vortex-index-spfresh/README.md) uses constrained local
 artifact access. SQL wiring remains separate; whole-object `Bytes` IO is not a
-scalable substitute for native checkpoint files or remote range reads.
+scalable substitute for native checkpoint file access.
 
 The crate has no DuckDB, SPFresh, SPTAG, or SPDK dependency. No code was imported
 from the earlier `vendor/vortex-index` prototype. See the

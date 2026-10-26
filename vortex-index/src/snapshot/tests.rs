@@ -610,3 +610,107 @@ fn test_visibility_subset_proof_against_exhaustive_rows() -> VortexResult<()> {
     }
     Ok(())
 }
+
+#[test]
+fn test_local_snapshot_merges_generations_and_delta_then_reads_payload() -> VortexResult<()> {
+    block_on(|handle| async move {
+        let session = test_session(handle)?;
+        let dir = tempfile::tempdir()?;
+        let dtype = data(&[1])?.dtype().clone();
+        let mut files = Vec::new();
+        for (id, ids) in [(10, [1, 2]), (20, [3, 4])] {
+            files.push(write_file(&session, dir.path(), id, data(&ids)?.into_array()).await?);
+        }
+        let base = Snapshot {
+            dataset_id: "local-multi-base".into(),
+            version: "base".into(),
+            schema_fingerprint: schema_fingerprint(&dtype)?,
+            files,
+        };
+        let mut current = base.clone();
+        current.version = "snapshot-2".into();
+        current
+            .files
+            .push(write_file(&session, dir.path(), 30, data(&[2, 6])?.into_array()).await?);
+        let spec = spec();
+        let mut indexes = Vec::new();
+        for (id, values) in [(10, [1.0_f32, 0.0, 2.0, 0.0]), (20, [3.0, 0.0, 4.0, 0.0])] {
+            let index = FlatIndex::try_new(
+                IndexMetadata {
+                    format_version: 1,
+                    name: "embedding".into(),
+                    generation: format!("index-{id}"),
+                    backend: FlatIndex::ID.into(),
+                    backend_version: 1,
+                    snapshot: base.clone(),
+                    fields: vec!["embedding".into()],
+                    covered_files: vec![id],
+                    artifacts: Vec::new(),
+                },
+                spec,
+                vec![row(id, 0), row(id, 1)],
+                Buffer::from(values.to_vec()),
+            )?;
+            indexes.push(SnapshotIndex::try_new(
+                Arc::new(index),
+                RowFilter::try_new(base.clone(), None, BTreeSet::new())?,
+                Bytes::new(),
+            )?);
+        }
+        let source = Arc::new(
+            LocalFileSource::open(current.clone(), dtype, 16 * 1024 * 1024, session.clone())
+                .await?,
+        );
+        let visibility = RowFilter::try_new(
+            current.clone(),
+            None,
+            BTreeSet::from([row(10, 1), row(20, 1)]),
+        )?;
+        let search = SnapshotVectorSearch::try_new(
+            VisibleSource::try_new(
+                Arc::clone(&source) as Arc<dyn IndexSource>,
+                visibility.clone(),
+            )?,
+            "embedding".into(),
+            spec,
+            indexes,
+            vec![30],
+            session.clone(),
+        )?;
+        let oracle = SnapshotVectorSearch::try_new(
+            VisibleSource::try_new(source, visibility)?,
+            "embedding".into(),
+            spec,
+            Vec::new(),
+            vec![10, 20, 30],
+            session.clone(),
+        )?;
+        let predicate = RowFilter::try_new(current, None, BTreeSet::new())?;
+        let k = NonZeroUsize::MIN.saturating_add(2);
+        let hits = search
+            .search(&[2.0, 0.0], k, SearchMode::Exact, &predicate)
+            .await?;
+        assert_eq!(
+            hits,
+            oracle
+                .search(&[2.0, 0.0], k, SearchMode::Exact, &predicate)
+                .await?
+        );
+        assert_eq!(
+            hits.iter().map(|hit| hit.row).collect::<Vec<_>>(),
+            vec![row(30, 0), row(10, 0), row(20, 0)]
+        );
+        let rows = [hits[2].row, hits[0].row, hits[1].row, hits[0].row];
+        let batch = search
+            .source()
+            .take(&rows, &["id".into(), "note".into()])
+            .await?;
+        assert_eq!(batch.rows, rows);
+        assert_arrays_eq!(
+            batch.data,
+            data(&[3, 2, 1, 2])?.project(&["id".into(), "note".into()])?,
+            &mut session.create_execution_ctx()
+        );
+        Ok(())
+    })
+}

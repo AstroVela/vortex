@@ -16,8 +16,6 @@
 pub mod attributes;
 #[cfg(any(feature = "file", all(unix, feature = "local-store")))]
 mod checksum;
-#[cfg(feature = "cloud")]
-pub mod cloud;
 #[cfg(feature = "file")]
 pub mod file;
 mod flat;
