@@ -21,6 +21,7 @@ use tantivy::IndexReader;
 use tantivy::TERMINATED;
 use tantivy::TantivyDocument;
 use tantivy::query::EnableScoring;
+use tantivy::query::Query;
 use tantivy::query::QueryParser;
 use tantivy::schema::FAST;
 use tantivy::schema::Field;
@@ -34,6 +35,7 @@ use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
 use vortex::error::vortex_err;
 use vortex::session::VortexSession;
+use vortex_index::AttributeIndex;
 use vortex_index::FullTextHit;
 use vortex_index::FullTextIndex;
 use vortex_index::Index;
@@ -46,9 +48,15 @@ use vortex_index::IndexStore;
 use vortex_index::LocalArtifactLease;
 use vortex_index::RowAddress;
 use vortex_index::RowFilter;
+use vortex_index::attributes::AttributePredicate;
 
 use crate::schema::validate_columns;
 use crate::schema::validate_names;
+
+mod attributes;
+use attributes::AttributeFields;
+pub use attributes::AttributeType;
+pub use attributes::TantivyBuildOptions;
 
 /// Registry identity of the immutable multi-file Tantivy provider.
 pub const TANTIVY_ID: &str = "tantivy.static";
@@ -82,13 +90,15 @@ struct Descriptor {
     metadata: IndexMetadata,
     analyzer: String,
     rows: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    options: Option<TantivyBuildOptions>,
 }
 
 fn validate(metadata: &IndexMetadata) -> VortexResult<()> {
     metadata.validate_for(&metadata.snapshot)?;
     validate_names(&metadata.fields)?;
     if metadata.backend != TANTIVY_ID
-        || metadata.backend_version != 1
+        || !matches!(metadata.backend_version, 1 | 2)
         || metadata.fields.len() > 16
         || metadata.fields.iter().any(|name| name == FILE_ID)
     {
@@ -97,7 +107,10 @@ fn validate(metadata: &IndexMetadata) -> VortexResult<()> {
     Ok(())
 }
 
-fn schema(fields: &[String]) -> (Schema, Field, Field, Vec<Field>) {
+fn schema(
+    fields: &[String],
+    options: Option<&TantivyBuildOptions>,
+) -> (Schema, Field, Field, Vec<Field>, Option<AttributeFields>) {
     let mut schema = Schema::builder();
     let file = schema.add_u64_field(FILE_ID, FAST);
     let row = schema.add_u64_field(ROW_ID, FAST);
@@ -105,7 +118,8 @@ fn schema(fields: &[String]) -> (Schema, Field, Field, Vec<Field>) {
         .iter()
         .map(|name| schema.add_text_field(name, TEXT))
         .collect();
-    (schema.build(), file, row, text)
+    let attributes = options.map(|options| AttributeFields::add(&mut schema, options));
+    (schema.build(), file, row, text, attributes)
 }
 
 #[async_trait]
@@ -114,7 +128,7 @@ impl IndexProvider for TantivyProvider {
         TANTIVY_ID
     }
     fn supports_version(&self, version: u32) -> bool {
-        version == 1
+        matches!(version, 1 | 2)
     }
     fn builder(&self) -> Option<&dyn IndexBuilder> {
         Some(self)
@@ -156,7 +170,18 @@ impl IndexProvider for TantivyProvider {
         }
         let index = NativeIndex::open_in_dir(lease.path().join("tantivy/index"))
             .map_err(|err| vortex_err!(External: err))?;
-        let (expected_schema, _, _, fields) = schema(&metadata.fields);
+        let options = descriptor.options;
+        if (metadata.backend_version == 2) != options.is_some() {
+            vortex_bail!("Tantivy format and field roles disagree");
+        }
+        if let Some(options) = &options {
+            options.validate(metadata)?;
+        }
+        let text_names = options
+            .as_ref()
+            .map_or(&metadata.fields, |options| &options.text_fields)
+            .clone();
+        let (expected_schema, _, _, fields, attributes) = schema(&text_names, options.as_ref());
         if index.schema() != expected_schema {
             vortex_bail!("Tantivy schema mismatch");
         }
@@ -168,6 +193,8 @@ impl IndexProvider for TantivyProvider {
             index,
             reader,
             fields,
+            text_names,
+            attributes,
             metadata: metadata.clone(),
             _lease: lease,
         }))
@@ -185,14 +212,29 @@ impl IndexBuilder for TantivyProvider {
         let mut metadata = request.metadata;
         validate(&metadata)?;
         metadata.validate_for(source.snapshot())?;
-        if !metadata.artifacts.is_empty() || !request.backend_options.is_empty() {
-            vortex_bail!("Tantivy v1 requires empty build options and a new artifact inventory");
+        if !metadata.artifacts.is_empty() || request.backend_options.len() > 64 * 1024 {
+            vortex_bail!("Tantivy requires a new artifact inventory and bounded build options");
         }
+        let options = if metadata.backend_version == 1 {
+            if !request.backend_options.is_empty() {
+                vortex_bail!("Tantivy v1 requires empty build options");
+            }
+            None
+        } else {
+            let options: TantivyBuildOptions = serde_json::from_slice(&request.backend_options)
+                .map_err(|err| vortex_err!(External: err))?;
+            options.validate(&metadata)?;
+            Some(options)
+        };
+        let text_names = options
+            .as_ref()
+            .map_or(&metadata.fields, |options| &options.text_fields);
         let local = store
             .as_local_files()
             .ok_or_else(|| vortex_err!("Tantivy requires local artifacts"))?;
         let temporary = tempfile::tempdir_in(&self.scratch)?;
-        let (schema, file_field, row_field, text_fields) = schema(&metadata.fields);
+        let (schema, file_field, row_field, text_fields, attributes) =
+            schema(text_names, options.as_ref());
         let index = NativeIndex::create_in_dir(temporary.path(), schema)
             .map_err(|err| vortex_err!(External: err))?;
         let mut writer = index
@@ -205,11 +247,13 @@ impl IndexBuilder for TantivyProvider {
             if batch.rows.len() != batch.data.len() {
                 vortex_bail!("Source row mapping length mismatch");
             }
-            validate_columns(batch.data.dtype(), &metadata.fields)?;
+            if !text_names.is_empty() {
+                validate_columns(batch.data.dtype(), text_names)?;
+            }
             let data = batch.data.execute::<StructArray>(&mut ctx)?;
             let valid = data.validity()?.execute_mask(data.len(), &mut ctx)?;
             let mut columns = Vec::new();
-            for name in &metadata.fields {
+            for name in text_names {
                 let array = data
                     .unmasked_field_by_name(name)?
                     .clone()
@@ -217,6 +261,10 @@ impl IndexBuilder for TantivyProvider {
                 let mask = array.validity()?.execute_mask(array.len(), &mut ctx)?;
                 columns.push((array, mask));
             }
+            let attribute_columns = attributes
+                .as_ref()
+                .map(|attributes| attributes.decode(&data, &mut ctx))
+                .transpose()?;
             for ((offset, address), valid) in batch.rows.into_iter().enumerate().zip(valid.iter()) {
                 metadata.snapshot.validate_row(address)?;
                 if !metadata.covers(address.file_id)
@@ -240,6 +288,9 @@ impl IndexBuilder for TantivyProvider {
                         }
                     }
                 }
+                if let (Some(attributes), Some(columns)) = (&attributes, &attribute_columns) {
+                    attributes.add_values(&mut doc, columns, offset);
+                }
                 writer
                     .add_document(doc)
                     .map_err(|err| vortex_err!(External: err))?;
@@ -254,6 +305,7 @@ impl IndexBuilder for TantivyProvider {
             metadata: metadata.clone(),
             analyzer: "tantivy-0.25-default".into(),
             rows: seen.len() as u64,
+            options,
         };
         let mut files = fs::read_dir(temporary.path())?.collect::<Result<Vec<_>, _>>()?;
         files.sort_by_key(|entry| entry.file_name());
@@ -296,6 +348,8 @@ struct Opened {
     index: NativeIndex,
     reader: IndexReader,
     fields: Vec<Field>,
+    text_names: Vec<String>,
+    attributes: Option<AttributeFields>,
     metadata: IndexMetadata,
     _lease: Box<dyn LocalArtifactLease>,
 }
@@ -310,7 +364,12 @@ impl Index for Opened {
         &self.metadata
     }
     fn as_full_text(&self) -> Option<&dyn FullTextIndex> {
-        Some(self)
+        (!self.fields.is_empty()).then_some(self)
+    }
+    fn as_attributes(&self) -> Option<&dyn AttributeIndex> {
+        self.attributes
+            .as_ref()
+            .map(|_| self as &dyn AttributeIndex)
     }
 }
 
@@ -344,6 +403,15 @@ impl Ord for Ranked {
 
 #[async_trait]
 impl FullTextIndex for Opened {
+    async fn filter_text(&self, query: &str, visibility: &RowFilter) -> VortexResult<RowFilter> {
+        if query.trim().is_empty() || query.len() > 64 * 1024 || self.fields.is_empty() {
+            vortex_bail!("Invalid full-text prefilter query");
+        }
+        let query = QueryParser::for_index(&self.index, self.fields.clone())
+            .parse_query(query)
+            .map_err(|err| vortex_err!(External: err))?;
+        self.collect_filter(query.as_ref(), visibility)
+    }
     async fn search_text(
         &self,
         query: &str,
@@ -367,8 +435,7 @@ impl FullTextIndex for Opened {
         let mut parser = QueryParser::for_index(&self.index, self.fields.clone());
         for (name, boost) in options.field_boosts {
             let position = self
-                .metadata
-                .fields
+                .text_names
                 .iter()
                 .position(|field| field == &name)
                 .ok_or_else(|| vortex_err!("Unknown boosted field: {name}"))?;
@@ -433,5 +500,74 @@ impl FullTextIndex for Opened {
         let mut hits = heap.into_iter().map(|hit| hit.0).collect::<Vec<_>>();
         hits.sort_by(|left, right| right.cmp(left));
         Ok(hits.into_iter().map(|hit| hit.0).collect())
+    }
+}
+
+#[async_trait]
+impl AttributeIndex for Opened {
+    async fn filter(
+        &self,
+        predicate: &AttributePredicate,
+        visibility: &RowFilter,
+    ) -> VortexResult<RowFilter> {
+        let attributes = self.attributes.as_ref().ok_or_else(|| {
+            vortex_err!("Generation has no attribute fields; rebuild with Tantivy v2")
+        })?;
+        let query = attributes.query(predicate, 0, &mut 4096)?;
+        self.collect_filter(query.as_ref(), visibility)
+    }
+}
+
+impl Opened {
+    fn collect_filter(&self, query: &dyn Query, visibility: &RowFilter) -> VortexResult<RowFilter> {
+        if visibility.snapshot() != &self.metadata.snapshot {
+            vortex_bail!("Tantivy prefilter snapshot mismatch");
+        }
+        if self.metadata.uncovered_files().next().is_some() {
+            vortex_bail!("Tantivy prefilters require complete snapshot file coverage");
+        }
+        let searcher = self.reader.searcher();
+        // Enumerate every match with scoring disabled: BM25 top-k cannot be an ANN prefilter.
+        let weight = query
+            .weight(EnableScoring::disabled_from_searcher(&searcher))
+            .map_err(|err| vortex_err!(External: err))?;
+        let mut allowed = BTreeSet::new();
+        for segment in searcher.segment_readers() {
+            let files = segment
+                .fast_fields()
+                .u64(FILE_ID)
+                .map_err(|err| vortex_err!(External: err))?;
+            let offsets = segment
+                .fast_fields()
+                .u64(ROW_ID)
+                .map_err(|err| vortex_err!(External: err))?;
+            let mut scorer = weight
+                .scorer(segment, 1.0)
+                .map_err(|err| vortex_err!(External: err))?;
+            while scorer.doc() != TERMINATED {
+                let doc = scorer.doc();
+                let row = RowAddress {
+                    file_id: files
+                        .first(doc)
+                        .ok_or_else(|| vortex_err!("Missing file ID"))?,
+                    row_offset: offsets
+                        .first(doc)
+                        .ok_or_else(|| vortex_err!("Missing row offset"))?,
+                };
+                self.metadata.snapshot.validate_row(row)?;
+                if !self.metadata.covers(row.file_id) || segment.is_deleted(doc) {
+                    vortex_bail!("Invalid row in immutable Tantivy generation");
+                }
+                if visibility.includes(row) {
+                    allowed.insert(row);
+                }
+                scorer.advance();
+            }
+        }
+        RowFilter::try_new(
+            self.metadata.snapshot.clone(),
+            Some(allowed),
+            BTreeSet::new(),
+        )
     }
 }

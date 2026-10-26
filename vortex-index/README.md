@@ -115,3 +115,23 @@ The crate has no DuckDB, SPFresh, SPTAG, or SPDK dependency. No code was importe
 from the earlier `vendor/vortex-index` prototype. See the
 [index design](../docs/developer-guide/extending/secondary-indexes.md) for
 ownership, consistency rules, limitations, and the SPFresh integration plan.
+
+## Attribute prefilters
+
+`AttributeIndex::filter` evaluates typed `attributes::AttributePredicate` values
+and returns an exact `RowFilter`. `FullTextIndex::filter_text` returns all matching
+visible text rows, without a BM25 top-k limit. Both can prefilter vector search.
+The implementation lives in the existing [Tantivy provider](../vortex-fts/README.md#tantivy-prefilters-for-vector-search):
+text and scalar attributes share one Tantivy generation, document row mapping,
+and artifact lifecycle. There is no separate custom attribute postings format.
+
+Use `Index::as_attributes()` or `as_full_text()` after opening a generation through
+`IndexProvider`. Intersect text and attribute predicates by passing the text
+filter as visibility to the attribute filter. Snapshot mismatches and incomplete
+file coverage are errors; the allow-list must not silently omit unindexed files.
+SPFresh translates the resulting physical addresses through its own row map.
+The two indexes may have different internal ID orders for the same snapshot.
+
+Data, attribute, deletion-visibility and compaction changes require compatible
+new static generations on a new snapshot. Catalog publication and SQL predicate
+planning remain the caller's responsibility.

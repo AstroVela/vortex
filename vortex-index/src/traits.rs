@@ -25,6 +25,7 @@ use crate::SearchHit;
 use crate::Snapshot;
 use crate::VectorSearchOptions;
 use crate::VectorSpec;
+use crate::attributes::AttributePredicate;
 
 /// An opened, immutable generation. Implementations synchronize non-thread-safe native handles.
 pub trait Index: Debug + Send + Sync {
@@ -38,6 +39,11 @@ pub trait Index: Debug + Send + Sync {
 
     /// Full-text retrieval capability, if implemented.
     fn as_full_text(&self) -> Option<&dyn FullTextIndex> {
+        None
+    }
+
+    /// Structured attribute prefilter capability, if implemented.
+    fn as_attributes(&self) -> Option<&dyn AttributeIndex> {
         None
     }
 
@@ -287,6 +293,13 @@ pub trait IndexProvider: Send + Sync {
 /// Snapshot-bound relevance search, distinct from vector distances.
 #[async_trait]
 pub trait FullTextIndex: Index {
+    /// Return all matching visible rows for use as a vector prefilter.
+    /// Implementations must reject partial snapshot coverage and stale visibility.
+    /// The default rejects backends without complete-match enumeration.
+    async fn filter_text(&self, _query: &str, _visibility: &RowFilter) -> VortexResult<RowFilter> {
+        vortex_bail!("Full-text prefiltering is not supported by this backend")
+    }
+
     /// Return at most k distinct hits ordered by descending score, then ascending row address.
     /// Mandatory visibility restrictions must be applied before selecting top-k.
     async fn search_text(
@@ -296,4 +309,18 @@ pub trait FullTextIndex: Index {
         options: &Bytes,
         filter: &RowFilter,
     ) -> VortexResult<Vec<FullTextHit>>;
+}
+
+/// Exact structured attribute filtering for vector retrieval.
+#[async_trait]
+pub trait AttributeIndex: Index {
+    /// Return all matching visible rows, without ranking or a top-k limit.
+    ///
+    /// Validate snapshot identity and reject partial snapshot coverage: otherwise
+    /// an allow-list would silently exclude matches in uncovered files.
+    async fn filter(
+        &self,
+        predicate: &AttributePredicate,
+        visibility: &RowFilter,
+    ) -> VortexResult<RowFilter>;
 }

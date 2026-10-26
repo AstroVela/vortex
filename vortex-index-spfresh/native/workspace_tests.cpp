@@ -237,6 +237,66 @@ void test_thread_migration_and_destruction(const Fixture &fixture) {
     }
 }
 
+void test_filtered_search(const Fixture &fixture) {
+    // Exercise both mapped postings and the copying fallback with identical semantics.
+    for (const char *views : {"0", "1"}) {
+        setenv("VORTEX_SPFRESH_POSTING_VIEW", views, 1);
+        auto handle = fixture.open();
+        unsetenv("VORTEX_SPFRESH_POSTING_VIEW");
+        const auto all = fixture.search(handle.get(), 7, 4096, 256, 256);
+        std::vector<uint8_t> allowed((fixture.rows + 7) / 8, 0xff);
+        if (fixture.rows % 8) {
+            allowed.back() = (1u << (fixture.rows % 8)) - 1;
+        }
+        for (size_t rank = 0; rank < 5; ++rank) {
+            const auto id = all.first[rank];
+            require(id >= 0, "Fixture returned too few neighbors");
+            allowed[id / 8] &= ~(uint8_t(1) << (id % 8));
+        }
+        std::array<int32_t, 5> ids {};
+        std::array<float, 5> distances {};
+        char error[1024] = {};
+        auto search = [&](uint32_t bytes) {
+            return vortex_spfresh_search_filtered(handle.get(),
+                                                  fixture.vectors.data() + 7 * fixture.dimension,
+                                                  fixture.dimension,
+                                                  1,
+                                                  ids.size(),
+                                                  4096,
+                                                  256,
+                                                  fixture.pages,
+                                                  allowed.data(),
+                                                  bytes,
+                                                  ids.data(),
+                                                  distances.data(),
+                                                  error);
+        };
+        require(search(allowed.size()) == 0, error);
+        for (size_t rank = 0; rank < ids.size(); ++rank) {
+            require(ids[rank] == all.first[rank + 5] && distances[rank] == all.second[rank + 5],
+                    "Filtered search did not retrieve farther eligible neighbors");
+        }
+        require(search(allowed.size() - 1) != 0, "Truncated filter bitmap was accepted");
+        std::fill(allowed.begin(), allowed.end(), 0);
+        require(search(allowed.size()) == 0, error);
+        for (auto id : ids) {
+            require(id == -1, "Empty filter admitted a head or posting");
+        }
+        // Head IDs and posting IDs must be tested in the same global ID domain.
+        for (uint32_t row : {0u, 7u, 32u, 64u, 129u, 242u}) {
+            allowed[row / 8] |= uint8_t(1) << (row % 8);
+            require(search(allowed.size()) == 0, error);
+            for (auto id : ids) {
+                require(id == -1 || id == int32_t(row), "Filter leaked a native ID");
+            }
+            allowed[row / 8] = 0;
+        }
+        require(fixture.search(handle.get(), 7, 4096, 256, 256) == all,
+                "Retained workspace leaked its previous filter");
+        require(vortex_spfresh_test_workspaces(handle.get()).thread_detached, "Filtered call leaked TLS");
+    }
+}
+
 void test_concurrent_handles(const Fixture &first, const Fixture &second) {
     auto a = first.open();
     auto b = second.open();
@@ -279,12 +339,13 @@ int main() {
         test_reuse_and_handle_isolation(first, second);
         test_option_changes(first);
         test_error_cleanup(first);
+        test_filtered_search(first);
         test_thread_migration_and_destruction(first);
         test_concurrent_handles(first, second);
         const auto final = vortex_spfresh_test_workspaces(nullptr);
         require(final.thread_detached && final.live_posting_workspaces == 0,
                 "Tests leaked thread-local or handle-owned workspaces");
-        std::cout << "5 workspace lifecycle checks passed\n";
+        std::cout << "6 workspace and filter checks passed\n";
         return 0;
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';
