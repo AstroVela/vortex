@@ -1497,6 +1497,9 @@ extern "C" duckdb_state duckdb_vx_register_table_functions(duckdb_database ffi_d
                 throw InvalidInputException("Vortex input path cannot be NULL");
             }
             const auto path = input.inputs[0].GetValue<string>();
+            if (path.find('\0') != string::npos) {
+                throw InvalidInputException("Vortex input path cannot contain a null byte");
+            }
             VortexBindResults results = {types, names};
             duckdb_vx_error error = nullptr;
             auto data =

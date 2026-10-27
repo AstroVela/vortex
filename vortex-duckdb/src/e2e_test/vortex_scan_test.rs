@@ -104,6 +104,25 @@ fn test_duckdb_file_reader_literal_path_and_float_filters() -> Result<()> {
 
 #[cfg(not(vortex_vane_distributed))]
 #[test]
+fn test_duckdb_file_reader_rejects_nul_path() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("literal.vortex");
+    let path = path.to_string_lossy().replace('\'', "''");
+    let conn = database_connection();
+    conn.query(&format!(
+        "COPY (SELECT 42::BIGINT AS id) TO '{path}' (FORMAT VORTEX)"
+    ))?;
+    let Err(error) = conn.query(&format!(
+        "SELECT * FROM _read_vortex_file('{path}' || chr(0) || 'suffix')"
+    )) else {
+        bail!("a path containing a null byte must not read its existing prefix");
+    };
+    assert!(error.to_string().contains("null byte"), "{error}");
+    Ok(())
+}
+
+#[cfg(not(vortex_vane_distributed))]
+#[test]
 fn test_duckdb_file_reader_prepared_access_change() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("prepared.vortex");
