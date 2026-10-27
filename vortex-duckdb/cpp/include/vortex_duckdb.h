@@ -15,6 +15,7 @@ typedef struct duckdb_vx_error_ *duckdb_vx_error;
 typedef struct duckdb_vx_data_ *duckdb_vx_data;
 typedef struct duckdb_vx_reusable_dict_ *duckdb_vx_reusable_dict;
 typedef struct duckdb_vx_file_writer_ *duckdb_vx_file_writer;
+typedef struct duckdb_vx_file_reader_ *duckdb_vx_file_reader;
 
 //! Create a DuckDB vortex error.
 duckdb_vx_error duckdb_vx_error_create(const char *message, size_t message_length);
@@ -23,6 +24,22 @@ duckdb_vx_error duckdb_vx_error_create(const char *message, size_t message_lengt
 const char *duckdb_vx_error_value(duckdb_vx_error err);
 
 void duckdb_vx_error_free(duckdb_vx_error err);
+
+/// Open one literal path using this connection's filesystem, secrets and access policy.
+duckdb_vx_file_reader duckdb_vx_file_reader_create(void *client_context,
+                                                   const char *file_path,
+                                                   uint64_t *size_out,
+                                                   duckdb_vx_error *error_out);
+
+/// Read an exact byte range. Calls on the same handle must be serialized by the caller.
+duckdb_state duckdb_vx_file_reader_read(duckdb_vx_file_reader reader,
+                                        uint64_t offset,
+                                        uint8_t *data,
+                                        size_t size,
+                                        duckdb_vx_error *error_out);
+
+/// Close and destroy an input handle after all reads have finished.
+void duckdb_vx_file_reader_destroy(duckdb_vx_file_reader reader);
 
 /// Open a writer through the file system associated with a DuckDB client context.
 duckdb_vx_file_writer

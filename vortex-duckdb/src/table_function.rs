@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::cmp::max;
+#[cfg(not(vortex_vane_distributed))]
+use std::ffi::c_void;
 use std::fmt::Formatter;
 use std::fmt::{self};
 use std::pin::Pin;
@@ -80,6 +82,8 @@ use crate::exporter::ConversionCache;
 #[cfg(vortex_vane_distributed)]
 use crate::multi_file::BoundFile;
 use crate::multi_file::bind_multi_file_scan;
+#[cfg(not(vortex_vane_distributed))]
+use crate::multi_file::open_duckdb_file;
 use crate::projection::DuckdbField;
 use crate::projection::Filter;
 use crate::projection::Projection;
@@ -133,6 +137,8 @@ pub struct TableFunctionBind {
     pub(crate) data_source: Arc<MultiLayoutDataSource>,
     #[cfg(not(vortex_vane_distributed))]
     data_source: Arc<MultiLayoutDataSource>,
+    #[cfg(not(vortex_vane_distributed))]
+    duckdb_path: Option<String>,
     #[cfg(vortex_vane_distributed)]
     pub(crate) files: Vec<BoundFile>,
     /// Maps each child of `data_source` to its stable coordinator file index.
@@ -164,6 +170,8 @@ impl Clone for TableFunctionBind {
     fn clone(&self) -> Self {
         Self {
             data_source: Arc::clone(&self.data_source),
+            #[cfg(not(vortex_vane_distributed))]
+            duckdb_path: self.duckdb_path.clone(),
             #[cfg(vortex_vane_distributed)]
             files: self.files.clone(),
             #[cfg(vortex_vane_distributed)]
@@ -281,10 +289,38 @@ pub fn bind(input: &BindInputRef, result: &mut BindResultRef) -> VortexResult<Ta
     }
     Ok(TableFunctionBind {
         data_source: Arc::new(data_source),
+        #[cfg(not(vortex_vane_distributed))]
+        duckdb_path: None,
         #[cfg(vortex_vane_distributed)]
         file_indexes: (0..files.len()).collect(),
         #[cfg(vortex_vane_distributed)]
         files,
+        filter_exprs: vec![],
+        column_fields,
+        has_non_optional_filter: AtomicBool::new(false),
+        aggregates: vec![],
+    })
+}
+
+/// Bind the exact-file adapter used by native Iceberg scans.
+///
+/// # Safety
+/// `context` must point to the live DuckDB ClientContext owning this bind.
+#[cfg(not(vortex_vane_distributed))]
+pub(crate) unsafe fn bind_duckdb_file(
+    context: *mut c_void,
+    path: &str,
+    result: &mut BindResultRef,
+) -> VortexResult<TableFunctionBind> {
+    // SAFETY: The caller guarantees the context lifetime during this bind.
+    let data_source = unsafe { open_duckdb_file(context, path) }?;
+    let column_fields = extract_schema_from_dtype(data_source.dtype())?;
+    for field in &column_fields {
+        result.add_result_column(&field.name, &field.logical_type);
+    }
+    Ok(TableFunctionBind {
+        data_source: Arc::new(data_source),
+        duckdb_path: Some(path.to_owned()),
         filter_exprs: vec![],
         column_fields,
         has_non_optional_filter: AtomicBool::new(false),
@@ -384,7 +420,22 @@ pub fn init_global(init_input: &TableInitInput) -> VortexResult<TableFunctionGlo
         limit: None,
     };
 
-    let scan = RUNTIME.block_on(bind_data.data_source.scan(request))?;
+    #[cfg(not(vortex_vane_distributed))]
+    let data_source = if let Some(path) = &bind_data.duckdb_path {
+        // Prepared statements may execute after secrets or access settings change. Reopen before
+        // scanning even when the footer and every projected column were cached during binding.
+        // SAFETY: DuckDB borrows this context for the complete init_global call.
+        let source = unsafe { open_duckdb_file(init_input.input.client_context.cast(), path) }?;
+        if source.dtype() != bind_data.data_source.dtype() {
+            vortex_bail!("Vortex input schema changed after binding");
+        }
+        Arc::new(source)
+    } else {
+        Arc::clone(&bind_data.data_source)
+    };
+    #[cfg(vortex_vane_distributed)]
+    let data_source = Arc::clone(&bind_data.data_source);
+    let scan = RUNTIME.block_on(data_source.scan(request))?;
 
     let num_workers = get_available_parallelism().unwrap_or(1);
 

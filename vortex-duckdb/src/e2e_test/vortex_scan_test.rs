@@ -10,6 +10,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::Result;
+#[cfg(not(vortex_vane_distributed))]
+use anyhow::bail;
 use geo_types::LineString;
 use geo_types::Polygon;
 use jiff::Span;
@@ -64,6 +66,62 @@ fn database_connection() -> Connection {
     db.register_vortex_scan_replacement().unwrap();
     crate::initialize(&db).unwrap();
     db.connect().unwrap()
+}
+
+#[cfg(not(vortex_vane_distributed))]
+#[test]
+fn test_duckdb_file_reader_literal_path_and_float_filters() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("literal%20 # ü.vortex");
+    let path = path.to_string_lossy().replace('\'', "''");
+    let conn = database_connection();
+    conn.query(&format!(
+        "COPY (SELECT * FROM (VALUES (1::BIGINT, 0.0::DOUBLE), (2, '-0.0'::DOUBLE), \
+         (3, 'NaN'::DOUBLE), (4, NULL::DOUBLE)) t(id, x)) TO '{path}' (FORMAT VORTEX)"
+    ))?;
+    let result = conn.query(&format!(
+        "SELECT id FROM _read_vortex_file('{path}') WHERE x = 0 ORDER BY id"
+    ))?;
+    let ids: Vec<i64> = result
+        .into_iter()
+        .flat_map(|chunk| {
+            chunk
+                .get_vector(0)
+                .as_slice_with_len::<i64>(chunk.len().as_())
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(ids, vec![1, 2]);
+    assert_eq!(
+        conn.query(&format!(
+            "SELECT id FROM _read_vortex_file('{path}') WHERE x IS NULL"
+        ))?
+        .row_count(),
+        1
+    );
+    Ok(())
+}
+
+#[cfg(not(vortex_vane_distributed))]
+#[test]
+fn test_duckdb_file_reader_prepared_access_change() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("prepared.vortex");
+    let path = path.to_string_lossy().replace('\'', "''");
+    let conn = database_connection();
+    conn.query(&format!(
+        "COPY (SELECT i FROM range(10) t(i)) TO '{path}' (FORMAT VORTEX)"
+    ))?;
+    conn.query(&format!(
+        "PREPARE read_file AS SELECT i FROM _read_vortex_file('{path}')"
+    ))?;
+    assert_eq!(conn.query("EXECUTE read_file")?.row_count(), 10);
+    conn.query("SET enable_external_access=false")?;
+    let Err(error) = conn.query("EXECUTE read_file") else {
+        bail!("prepared input must enforce the new policy");
+    };
+    assert!(error.to_string().contains("disabled"), "{error}");
+    Ok(())
 }
 
 fn create_temp_file() -> NamedTempFile {

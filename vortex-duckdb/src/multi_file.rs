@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+#[cfg(not(vortex_vane_distributed))]
+use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::LazyLock;
 
@@ -37,6 +39,8 @@ use vortex::error::VortexError;
 use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
 use vortex::error::vortex_err;
+#[cfg(not(vortex_vane_distributed))]
+use vortex::file::OpenOptionsSessionExt;
 #[cfg(vortex_vane_distributed)]
 use vortex::file::VortexFile;
 #[cfg(vortex_vane_distributed)]
@@ -48,7 +52,6 @@ use vortex::file::multi::open_cached;
 use vortex::file::multi::parse_uri_or_path;
 #[cfg(vortex_vane_distributed)]
 use vortex::io::CoalesceConfig;
-#[cfg(vortex_vane_distributed)]
 use vortex::io::VortexReadAt;
 use vortex::io::compat::Compat;
 use vortex::io::filesystem::FileSystemRef;
@@ -67,6 +70,8 @@ use crate::SESSION;
 #[cfg(vortex_vane_distributed)]
 use crate::bound_object_store::BoundObjectStore;
 use crate::duckdb::BindInputRef;
+#[cfg(not(vortex_vane_distributed))]
+use crate::duckdb::DuckDBFileReader;
 use crate::duckdb::ExtractedValue;
 
 /// Process-wide registry, so repeated scans against the same bucket share one client.
@@ -496,5 +501,32 @@ pub fn bind_multi_file_scan(input: &BindInputRef) -> VortexResult<MultiLayoutDat
             builder = builder.with_glob(&glob, Some(fs));
         }
         builder.build().await
+    })
+}
+
+/// Open one exact file through DuckDB, without using the process-wide object-store/footer cache.
+///
+/// # Safety
+/// `context` must point to a live DuckDB ClientContext throughout this call.
+#[cfg(not(vortex_vane_distributed))]
+pub(crate) unsafe fn open_duckdb_file(
+    context: *mut c_void,
+    path: &str,
+) -> VortexResult<MultiLayoutDataSource> {
+    // SAFETY: The caller guarantees the context lifetime during open.
+    let source = Arc::new(unsafe { DuckDBFileReader::open(context, path) }?);
+    RUNTIME.block_on(async {
+        let size = source.size().await?;
+        let file = SESSION
+            .open_options()
+            .with_file_size(size)
+            .open(source)
+            .await?;
+        Ok(MultiLayoutDataSource::new_with_first(
+            file.layout_reader()?,
+            Vec::new(),
+            vec![Some(size)],
+            &SESSION,
+        ))
     })
 }
