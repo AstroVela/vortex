@@ -36,6 +36,7 @@ cc = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 
 [dev-dependencies]
+vortex-fts = { path = "../vortex-fts" }
 futures = { workspace = true, features = ["executor"] }
 rustix.workspace = true
 tempfile.workspace = true

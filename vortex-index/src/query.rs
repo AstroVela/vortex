@@ -160,3 +160,12 @@ impl ScalarCandidates {
             .collect()
     }
 }
+
+/// A full-text hit. Scores are BM25 relevance, ordered descending.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FullTextHit {
+    /// Physical row address in the pinned source snapshot.
+    pub row: RowAddress,
+    /// Finite relevance score; higher is better.
+    pub score: f32,
+}

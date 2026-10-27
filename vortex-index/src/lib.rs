@@ -12,6 +12,7 @@
 //! The initial implementation requires an exact snapshot match; it does not
 //! implement transactions, compaction remapping, or automatic SQL optimization.
 
+pub mod attributes;
 #[cfg(any(feature = "file", all(unix, feature = "local-store")))]
 mod checksum;
 #[cfg(feature = "file")]
@@ -32,6 +33,7 @@ pub use metadata::Snapshot;
 pub use metadata::SourceFile;
 pub use query::CandidateGuarantee;
 pub use query::DistanceMetric;
+pub use query::FullTextHit;
 pub use query::RowFilter;
 pub use query::ScalarCandidates;
 pub use query::SearchHit;
@@ -39,6 +41,8 @@ pub use query::SearchMode;
 pub use query::VectorSearchOptions;
 pub use query::VectorSpec;
 pub use registry::IndexRegistry;
+pub use traits::AttributeIndex;
+pub use traits::FullTextIndex;
 pub use traits::Index;
 pub use traits::IndexBuildRequest;
 pub use traits::IndexBuilder;

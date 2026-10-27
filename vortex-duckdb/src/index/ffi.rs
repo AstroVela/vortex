@@ -24,6 +24,7 @@ use vortex::io::runtime::BlockingRuntime;
 use super::FACTORIES;
 use super::MAX_K;
 use super::MAX_OPTIONS_BYTES;
+use super::Query;
 use super::Request;
 use super::ValidationMode;
 use super::cache::CacheBudget;
@@ -61,7 +62,29 @@ fn options(value: &ValueRef) -> VortexResult<Bytes> {
     Ok(Bytes::from(options))
 }
 
-fn bind(build: bool, inputs: &[&ValueRef]) -> VortexResult<Request> {
+fn indexed_fields(value: &ValueRef, full_text: bool) -> VortexResult<Vec<String>> {
+    let fields = if full_text {
+        let ExtractedValue::List(fields) = value.extract() else {
+            vortex_bail!("FTS fields require a list");
+        };
+        fields
+            .iter()
+            .map(|v| string(v))
+            .collect::<VortexResult<Vec<_>>>()?
+    } else {
+        vec![string(value)?]
+    };
+    if fields.is_empty()
+        || fields.len() > 16
+        || fields.iter().any(|f| f.trim().is_empty())
+        || fields.iter().collect::<BTreeSet<_>>().len() != fields.len()
+    {
+        vortex_bail!("Index requires 1..16 unique nonempty fields");
+    }
+    Ok(fields)
+}
+
+fn bind(build: bool, full_text: bool, inputs: &[&ValueRef]) -> VortexResult<Request> {
     if build && inputs.len() == 5 {
         let ExtractedValue::List(files) = inputs[0].extract() else {
             vortex_bail!("Index build requires a non-NULL list of local filenames");
@@ -78,10 +101,7 @@ fn bind(build: bool, inputs: &[&ValueRef]) -> VortexResult<Request> {
         }
         let reference = PathBuf::from(string(inputs[1])?);
         root(&reference)?;
-        let field = string(inputs[2])?;
-        if field.trim().is_empty() {
-            vortex_bail!("Index field must be nonempty");
-        }
+        let fields = indexed_fields(inputs[2], full_text)?;
         let backend = string(inputs[3])?;
         if !FACTORIES.read().contains_key(&backend) {
             vortex_bail!("Unknown SQL index backend: {backend}");
@@ -89,7 +109,8 @@ fn bind(build: bool, inputs: &[&ValueRef]) -> VortexResult<Request> {
         Ok(Request::Build {
             files,
             reference,
-            field,
+            fields,
+            full_text,
             backend,
             options: options(inputs[4])?,
         })
@@ -101,19 +122,28 @@ fn bind(build: bool, inputs: &[&ValueRef]) -> VortexResult<Request> {
         };
         let reference = PathBuf::from(string(inputs[0])?);
         let (descriptor, identity) = read_reference(&reference)?;
-        let ExtractedValue::List(values) = inputs[1].extract() else {
-            vortex_bail!("Index search requires a non-NULL Float32 query list");
+        let query = if full_text {
+            let text = string(inputs[1])?;
+            if text.trim().is_empty() || text.len() > MAX_OPTIONS_BYTES {
+                vortex_bail!("FTS query must contain 1..65536 bytes");
+            }
+            Query::Text(text)
+        } else {
+            let ExtractedValue::List(values) = inputs[1].extract() else {
+                vortex_bail!("Index search requires a non-NULL Float32 query list");
+            };
+            if values.is_empty() || values.len() > 4096 {
+                vortex_bail!("Index query dimension must be between 1 and 4096");
+            }
+            let vector = values
+                .iter()
+                .map(|value| match value.extract() {
+                    ExtractedValue::Float(value) if value.is_finite() => Ok(value),
+                    _ => vortex_bail!("Index query requires finite, non-NULL Float32 elements"),
+                })
+                .collect::<VortexResult<Vec<_>>>()?;
+            Query::Vector(vector)
         };
-        if values.is_empty() || values.len() > 4096 {
-            vortex_bail!("Index query dimension must be between 1 and 4096");
-        }
-        let query = values
-            .iter()
-            .map(|value| match value.extract() {
-                ExtractedValue::Float(value) if value.is_finite() => Ok(value),
-                _ => vortex_bail!("Index query requires finite, non-NULL Float32 elements"),
-            })
-            .collect::<VortexResult<Vec<_>>>()?;
         let ExtractedValue::BigInt(k) = inputs[2].extract() else {
             vortex_bail!("Index k requires a non-NULL integer");
         };
@@ -272,6 +302,7 @@ unsafe extern "C-unwind" fn vortex_index_pins_inherit(
 #[unsafe(no_mangle)]
 unsafe extern "C-unwind" fn vortex_index_bind(
     build: bool,
+    full_text: bool,
     inputs: *const cpp::duckdb_value,
     count: usize,
     result_type: *mut cpp::duckdb_logical_type,
@@ -284,7 +315,7 @@ unsafe extern "C-unwind" fn vortex_index_bind(
         .map(|value| unsafe { Value::borrow(*value) })
         .collect::<Vec<_>>();
     try_or_null(error, || {
-        let request = bind(build, &inputs)?;
+        let request = bind(build, full_text, &inputs)?;
         let logical_type = LogicalType::try_from(request.result_dtype()?)?;
         unsafe { result_type.write(logical_type.into_ptr()) };
         Ok(Box::into_raw(Box::new(request)).cast())

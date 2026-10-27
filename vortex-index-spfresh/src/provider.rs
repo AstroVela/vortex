@@ -249,8 +249,8 @@ impl SpFreshIndex {
         if filter.snapshot() != &self.metadata.snapshot {
             vortex_bail!("SPFresh filter snapshot mismatch");
         }
-        if filter.is_restricted() || options.mode != SearchMode::Approximate {
-            vortex_bail!("SPFresh supports only unfiltered approximate search");
+        if options.mode != SearchMode::Approximate {
+            vortex_bail!("SPFresh supports only approximate search");
         }
         if options.k.get() > 4096 {
             vortex_bail!("SPFresh k exceeds 4096");
@@ -303,14 +303,32 @@ impl SpFreshIndex {
         queries: &[f32],
         k: u32,
         options: QueryOptions,
+        filter: &RowFilter,
     ) -> VortexResult<Vec<Vec<SearchHit>>> {
+        // Convert once per batch, using the validated native-ID -> row dictionary.
+        let allowed = filter.is_restricted().then(|| {
+            let mut mask = vec![0u8; self.rows.len().div_ceil(8)];
+            for (id, row) in self.rows.iter().enumerate() {
+                if filter.includes(*row) {
+                    mask[id / 8] |= 1 << (id % 8);
+                }
+            }
+            mask
+        });
+        if allowed
+            .as_ref()
+            .is_some_and(|mask| mask.iter().all(|byte| *byte == 0))
+        {
+            return Ok(vec![Vec::new(); queries.len() / self.spec.dimension.get()]);
+        }
         self.native
-            .search(
+            .search_filtered(
                 queries,
                 k,
                 options.max_check,
                 options.internal_results,
                 options.search_pages,
+                allowed.as_deref(),
             )?
             .into_iter()
             .map(|hits| {
@@ -320,6 +338,9 @@ impl SpFreshIndex {
                         .rows
                         .get(id as usize)
                         .ok_or_else(|| vortex_err!("SPFresh ID outside mapping"))?;
+                    if !filter.includes(*row) {
+                        vortex_bail!("SPFresh returned a row outside the filter");
+                    }
                     unique
                         .entry(*row)
                         .and_modify(|best| *best = best.min(distance))
@@ -358,7 +379,7 @@ impl VectorIndex for SpFreshIndex {
         false
     }
     fn supports_filter(&self) -> bool {
-        false
+        true
     }
 
     async fn search(
@@ -369,7 +390,7 @@ impl VectorIndex for SpFreshIndex {
     ) -> VortexResult<Vec<SearchHit>> {
         let (k, native_options) = self.options(options, filter)?;
         self.validate_query(query)?;
-        self.run(query, k, native_options)?
+        self.run(query, k, native_options, filter)?
             .pop()
             .ok_or_else(|| vortex_err!("Missing SPFresh result"))
     }
@@ -394,6 +415,6 @@ impl VectorIndex for SpFreshIndex {
             .iter()
             .flat_map(|query| query.iter().copied())
             .collect::<Vec<_>>();
-        self.run(&flat, k, native_options)
+        self.run(&flat, k, native_options, filter)
     }
 }

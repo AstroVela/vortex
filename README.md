@@ -54,6 +54,7 @@ It is the fastest and most extensible format for building data systems backed by
 - **Cascading Compression** - Support for nested encoding schemes
 - **High-Performance Computing** - Optimized compute kernels for encoded data
 - **Rich Statistics** - Lazy-loaded summary statistics for optimization
+- **Full-Text Search** - [Tantivy sidecar indexes](vortex-fts/README.md) for immutable local files, with a standalone Rust API and CLI
 
 ### Technical Architecture
 
@@ -72,7 +73,7 @@ Vortex strictly separates logical and physical concerns:
 
 #### Rust Crate
 
-All features are exported through the main `vortex` crate.
+Core file and array features are exported through the main `vortex` crate.
 
 ```bash
 cargo add vortex

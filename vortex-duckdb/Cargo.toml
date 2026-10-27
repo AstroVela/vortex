@@ -60,6 +60,7 @@ opendal = ["vortex/opendal"]
 index = ["dep:bytes", "dep:rustix", "dep:serde", "dep:serde_json", "dep:tempfile", "dep:vortex-index"]
 
 [dev-dependencies]
+vortex-fts = { workspace = true }
 async-fs = { workspace = true }
 anyhow = { workspace = true }
 divan = { workspace = true }

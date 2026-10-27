@@ -36,7 +36,7 @@ unsafe extern "C" {
         handle: *mut *mut c_void,
         error: *mut c_char,
     ) -> i32;
-    fn vortex_spfresh_search(
+    fn vortex_spfresh_search_filtered(
         handle: *mut c_void,
         queries: *const f32,
         dimension: u32,
@@ -45,6 +45,8 @@ unsafe extern "C" {
         max_check: u32,
         internal_results: u32,
         search_pages: u32,
+        allowed: *const u8,
+        allowed_bytes: u32,
         ids: *mut i32,
         distances: *mut f32,
         error: *mut c_char,
@@ -136,6 +138,7 @@ impl Native {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn search(
         &self,
         queries: &[f32],
@@ -144,6 +147,21 @@ impl Native {
         internal_results: u32,
         search_pages: u32,
     ) -> VortexResult<Vec<Vec<(u32, f32)>>> {
+        self.search_filtered(queries, k, max_check, internal_results, search_pages, None)
+    }
+
+    pub(crate) fn search_filtered(
+        &self,
+        queries: &[f32],
+        k: u32,
+        max_check: u32,
+        internal_results: u32,
+        search_pages: u32,
+        allowed: Option<&[u8]>,
+    ) -> VortexResult<Vec<Vec<(u32, f32)>>> {
+        if allowed.is_some_and(|mask| mask.len() != (self.bundle.rows as usize).div_ceil(8)) {
+            vortex_bail!("Invalid SPFresh allowed-ID bitmap length");
+        }
         if queries.is_empty()
             || !queries.len().is_multiple_of(self.bundle.dimension as usize)
             || k == 0
@@ -161,8 +179,9 @@ impl Native {
         let mut error = [0u8; 1024];
         // SAFETY: the handle is live, input length is count*dimension, both output
         // arrays have count*k elements, and the error buffer has exactly 1024 bytes.
+        // The optional mask has ceil(rows/8) bytes and lives until this call returns.
         let code = unsafe {
-            vortex_spfresh_search(
+            vortex_spfresh_search_filtered(
                 self.handle.as_ptr(),
                 queries.as_ptr(),
                 self.bundle.dimension,
@@ -171,6 +190,8 @@ impl Native {
                 max_check,
                 internal_results,
                 search_pages,
+                allowed.map_or(std::ptr::null(), |mask| mask.as_ptr()),
+                allowed.map_or(0, |_| self.bundle.rows.div_ceil(8)),
                 ids.as_mut_ptr(),
                 distances.as_mut_ptr(),
                 error.as_mut_ptr().cast(),

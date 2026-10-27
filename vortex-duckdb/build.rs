@@ -703,6 +703,7 @@ fn main() {
             "cargo:info=Using DuckDB source from DUCKDB_SOURCE_DIR={}",
             source_dir.display()
         );
+        println!("cargo:include_dir={}", duckdb_include_dir.display());
         bindgen_c2rust(&crate_dir, &duckdb_include_dir);
         cbindgen_rust2c(&crate_dir);
         compile_cpp(&duckdb_include_dir);
@@ -809,6 +810,7 @@ fn main() {
     println!("cargo:lib_dir={library_dir_str}");
 
     let duckdb_include_dir = inner_dir.join("src").join("include");
+    println!("cargo:include_dir={}", duckdb_include_dir.display());
     bindgen_c2rust(&crate_dir, &duckdb_include_dir);
     cbindgen_rust2c(&crate_dir);
     compile_cpp(&duckdb_include_dir);

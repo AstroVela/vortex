@@ -161,7 +161,8 @@ enum Request {
     Build {
         files: Vec<String>,
         reference: PathBuf,
-        field: String,
+        fields: Vec<String>,
+        full_text: bool,
         backend: String,
         options: Bytes,
     },
@@ -171,10 +172,25 @@ enum Request {
         descriptor: Box<Reference>,
         cache: Weak<PreparedIndexCache>,
         validation_mode: ValidationMode,
-        query: Vec<f32>,
+        query: Query,
         k: NonZeroUsize,
         options: Bytes,
     },
+}
+
+#[derive(Clone)]
+enum Query {
+    Vector(Vec<f32>),
+    Text(String),
+}
+
+impl Query {
+    fn score_name(&self) -> &'static str {
+        match self {
+            Self::Vector(_) => "distance",
+            Self::Text(_) => "score",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -199,7 +215,9 @@ impl Request {
                 ]),
                 Nullability::NonNullable,
             )),
-            Self::Search { descriptor, .. } => Ok(DType::Struct(
+            Self::Search {
+                descriptor, query, ..
+            } => Ok(DType::Struct(
                 vortex::dtype::StructFields::from_iter([
                     (
                         "rank",
@@ -214,7 +232,7 @@ impl Request {
                         DType::Primitive(PType::U64, Nullability::NonNullable),
                     ),
                     (
-                        "distance",
+                        query.score_name(),
                         DType::Primitive(PType::F32, Nullability::NonNullable),
                     ),
                     ("row", descriptor.dtype.clone()),
@@ -229,10 +247,21 @@ impl Request {
             Self::Build {
                 files,
                 reference,
-                field,
+                fields,
+                full_text,
                 backend,
                 options,
-            } => build(files, reference, field, backend, options.clone()).await,
+            } => {
+                build(
+                    files,
+                    reference,
+                    fields,
+                    *full_text,
+                    backend,
+                    options.clone(),
+                )
+                .await
+            }
             Self::Search {
                 reference,
                 identity,
@@ -344,7 +373,8 @@ fn read_reference(path: &Path) -> VortexResult<(Reference, String)> {
 async fn build(
     files: &[String],
     reference: &Path,
-    field: &str,
+    indexed_fields: &[String],
+    full_text: bool,
     backend: &str,
     options: Bytes,
 ) -> VortexResult<StructArray> {
@@ -390,10 +420,18 @@ async fn build(
     let DType::Struct(fields, _) = &dtype else {
         vortex_bail!("Index source requires a struct schema");
     };
-    let vector_dtype = fields
-        .field(field)
-        .ok_or_else(|| vortex_err!("Index vector field does not exist: {field}"))?;
-    validate_vector_dtype(&vector_dtype)?;
+    for field in indexed_fields {
+        let dtype = fields
+            .field(field)
+            .ok_or_else(|| vortex_err!("Index field does not exist: {field}"))?;
+        if full_text {
+            if !matches!(dtype, DType::Utf8(_)) {
+                vortex_bail!("Full-text fields must be UTF-8: {field}");
+            }
+        } else {
+            validate_vector_dtype(&dtype)?;
+        }
+    }
     let snapshot = Snapshot {
         dataset_id: reference.to_string_lossy().into_owned(),
         version: file_version(
@@ -411,10 +449,14 @@ async fn build(
         )
         .await?,
     );
-    let build_source = Arc::new(BuildSource {
-        source: Arc::clone(&source),
-        field: field.into(),
-    });
+    let build_source: Arc<dyn IndexSource> = if full_text {
+        Arc::clone(&source) as Arc<dyn IndexSource>
+    } else {
+        Arc::new(BuildSource {
+            source: Arc::clone(&source),
+            field: indexed_fields[0].clone(),
+        })
+    };
     let generation = format!(
         "generation-{}",
         scratch
@@ -426,12 +468,12 @@ async fn build(
     let store = Arc::new(LocalIndexStore::create(root, &generation, STORE_LIMITS)?);
     let expected = IndexMetadata {
         format_version: 1,
-        name: field.into(),
+        name: indexed_fields.join(","),
         generation: generation.clone(),
         backend: backend.into(),
         backend_version: 1,
         snapshot: snapshot.clone(),
-        fields: vec![field.into()],
+        fields: indexed_fields.to_vec(),
         covered_files: snapshot.files.iter().map(|file| file.id).collect(),
         artifacts: vec![],
     };
@@ -458,7 +500,11 @@ async fn build(
     let handle = registry
         .open(&reopened_metadata, &snapshot, Arc::new(reopened))
         .await?;
-    if handle
+    if full_text {
+        if handle.as_full_text().is_none() {
+            vortex_bail!("Index has no full-text capability");
+        }
+    } else if handle
         .as_vector()
         .is_none_or(|vector| vector.spec().metric != DistanceMetric::SquaredL2)
     {
@@ -515,7 +561,7 @@ async fn search(
     key: &CacheKey,
     descriptor: &Reference,
     cache: Option<&PreparedIndexCache>,
-    query: &[f32],
+    query: &Query,
     k: NonZeroUsize,
     options: Bytes,
     timing: &mut SearchTiming,
@@ -553,8 +599,8 @@ async fn search(
             STORE_LIMITS,
         )?;
         let metadata = pending.metadata();
-        if metadata.uncovered_files().next().is_some() || metadata.fields.len() != 1 {
-            vortex_bail!("SQL static search requires full file coverage and one vector field");
+        if metadata.uncovered_files().next().is_some() {
+            vortex_bail!("SQL static search requires full file coverage");
         }
         timing.mark(Phase::SourceValidation);
         let pinned_source = snapshot_cache.map(|_| Arc::clone(&source));
@@ -564,47 +610,72 @@ async fn search(
     };
     let metadata = opened.index.metadata();
     timing.provider_cache_hit(cache_hit);
-    let vector = opened
-        .index
-        .as_vector()
-        .ok_or_else(|| vortex_err!("Index has no vector capability"))?;
-    if vector.spec().metric != DistanceMetric::SquaredL2 {
-        vortex_bail!("SQL static search supports squared L2 only");
-    }
     let filter = RowFilter::try_new(source.snapshot().clone(), None, BTreeSet::new())?;
     timing.mark(Phase::ProviderOpen);
-    let hits = vector
-        .search(
-            query,
-            &VectorSearchOptions {
-                k,
-                mode: SearchMode::Approximate,
-                backend_options: options,
-            },
-            &filter,
-        )
-        .await?;
+    let (rows, scores) = match query {
+        Query::Vector(query) => {
+            let vector = opened
+                .index
+                .as_vector()
+                .ok_or_else(|| vortex_err!("Index has no vector capability"))?;
+            if vector.spec().metric != DistanceMetric::SquaredL2 || metadata.fields.len() != 1 {
+                vortex_bail!("SQL static search supports one squared L2 vector field only");
+            }
+            let hits = vector
+                .search(
+                    query,
+                    &VectorSearchOptions {
+                        k,
+                        mode: SearchMode::Approximate,
+                        backend_options: options,
+                    },
+                    &filter,
+                )
+                .await?;
+            if hits.windows(2).any(|p| {
+                p[0].distance
+                    .total_cmp(&p[1].distance)
+                    .then_with(|| p[0].row.cmp(&p[1].row))
+                    .is_gt()
+            }) {
+                vortex_bail!("Index returned unordered vector hits");
+            }
+            (
+                hits.iter().map(|h| h.row).collect::<Vec<_>>(),
+                hits.iter().map(|h| h.distance).collect::<Vec<_>>(),
+            )
+        }
+        Query::Text(query) => {
+            let index = opened
+                .index
+                .as_full_text()
+                .ok_or_else(|| vortex_err!("Index has no full-text capability"))?;
+            let hits = index.search_text(query, k, &options, &filter).await?;
+            if hits.windows(2).any(|p| {
+                p[1].score
+                    .total_cmp(&p[0].score)
+                    .then_with(|| p[0].row.cmp(&p[1].row))
+                    .is_gt()
+            }) {
+                vortex_bail!("Index returned unordered full-text hits");
+            }
+            (
+                hits.iter().map(|h| h.row).collect::<Vec<_>>(),
+                hits.iter().map(|h| h.score).collect::<Vec<_>>(),
+            )
+        }
+    };
     timing.mark(Phase::NativeSearch);
-    if hits.len() > k.get() {
+    if rows.len() > k.get() {
         vortex_bail!("Index returned more than k hits");
     }
     let mut seen = BTreeSet::new();
-    for hit in &hits {
-        source.snapshot().validate_row(hit.row)?;
-        if !hit.distance.is_finite() || !metadata.covers(hit.row.file_id) || !seen.insert(hit.row) {
-            vortex_bail!("Index returned invalid vector hits");
+    for (row, score) in rows.iter().zip(&scores) {
+        source.snapshot().validate_row(*row)?;
+        if !score.is_finite() || !metadata.covers(row.file_id) || !seen.insert(*row) {
+            vortex_bail!("Index returned invalid hits");
         }
     }
-    if hits.windows(2).any(|pair| {
-        pair[0]
-            .distance
-            .total_cmp(&pair[1].distance)
-            .then_with(|| pair[0].row.cmp(&pair[1].row))
-            .is_gt()
-    }) {
-        vortex_bail!("Index returned unordered vector hits");
-    }
-    let rows = hits.iter().map(|hit| hit.row).collect::<Vec<_>>();
     let fields = descriptor
         .dtype
         .as_struct_fields()
@@ -621,19 +692,19 @@ async fn search(
     StructArray::try_from_iter([
         (
             "rank",
-            PrimitiveArray::from_iter((1..=hits.len()).map(|rank| rank as u64)).into_array(),
+            PrimitiveArray::from_iter((1..=rows.len()).map(|rank| rank as u64)).into_array(),
         ),
         (
             "file_id",
-            PrimitiveArray::from_iter(hits.iter().map(|hit| hit.row.file_id)).into_array(),
+            PrimitiveArray::from_iter(rows.iter().map(|row| row.file_id)).into_array(),
         ),
         (
             "row_offset",
-            PrimitiveArray::from_iter(hits.iter().map(|hit| hit.row.row_offset)).into_array(),
+            PrimitiveArray::from_iter(rows.iter().map(|row| row.row_offset)).into_array(),
         ),
         (
-            "distance",
-            PrimitiveArray::from_iter(hits.iter().map(|hit| hit.distance)).into_array(),
+            query.score_name(),
+            PrimitiveArray::from_iter(scores).into_array(),
         ),
         ("row", taken.data),
     ])
