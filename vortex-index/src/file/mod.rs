@@ -53,6 +53,7 @@ use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 use vortex_file::OpenOptionsSessionExt;
 use vortex_file::VortexFile;
+use vortex_file::VortexOpenOptions;
 use vortex_io::session::RuntimeSessionExt;
 use vortex_scan::strict_sorted_buffer::StrictSortedBuffer;
 use vortex_session::VortexSession;
@@ -61,6 +62,7 @@ use crate::IndexSource;
 use crate::RowAddress;
 use crate::Snapshot;
 use crate::SourceBatch;
+use crate::SourceFile;
 use crate::checksum::sha256;
 
 /// SHA-256 identity of the complete encoded file, including footer and metadata.
@@ -76,6 +78,86 @@ pub fn file_version(bytes: &[u8]) -> String {
 pub fn schema_fingerprint(dtype: &DType) -> VortexResult<String> {
     let json = serde_json::to_vec(dtype).map_err(|err| vortex_err!("{}", err))?;
     Ok(format!("vortex-dtype-json-v1:{}", file_version(&json)))
+}
+
+/// An owned file bound to its verified content identity and physical row count.
+///
+/// The immutable reader and identity are private so assembly can reuse the open
+/// file without accepting an unchecked reader or trusting a caller's digest.
+pub struct VerifiedFile {
+    entry: SourceFile,
+    file: VortexFile,
+    pinned_bytes: usize,
+}
+
+impl VerifiedFile {
+    /// Verify and open encoded bytes once, without accessing the source URI.
+    ///
+    /// The expected entry must use an absolute URI and lowercase SHA-256 identity.
+    /// The file must embed its dtype. The byte budget excludes decoded data and
+    /// reader allocations. This object retains the bytes until it is dropped or
+    /// transferred into [`LocalFileSource::from_verified`].
+    pub fn from_buffer(
+        entry: SourceFile,
+        bytes: ByteBuffer,
+        max_pinned_bytes: usize,
+        session: VortexSession,
+    ) -> VortexResult<Self> {
+        Self::open(entry, bytes, max_pinned_bytes, session.open_options())
+    }
+
+    fn open(
+        entry: SourceFile,
+        bytes: ByteBuffer,
+        max_pinned_bytes: usize,
+        options: VortexOpenOptions,
+    ) -> VortexResult<Self> {
+        validate_file(&entry)?;
+        if bytes.len() > max_pinned_bytes {
+            vortex_bail!("Source {} exceeds the pinned byte budget", entry.id);
+        }
+        if file_version(&bytes) != entry.version {
+            vortex_bail!("Source file {} content version mismatch", entry.id);
+        }
+        let pinned_bytes = bytes.len();
+        let file = options.open_buffer(bytes)?;
+        if file.row_count() != entry.row_count {
+            vortex_bail!("Source file {} schema or row count mismatch", entry.id);
+        }
+        Ok(Self {
+            entry,
+            file,
+            pinned_bytes,
+        })
+    }
+
+    /// Logical dtype of the already opened file.
+    pub fn dtype(&self) -> &DType {
+        self.file.dtype()
+    }
+
+    /// Encoded bytes retained by this file, excluding decoded data and metadata.
+    pub fn pinned_bytes(&self) -> usize {
+        self.pinned_bytes
+    }
+}
+
+fn validate_file(file: &SourceFile) -> VortexResult<()> {
+    if !Path::new(&file.uri).is_absolute() {
+        vortex_bail!("Local file source requires an absolute path: {}", file.uri);
+    }
+    if !file.version.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) {
+        vortex_bail!(
+            "Local file source requires a lowercase SHA-256 version: {}",
+            file.id
+        );
+    }
+    Ok(())
 }
 
 /// A fixed collection of content-verified local Vortex files without tombstones.
@@ -168,20 +250,7 @@ impl LocalFileSource {
             vortex_bail!("Local file source schema fingerprint does not match its dtype");
         }
         for file in &snapshot.files {
-            if !Path::new(&file.uri).is_absolute() {
-                vortex_bail!("Local file source requires an absolute path: {}", file.uri);
-            }
-            if !file.version.strip_prefix("sha256:").is_some_and(|digest| {
-                digest.len() == 64
-                    && digest
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            }) {
-                vortex_bail!(
-                    "Local file source requires a lowercase SHA-256 version: {}",
-                    file.id
-                );
-            }
+            validate_file(file)?;
         }
 
         Ok(())
@@ -211,21 +280,60 @@ impl LocalFileSource {
             let bytes = buffers
                 .remove(&entry.id)
                 .ok_or_else(|| vortex_err!("Missing source buffer: {}", entry.id))?;
-            if bytes.len() > remaining {
+            let file = VerifiedFile::open(
+                entry.clone(),
+                bytes,
+                remaining,
+                session.open_options().with_fallback_dtype(dtype.clone()),
+            )?;
+            remaining -= file.pinned_bytes;
+            files.insert(entry.id, file);
+        }
+        Self::assemble(snapshot, dtype, files, max_pinned_bytes)
+    }
+
+    /// Bind already verified files to an exact snapshot without rehashing or reopening.
+    ///
+    /// All keys and complete file identities must match the snapshot. The supplied
+    /// dtype and its fingerprint must match every file, and the aggregate encoded
+    /// byte budget is checked again. Ownership is consumed; subsequent scans and
+    /// takes use the same immutable readers verified by [`VerifiedFile`].
+    pub fn from_verified(
+        snapshot: Snapshot,
+        dtype: DType,
+        files: BTreeMap<u64, VerifiedFile>,
+        max_pinned_bytes: usize,
+    ) -> VortexResult<Self> {
+        Self::validate(&snapshot, &dtype)?;
+        Self::assemble(snapshot, dtype, files, max_pinned_bytes)
+    }
+
+    fn assemble(
+        snapshot: Snapshot,
+        dtype: DType,
+        mut verified: BTreeMap<u64, VerifiedFile>,
+        max_pinned_bytes: usize,
+    ) -> VortexResult<Self> {
+        if verified.len() != snapshot.files.len() {
+            vortex_bail!("Verified file inventory must match every snapshot file");
+        }
+        let mut remaining = max_pinned_bytes;
+        let mut files = BTreeMap::new();
+        for entry in &snapshot.files {
+            let file = verified
+                .remove(&entry.id)
+                .ok_or_else(|| vortex_err!("Missing verified source file: {}", entry.id))?;
+            if &file.entry != entry {
+                vortex_bail!("Verified source file {} identity mismatch", entry.id);
+            }
+            if file.pinned_bytes > remaining {
                 vortex_bail!("Source {} exceeds the pinned byte budget", entry.id);
             }
-            remaining -= bytes.len();
-            if file_version(&bytes) != entry.version {
-                vortex_bail!("Source file {} content version mismatch", entry.id);
-            }
-            let opened = session
-                .open_options()
-                .with_fallback_dtype(dtype.clone())
-                .open_buffer(bytes)?;
-            if opened.dtype() != &dtype || opened.row_count() != entry.row_count {
+            if file.dtype() != &dtype {
                 vortex_bail!("Source file {} schema or row count mismatch", entry.id);
             }
-            files.insert(entry.id, opened);
+            remaining -= file.pinned_bytes;
+            files.insert(entry.id, file.file);
         }
         Ok(Self {
             snapshot: Arc::new(snapshot),
