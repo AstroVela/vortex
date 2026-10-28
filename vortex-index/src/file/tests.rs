@@ -207,6 +207,8 @@ impl Fixture {
 #[cfg(all(unix, feature = "local-store"))]
 mod persistence;
 
+mod buffers;
+
 fn assert_error<T>(result: VortexResult<T>, message: &str) -> VortexResult<()> {
     let err = result
         .err()
