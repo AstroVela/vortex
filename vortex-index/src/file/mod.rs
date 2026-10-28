@@ -110,38 +110,13 @@ impl LocalFileSource {
         max_pinned_bytes: usize,
         session: VortexSession,
     ) -> VortexResult<Self> {
-        snapshot.validate()?;
-        let DType::Struct(fields, Nullability::NonNullable) = &dtype else {
-            vortex_bail!("Local file sources require a non-nullable struct dtype");
-        };
-        if fields.names().iter().collect::<BTreeSet<_>>().len() != fields.nfields() {
-            vortex_bail!("Local file sources require unique top-level field names");
-        }
-        if snapshot.schema_fingerprint != schema_fingerprint(&dtype)? {
-            vortex_bail!("Local file source schema fingerprint does not match its dtype");
-        }
-        for file in &snapshot.files {
-            if !Path::new(&file.uri).is_absolute() {
-                vortex_bail!("Local file source requires an absolute path: {}", file.uri);
-            }
-            if !file.version.strip_prefix("sha256:").is_some_and(|digest| {
-                digest.len() == 64
-                    && digest
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            }) {
-                vortex_bail!(
-                    "Local file source requires a lowercase SHA-256 version: {}",
-                    file.id
-                );
-            }
-        }
+        Self::validate(&snapshot, &dtype)?;
 
         session
             .handle()
             .spawn_blocking(move || {
                 let mut remaining = max_pinned_bytes;
-                let mut files = BTreeMap::new();
+                let mut buffers = BTreeMap::new();
                 for entry in &snapshot.files {
                     // Inspect the opened descriptor, but do not wait for a FIFO writer.
                     #[cfg(unix)]
@@ -174,26 +149,90 @@ impl LocalFileSource {
                         vortex_bail!("Source {} exceeds the pinned byte budget", entry.id);
                     }
                     remaining -= bytes.len();
-                    if file_version(&bytes) != entry.version {
-                        vortex_bail!("Source file {} content version mismatch", entry.id);
-                    }
-                    let opened = session
-                        .open_options()
-                        .with_fallback_dtype(dtype.clone())
-                        .open_buffer(ByteBuffer::from(bytes))?;
-                    if opened.dtype() != &dtype || opened.row_count() != entry.row_count {
-                        vortex_bail!("Source file {} schema or row count mismatch", entry.id);
-                    }
-                    files.insert(entry.id, opened);
+                    buffers.insert(entry.id, ByteBuffer::from(bytes));
                 }
-                Ok(Self {
-                    snapshot: Arc::new(snapshot),
-                    dtype,
-                    files,
-                    pinned_bytes: max_pinned_bytes - remaining,
-                })
+                Self::from_buffers(snapshot, dtype, buffers, max_pinned_bytes, session)
             })
             .await
+    }
+
+    fn validate(snapshot: &Snapshot, dtype: &DType) -> VortexResult<()> {
+        snapshot.validate()?;
+        let DType::Struct(fields, Nullability::NonNullable) = dtype else {
+            vortex_bail!("Local file sources require a non-nullable struct dtype");
+        };
+        if fields.names().iter().collect::<BTreeSet<_>>().len() != fields.nfields() {
+            vortex_bail!("Local file sources require unique top-level field names");
+        }
+        if snapshot.schema_fingerprint != schema_fingerprint(dtype)? {
+            vortex_bail!("Local file source schema fingerprint does not match its dtype");
+        }
+        for file in &snapshot.files {
+            if !Path::new(&file.uri).is_absolute() {
+                vortex_bail!("Local file source requires an absolute path: {}", file.uri);
+            }
+            if !file.version.strip_prefix("sha256:").is_some_and(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            }) {
+                vortex_bail!(
+                    "Local file source requires a lowercase SHA-256 version: {}",
+                    file.id
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Open an exact inventory of owned encoded buffers without filesystem access.
+    ///
+    /// Keys must match the complete snapshot inventory. URI strings retain the
+    /// caller's physical identities; they are never opened or used as a fallback.
+    /// Contents, schema, row counts and the aggregate byte budget are verified
+    /// through the same contract as [`Self::open`]. Immutable buffers are retained
+    /// by the source and may be released by the caller after this function returns.
+    pub fn from_buffers(
+        snapshot: Snapshot,
+        dtype: DType,
+        mut buffers: BTreeMap<u64, ByteBuffer>,
+        max_pinned_bytes: usize,
+        session: VortexSession,
+    ) -> VortexResult<Self> {
+        Self::validate(&snapshot, &dtype)?;
+        if buffers.len() != snapshot.files.len() {
+            vortex_bail!("Source buffer inventory must match every snapshot file");
+        }
+        let mut remaining = max_pinned_bytes;
+        let mut files = BTreeMap::new();
+        for entry in &snapshot.files {
+            let bytes = buffers
+                .remove(&entry.id)
+                .ok_or_else(|| vortex_err!("Missing source buffer: {}", entry.id))?;
+            if bytes.len() > remaining {
+                vortex_bail!("Source {} exceeds the pinned byte budget", entry.id);
+            }
+            remaining -= bytes.len();
+            if file_version(&bytes) != entry.version {
+                vortex_bail!("Source file {} content version mismatch", entry.id);
+            }
+            let opened = session
+                .open_options()
+                .with_fallback_dtype(dtype.clone())
+                .open_buffer(bytes)?;
+            if opened.dtype() != &dtype || opened.row_count() != entry.row_count {
+                vortex_bail!("Source file {} schema or row count mismatch", entry.id);
+            }
+            files.insert(entry.id, opened);
+        }
+        Ok(Self {
+            snapshot: Arc::new(snapshot),
+            dtype,
+            files,
+            pinned_bytes: max_pinned_bytes - remaining,
+        })
     }
 
     /// The verified, unprojected dtype shared by all files.
