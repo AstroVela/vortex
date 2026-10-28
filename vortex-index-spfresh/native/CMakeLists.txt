@@ -45,6 +45,11 @@ target_compile_definitions(spfresh_benchmark PRIVATE VORTEX_SPFRESH_BENCHMARK)
 target_link_libraries(spfresh_benchmark PRIVATE spfresh_core)
 
 enable_testing()
+add_executable(spfresh_logging_tests logging_tests.cpp)
+target_link_libraries(spfresh_logging_tests PRIVATE spfresh_core)
+add_test(NAME spfresh_logging_tests COMMAND "${CMAKE_COMMAND}"
+    "-DPROGRAM=$<TARGET_FILE:spfresh_logging_tests>"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/logging_test.cmake")
 add_executable(spfresh_native_tests tests.cpp)
 target_link_libraries(spfresh_native_tests PRIVATE spfresh_core)
 add_test(NAME spfresh_native_tests COMMAND spfresh_native_tests)
