@@ -16,8 +16,9 @@ cargo test -p vortex-index-hnswlib --features native
 
 AVX2, FMA and F16C are required and checked before entering native code. This
 initial implementation does not provide CPU dispatch or portable native files.
-The upstream Apache-2.0 headers are compiled from the external checkout,
-not copied or patched here.
+The upstream Apache-2.0 headers are compiled from the external checkout.
+The repository-maintained `native/hnswlib/payload_graph.h` adds attribute-block
+construction and filtered search without changing the upstream serialization.
 
 ## Contract
 
@@ -25,7 +26,9 @@ not copied or patched here.
 - Initial construction explicitly attaches `HnswIndexBuilder` to the provider;
   sealing and reference publication remain the owner's responsibility.
 - Required build JSON: `{"format_version":1,"dimension":128,"m":32,
-  "ef_construction":200,"seed":100,"threads":1}`. Only `threads=1` is accepted
+  "ef_construction":200,"seed":100,"threads":1,"payload_m":0,
+  "payload_fields":{},"payload_min_rows":2,"payload_target_rows":4096}`.
+  Only `threads=1` is accepted
   because upstream parallel insertion races on its random number generator.
   Independent indexes can still be built concurrently.
   Construction buffers vectors and owns a native graph;
@@ -33,10 +36,14 @@ not copied or patched here.
 - Optional query JSON: `{"ef":136}`. Empty options use `max(k,64)`, which is not
   a dataset-independent recall guarantee. `ef >= k`, `k <= 4096`, finite values,
   matching snapshots and all configured resource limits are enforced.
-- Exact search, visibility restrictions, unknown parameters, deletes,
-  incremental writes and unsupported metrics are rejected, not silently ignored.
-- Bundles bind the complete physical row mapping, source snapshot, coverage,
-  upstream revision and graph shape. Opening verifies a private artifact lease
+- Filtered approximate search honors allow-lists and mandatory exclusions;
+  batches reuse one label bitmap. Exact search, unknown parameters, native deletes,
+  incremental writes and unsupported metrics are rejected.
+- Bundles bind the complete physical row mapping, source snapshot,
+  coverage, upstream revision, graph shape and payload CSR through content digests.
+  The experimental bundle and build formats are extended in place and remain
+  version 1. All four artifacts are mandatory, including an empty
+  payload file for payload_m=0. Opening verifies a private artifact lease
   and validates the pinned native file structure before deserialization.
 - Queries synchronize ef changes and search on the same native handle; different
   generations do not share a global query lock. Per-handle distance dispatch uses
@@ -74,3 +81,30 @@ because upstream insertion acquires its private graph locks in different orders
 even on the serial control. If TSan exits with `unexpected memory mapping`, run
 the test with `setarch x86_64 -R` where supported to disable ASLR for that process.
 No system-wide kernel changes or race suppressions are needed.
+
+## Building attribute links
+
+Build and open a Tantivy attribute index for the same snapshot, then attach it
+with `HnswIndexBuilder::with_attributes(index)`. Set `payload_m` to 1..=64 and
+choose fields with `payload_fields`, for example:
+
+```json
+{"category":"equality","price":"numeric_range"}
+```
+
+Each equality group or overlapping numeric window builds a single-level graph
+using the base vectors. The merged CSR links participate in filtered level-zero
+search; rejected nodes can navigate but cannot enter results. Fields are
+independent, with no graph per predicate combination. `payload_m` controls degree
+per block; separate edge, degree, block and membership budgets bound combined
+work. Oversized blocks or mismatched snapshots fail construction.
+
+Defaults allow 32M supplementary directed edges, degree 256, 100K rows per block,
+8M postings/memberships and 65,536 terms/blocks. These are object/work bounds,
+not process RSS quotas. Complete block plans are currently buffered in memory.
+There is no ACORN expansion or automatic exact-scan fallback.
+
+See [the design and roadmap](DESIGN.md), the [native extension notes](native/hnswlib/README.md),
+and the [synthetic benchmark](native/benchmarks/README.md). The benchmark compares
+upstream callback filtering and payload filtering at the same ef; production
+recall/latency qualification still requires representative application data.

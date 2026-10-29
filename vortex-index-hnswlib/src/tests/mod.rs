@@ -22,7 +22,7 @@ fn metadata(count: u64) -> IndexMetadata {
         name: "embedding".into(),
         generation: "generation-1".into(),
         backend: HNSWLIB_ID.into(),
-        backend_version: 1,
+        backend_version: crate::HNSWLIB_FORMAT_VERSION,
         fields: vec!["embedding".into()],
         covered_files: vec![11, 29],
         artifacts: Vec::new(),

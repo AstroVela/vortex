@@ -104,6 +104,17 @@ impl RowFilter {
         self.allow.as_ref().is_none_or(|allow| allow.contains(&row)) && !self.exclude.contains(&row)
     }
 
+    /// Explicit allow-list, or `None` for all physical rows. Exclusions still win.
+    /// Backends can translate sparse lists without testing every indexed row.
+    pub fn allowed_rows(&self) -> Option<&BTreeSet<RowAddress>> {
+        self.allow.as_ref()
+    }
+
+    /// Mandatory exclusions, including tombstones, regardless of the allow-list.
+    pub fn excluded_rows(&self) -> &BTreeSet<RowAddress> {
+        &self.exclude
+    }
+
     /// Whether a backend needs filtered-search support for this request.
     pub fn is_restricted(&self) -> bool {
         self.allow.is_some() || !self.exclude.is_empty()

@@ -6,14 +6,16 @@
 
 /// Explicit registry identifier, not an automatically selected default backend.
 pub const HNSWLIB_ID: &str = "hnswlib.static";
-/// Closed descriptor, native-file and physical-row-mapping format version.
+/// Closed descriptor, native-file, physical-row mapping and payload CSR format version.
 pub const HNSWLIB_FORMAT_VERSION: u32 = 1;
-/// Exact upstream revision defining the native serialization and search implementation.
+/// Upstream revision used for the base graph serialization and distance kernels.
 pub const HNSWLIB_REVISION: &str = "d9b3608c83d83b46c96e25088cb1d729b29dcfe9";
 
 mod bundle;
+mod payload;
 pub use bundle::HnswBundle;
 pub use bundle::import_bundle;
+pub use payload::HnswPayload;
 #[cfg(feature = "native")]
 mod builder;
 #[cfg(feature = "native")]

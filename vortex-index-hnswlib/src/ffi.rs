@@ -15,8 +15,10 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 
+use crate::HnswBuildLimits;
 use crate::HnswBuildOptions;
 use crate::HnswBundle;
+use crate::HnswPayload;
 use crate::validate;
 
 unsafe extern "C" {
@@ -44,12 +46,51 @@ unsafe extern "C" {
         query: *const f32,
         k: u32,
         ef: u32,
+        mask: *const u64,
+        mask_words: u64,
         ids: *mut u32,
         distances: *mut f32,
         count: *mut u32,
         error: *mut c_char,
     ) -> i32;
     fn vortex_hnswlib_close(handle: *mut c_void);
+    fn vortex_hnswlib_payload_begin(
+        handle: *mut c_void,
+        m: u32,
+        ef: u32,
+        max_edges: u64,
+        max_degree: u32,
+        max_block_rows: u32,
+        max_memberships: u64,
+        error: *mut c_char,
+    ) -> i32;
+    fn vortex_hnswlib_payload_block(
+        handle: *mut c_void,
+        labels: *const u32,
+        count: u32,
+        error: *mut c_char,
+    ) -> i32;
+    fn vortex_hnswlib_payload_finish(
+        handle: *mut c_void,
+        edges: *mut u64,
+        error: *mut c_char,
+    ) -> i32;
+    fn vortex_hnswlib_payload_export(
+        handle: *mut c_void,
+        offsets: *mut u64,
+        rows: u32,
+        links: *mut u32,
+        edges: u64,
+        error: *mut c_char,
+    ) -> i32;
+    fn vortex_hnswlib_payload_load(
+        handle: *mut c_void,
+        offsets: *const u64,
+        rows: u32,
+        links: *const u32,
+        edges: u64,
+        error: *mut c_char,
+    ) -> i32;
 }
 
 fn supported_cpu() -> VortexResult<()> {
@@ -80,6 +121,7 @@ pub(crate) struct Native {
 }
 
 // SAFETY: each handle's C++ mutex serializes ef changes and synchronous searches.
+// Construction and payload loading require exclusive &mut self before publication.
 // Distance kernels have no shared mutable state. No native operation retains
 // borrowed inputs or has owner-thread affinity.
 unsafe impl Send for Native {}
@@ -146,7 +188,13 @@ impl Native {
         })
     }
 
-    pub(crate) fn search(&self, query: &[f32], k: u32, ef: u32) -> VortexResult<Vec<(u32, f32)>> {
+    pub(crate) fn search(
+        &self,
+        query: &[f32],
+        k: u32,
+        ef: u32,
+        mask: Option<&[u64]>,
+    ) -> VortexResult<Vec<(u32, f32)>> {
         if query.len() != self.bundle.dimension as usize
             || k == 0
             || k > self.bundle.rows
@@ -156,18 +204,29 @@ impl Native {
         {
             vortex_bail!("Invalid hnswlib native query shape or options");
         }
+        if let Some(mask) = mask {
+            if mask.len() != (self.bundle.rows as usize).div_ceil(64) {
+                vortex_bail!("Invalid hnswlib label mask length");
+            }
+            if mask.iter().all(|word| *word == 0) {
+                return Ok(Vec::new());
+            }
+        }
         let mut ids = vec![u32::MAX; k as usize];
         let mut distances = vec![f32::NAN; k as usize];
         let mut count = 0u32;
         let mut error = [0u8; 1024];
         // SAFETY: live owned handle, dimension-sized input and k-sized output
-        // buffers. The C++ mutex serializes this synchronous call and ef mutation.
+        // buffers and an optional validated mask slice, all borrowed only during the call.
+        // The C++ mutex serializes this synchronous call and ef mutation.
         let code = unsafe {
             vortex_hnswlib_search(
                 self.handle.as_ptr(),
                 query.as_ptr(),
                 k,
                 ef,
+                mask.map_or(std::ptr::null(), |mask| mask.as_ptr()),
+                mask.map_or(0, |mask| mask.len() as u64),
                 ids.as_mut_ptr(),
                 distances.as_mut_ptr(),
                 &raw mut count,
@@ -183,12 +242,97 @@ impl Native {
         ids.into_iter()
             .zip(distances)
             .map(|(id, distance)| {
-                if id >= self.bundle.rows || !distance.is_finite() || distance < 0.0 {
+                if id >= self.bundle.rows
+                    || !distance.is_finite()
+                    || distance < 0.0
+                    || mask.is_some_and(|mask| mask[id as usize / 64] & (1u64 << (id % 64)) == 0)
+                {
                     vortex_bail!("Invalid hnswlib native result");
                 }
                 Ok((id, distance))
             })
             .collect()
+    }
+    fn call(&self, operation: impl FnOnce(*mut c_void, *mut c_char) -> i32) -> VortexResult<()> {
+        let mut error = [0u8; 1024];
+        result(
+            operation(self.handle.as_ptr(), error.as_mut_ptr().cast()),
+            &error,
+        )
+    }
+
+    pub(crate) fn begin_payload(
+        &mut self,
+        m: u32,
+        ef: u32,
+        limits: HnswBuildLimits,
+    ) -> VortexResult<()> {
+        // SAFETY: exclusive handle borrow; native catches exceptions and bounds the error write.
+        self.call(|handle, error| unsafe {
+            vortex_hnswlib_payload_begin(
+                handle,
+                m,
+                ef,
+                limits.max_payload_edges,
+                limits.max_payload_degree,
+                limits.max_payload_block_rows,
+                limits.max_payload_memberships,
+                error,
+            )
+        })
+    }
+
+    pub(crate) fn add_payload_block(&mut self, labels: &[u32]) -> VortexResult<()> {
+        let count = u32::try_from(labels.len())?;
+        // SAFETY: exclusive handle and live count-sized label slice; no retained pointers.
+        self.call(|handle, error| unsafe {
+            vortex_hnswlib_payload_block(handle, labels.as_ptr(), count, error)
+        })
+    }
+
+    pub(crate) fn finish_payload(&mut self, max_edges: u64) -> VortexResult<HnswPayload> {
+        let mut edges = 0;
+        // SAFETY: exclusive handle, valid output pointer and bounded error buffer.
+        self.call(|handle, error| unsafe {
+            vortex_hnswlib_payload_finish(handle, &raw mut edges, error)
+        })?;
+        if edges > max_edges {
+            vortex_bail!("Native payload exceeds edge budget");
+        }
+        let mut graph = HnswPayload::empty(self.bundle.rows);
+        graph
+            .links
+            .try_reserve_exact(usize::try_from(edges)?)
+            .map_err(|err| vortex_err!("Payload edge allocation: {err}"))?;
+        graph.links.resize(usize::try_from(edges)?, 0);
+        // SAFETY: buffers have exactly the shape passed to native, which checks it before copying.
+        self.call(|handle, error| unsafe {
+            vortex_hnswlib_payload_export(
+                handle,
+                graph.offsets.as_mut_ptr(),
+                self.bundle.rows,
+                graph.links.as_mut_ptr(),
+                edges,
+                error,
+            )
+        })?;
+        graph.validate(self.bundle.rows)?;
+        Ok(graph)
+    }
+
+    pub(crate) fn load_payload(&mut self, graph: &HnswPayload) -> VortexResult<()> {
+        graph.validate(self.bundle.rows)?;
+        // SAFETY: exclusive handle and validated CSR slices, synchronously copied by native.
+        self.call(|handle, error| unsafe {
+            vortex_hnswlib_payload_load(
+                handle,
+                graph.offsets.as_ptr(),
+                self.bundle.rows,
+                graph.links.as_ptr(),
+                graph.links.len() as u64,
+                error,
+            )
+        })
     }
 }
 

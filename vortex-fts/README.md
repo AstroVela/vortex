@@ -108,3 +108,26 @@ materializes a `BTreeSet<RowAddress>` and costs O(matches) memory; these limits
 are not an overall RSS guarantee. Source adapters must scan all visible rows
 in declared coverage. Publish the Tantivy and vector generations against the
 same immutable snapshot; changing attributes or data requires rebuilding.
+
+## Attribute blocks for filterable HNSW
+
+`AttributeIndex::blocks` enumerates construction blocks directly from the typed
+term dictionaries and posting lists of a sealed generation. Pass an
+`AttributeBlockRequest` specifying covered files, a sorted map of field policies
+(`equality` or `numeric_range`), minimum and target rows, and hard limits for
+block size, term/block count and memberships. Requested files must all be covered
+by the attribute index. The returned `AttributeBlockPlan` binds the full source
+snapshot and request; vector builders must verify that binding before using it.
+
+Equality blocks contain complete posting lists. Numeric windows follow value
+order and advance by approximately half the target row count. Equal values are
+never split, so the target is not a hard size limit. Nulls have no postings;
+booleans, exact strings, signed/unsigned integers and finite floating-point
+values retain their query semantics. Fields are processed independently, without
+constructing graphs for combinations of filters.
+
+Plans are deterministic and bounded, currently materialized in memory. Input
+postings and emitted memberships each obey `max_memberships`; overlapping blocks
+count each repeated membership. Oversized groups, insufficient coverage and
+exhausted budgets return errors instead of truncating data. Construction includes
+physical rows; query-time visibility and tombstones still apply separately.
