@@ -39,6 +39,8 @@ use vortex_index::attributes::AttributePredicate;
 use vortex_index::attributes::AttributeValue;
 use vortex_index::attributes::FloatValue;
 
+mod blocks;
+
 /// Scalar column type indexed by Tantivy, with no implicit query coercion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -34,6 +34,8 @@ use vortex_index::SourceFile;
 use vortex_index::VectorIndex;
 use vortex_index::VectorSearchOptions;
 use vortex_index::VectorSpec;
+use vortex_index::attributes::AttributeBlockKind as Kind;
+use vortex_index::attributes::AttributeBlockRequest;
 use vortex_index::attributes::AttributePredicate as P;
 use vortex_index::attributes::AttributeValue as V;
 use vortex_index::attributes::FloatValue;
@@ -383,6 +385,23 @@ async fn test_partial_coverage_cannot_be_an_ann_allow_list() -> VortexResult<()>
     )
     .await?;
     let visible = all(index.as_ref())?;
+    let request = AttributeBlockRequest {
+        fields: [("category".into(), Kind::Equality)].into(),
+        covered_files: vec![3, 7],
+        min_rows: 2,
+        target_rows: 2,
+        max_block_rows: 10,
+        max_blocks: 10,
+        max_memberships: 100,
+    };
+    assert!(
+        index
+            .as_attributes()
+            .unwrap()
+            .blocks(&request)
+            .await
+            .is_err()
+    );
     assert!(
         index
             .as_attributes()
@@ -478,6 +497,131 @@ async fn test_attribute_only_raw_terms_and_invalid_source_values() -> VortexResu
         build(&dir.path().canonicalize()?, data, config, false)
             .await
             .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_attribute_blocks_are_complete_deterministic_and_bounded() -> VortexResult<()> {
+    let dir = tempfile::tempdir()?;
+    let data = StructArray::from_fields(&[
+        (
+            "category",
+            VarBinViewArray::from_iter_nullable_str([
+                Some("a"),
+                Some("a"),
+                Some("b"),
+                Some("b"),
+                Some("c"),
+                None,
+            ])
+            .into_array(),
+        ),
+        (
+            "signed",
+            buffer![i64::MIN, -5, -5, 0, 1, i64::MAX].into_array(),
+        ),
+        ("unsigned", buffer![0u64, 1, 1, 2, 3, u64::MAX].into_array()),
+        (
+            "price",
+            buffer![-10.0f64, -0.0, 0.0, 1.0, 2.0, 10.0].into_array(),
+        ),
+        (
+            "active",
+            BoolArray::from_iter([true, false, true, false, true, false]).into_array(),
+        ),
+    ])?
+    .into_array();
+    let options = TantivyBuildOptions {
+        text_fields: vec![],
+        attribute_fields: [
+            ("category".into(), T::String),
+            ("signed".into(), T::Int),
+            ("unsigned".into(), T::UInt),
+            ("price".into(), T::Float),
+            ("active".into(), T::Bool),
+        ]
+        .into(),
+    };
+    let index = build(&dir.path().canonicalize()?, data, options, false).await?;
+    let attributes = index
+        .as_attributes()
+        .ok_or_else(|| vortex_err!("No attributes"))?;
+    let request = AttributeBlockRequest {
+        fields: [
+            ("category".into(), Kind::Equality),
+            ("signed".into(), Kind::NumericRange),
+            ("unsigned".into(), Kind::NumericRange),
+            ("price".into(), Kind::NumericRange),
+            ("active".into(), Kind::Equality),
+        ]
+        .into(),
+        covered_files: vec![3, 7],
+        min_rows: 2,
+        target_rows: 4,
+        max_block_rows: 12,
+        max_blocks: 100,
+        max_memberships: 1000,
+    };
+    let plan = attributes.blocks(&request).await?;
+    plan.validate()?;
+    let mut invalid = plan.clone();
+    invalid.blocks.push(invalid.blocks[0].clone());
+    assert!(invalid.validate().is_err());
+    invalid = plan.clone();
+    let duplicate = invalid.blocks[0].rows[0];
+    invalid.blocks[0].rows.push(duplicate);
+    assert!(invalid.validate().is_err());
+    assert_eq!(plan, attributes.blocks(&request).await?);
+    assert_eq!(plan.snapshot, index.metadata().snapshot);
+    assert!(plan.blocks.len() > 10);
+    let visible = all(index.as_ref())?;
+    for block in &plan.blocks {
+        let expected = attributes.filter(&block.predicate, &visible).await?;
+        assert_eq!(
+            &block.rows.iter().copied().collect::<BTreeSet<_>>(),
+            expected
+                .allowed_rows()
+                .ok_or_else(|| vortex_err!("Missing allow-list"))?
+        );
+        assert!(block.rows.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+    // Numeric windows overlap, including complete duplicate-value groups.
+    let signed: Vec<_> = plan
+        .blocks
+        .iter()
+        .filter(|block| matches!(&block.predicate, P::Range(name, _, _) if name == "signed"))
+        .collect();
+    assert!(
+        signed
+            .windows(2)
+            .any(|pair| pair[0].rows.iter().any(|row| pair[1].rows.contains(row)))
+    );
+    let mut limited = request.clone();
+    limited.max_blocks = 1;
+    assert!(attributes.blocks(&limited).await.is_err());
+    limited = request.clone();
+    limited.max_memberships = 12;
+    assert!(attributes.blocks(&limited).await.is_err());
+    limited = request.clone();
+    limited.max_block_rows = 4;
+    assert!(attributes.blocks(&limited).await.is_err());
+    limited = request.clone();
+    limited.fields = [("category".into(), Kind::NumericRange)].into();
+    assert!(attributes.blocks(&limited).await.is_err());
+    limited = request.clone();
+    limited.fields = [("missing".into(), Kind::Equality)].into();
+    assert!(attributes.blocks(&limited).await.is_err());
+    limited = request;
+    limited.covered_files = vec![7];
+    assert!(
+        attributes
+            .blocks(&limited)
+            .await?
+            .blocks
+            .iter()
+            .flat_map(|block| &block.rows)
+            .all(|row| row.file_id == 7)
     );
     Ok(())
 }

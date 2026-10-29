@@ -505,6 +505,16 @@ impl FullTextIndex for Opened {
 
 #[async_trait]
 impl AttributeIndex for Opened {
+    async fn blocks(
+        &self,
+        request: &vortex_index::attributes::AttributeBlockRequest,
+    ) -> VortexResult<vortex_index::attributes::AttributeBlockPlan> {
+        self.attributes
+            .as_ref()
+            .ok_or_else(|| vortex_err!("Generation has no attribute fields"))?
+            .blocks(&self.metadata, &self.reader.searcher(), request)
+    }
+
     async fn filter(
         &self,
         predicate: &AttributePredicate,
