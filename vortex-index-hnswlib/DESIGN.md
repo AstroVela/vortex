@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright the Vortex contributors
+SPDX-License-Identifier: CC-BY-4.0
+-->
+
 # Vortex filterable HNSW：实现设计与 roadmap
 
 更新：2026-10-29。按最新要求直接增强现有 `hnswlib.static`，不实现 ACORN，不保留旧格式兼容分支，不提供自动扫描 fallback。旧 generation 必须重建。
