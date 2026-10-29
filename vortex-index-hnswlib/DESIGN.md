@@ -172,4 +172,4 @@ builder 必须显式 `with_attributes(opened_attribute_index)`。`payload_m=0` �
 
 - [PR #29：原生算法](https://github.com/AstroVela/vortex/pull/29)
 - [PR #30：属性分块](https://github.com/AstroVela/vortex/pull/30)
-- Provider PR 依赖前两项，统一目标为 `feat/vortex-filterable-hnsw`；合入前按实际 base 更新依赖 diff。
+- [PR #31：Provider 与持久化接入](https://github.com/AstroVela/vortex/pull/31)，依赖前两项，统一目标为 `feat/vortex-filterable-hnsw`；合入前按实际 base 更新依赖 diff。
