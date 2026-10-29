@@ -142,6 +142,17 @@ jobs:
           git clone https://github.com/nmslib/hnswlib.git target/hnswlib-source
           git -C target/hnswlib-source checkout --detach d9b3608c83d83b46c96e25088cb1d729b29dcfe9
           echo "VORTEX_HNSWLIB_SOURCE=$PWD/target/hnswlib-source" >> "$GITHUB_ENV"
+      - name: Payload graph invariants and filtered recall (ASan and UBSan)
+        run: |
+          work=$(mktemp -d)
+          c++ -std=c++17 -O2 -mavx2 -mfma -mf16c -pthread -I "$VORTEX_HNSWLIB_SOURCE" \
+            vortex-index-hnswlib/native/tests/payload_graph.cpp -o "$work/payload-simd"
+          "$work/payload-simd"
+          # Upstream SSE prefetch reads one neighbor past capacity; isolate it from this test.
+          c++ -std=c++17 -O1 -g -DNO_MANUAL_VECTORIZATION -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -pthread -I "$VORTEX_HNSWLIB_SOURCE" \
+            vortex-index-hnswlib/native/tests/payload_graph.cpp -o "$work/payload"
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 "$work/payload"
       - name: Native concurrency regression (ThreadSanitizer)
         run: |
           work=$(mktemp -d)
