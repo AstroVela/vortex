@@ -86,7 +86,10 @@ impl CurrentThreadRuntime {
         ThreadSafeIterator {
             executor: Arc::clone(&self.executor),
             results: result_rx,
-            driver: Arc::new(Mutex::new(Some(driver))),
+            driver: Arc::new(StreamDriver {
+                executor: Arc::clone(&self.executor),
+                task: Mutex::new(Some(driver)),
+            }),
         }
     }
 }
@@ -133,13 +136,28 @@ impl<T> Iterator for CurrentThreadIterator<'_, T> {
 }
 
 /// An iterator that drives a stream from multiple threads.
+/// Dropping the last clone cancels and joins the task driving its stream.
 pub struct ThreadSafeIterator<T> {
     executor: Arc<smol::Executor<'static>>,
     results: kanal::AsyncReceiver<T>,
     /// Handle to the task driving the stream. Once the stream ends, the first consumer to
     /// observe it joins the task so a panic raised while driving the stream is re-raised rather
     /// than silently ending the iterator.
-    driver: Arc<Mutex<Option<smol::Task<()>>>>,
+    driver: Arc<StreamDriver>,
+}
+
+struct StreamDriver {
+    executor: Arc<smol::Executor<'static>>,
+    task: Mutex<Option<smol::Task<()>>>,
+}
+
+impl Drop for StreamDriver {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.get_mut().take() {
+            // Cancellation must be driven even when no later query polls this executor.
+            block_on(self.executor.run(task.cancel()));
+        }
+    }
 }
 
 // Manual clone implementation since `T` does not need to be `Clone`.
@@ -174,7 +192,7 @@ impl<T> Iterator for ThreadSafeIterator<T> {
 impl<T> ThreadSafeIterator<T> {
     // Join current task so panics are re-raised
     fn get_task_error(&self) -> Option<T> {
-        let task = self.driver.lock().take();
+        let task = self.driver.task.lock().take();
         if let Some(task) = task {
             block_on(self.executor.run(task));
         }
@@ -244,6 +262,96 @@ mod tests {
         assert_eq!(iter.next(), Some(4));
         assert_eq!(iter.next(), Some(5));
         assert_eq!(iter.next(), None);
+    }
+
+    #[test]
+    fn test_thread_safe_iterator_drop_releases_unpolled_stream() {
+        let runtime = CurrentThreadRuntime::new();
+        let resource = Arc::new(());
+        let weak = Arc::downgrade(&resource);
+        let iterator = runtime.block_on_stream_thread_safe(move |_| {
+            stream::once(async move {
+                let _resource = resource;
+                futures::future::pending::<usize>().await
+            })
+        });
+        drop(iterator);
+        assert!(
+            weak.upgrade().is_none(),
+            "Dropping the last iterator must release its stream without another runtime poll"
+        );
+    }
+
+    #[test]
+    fn test_thread_safe_iterator_drop_releases_partial_stream() {
+        let runtime = CurrentThreadRuntime::new();
+        let resource = Arc::new(());
+        let weak = Arc::downgrade(&resource);
+        let mut iterator = runtime.block_on_stream_thread_safe(move |_| {
+            stream::unfold(resource, |resource| async move { Some((42, resource)) })
+        });
+        assert_eq!(iterator.next(), Some(42));
+        drop(iterator);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn test_thread_safe_iterator_last_clone_releases_stream() {
+        let runtime = CurrentThreadRuntime::new();
+        let resource = Arc::new(());
+        let weak = Arc::downgrade(&resource);
+        let mut iterator = runtime.block_on_stream_thread_safe(move |_| {
+            stream::unfold(resource, |resource| async move { Some((42, resource)) })
+        });
+        assert_eq!(iterator.next(), Some(42));
+        let clone = iterator.clone();
+        drop(iterator);
+        assert!(weak.upgrade().is_some());
+        assert!(thread::spawn(move || drop(clone)).join().is_ok());
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn test_thread_safe_iterator_drop_releases_child_task() {
+        let runtime = CurrentThreadRuntime::new();
+        let resource = Arc::new(());
+        let weak = Arc::downgrade(&resource);
+        let child = runtime.handle().spawn(async move {
+            let _resource = resource;
+            futures::future::pending::<()>().await;
+        });
+        let mut iterator = runtime.block_on_stream_thread_safe(move |_| {
+            stream::unfold(child, |child| async move { Some((42, child)) })
+        });
+        assert_eq!(iterator.next(), Some(42));
+        drop(iterator);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn test_thread_safe_iterator_concurrent_last_drop_releases_stream() {
+        let runtime = CurrentThreadRuntime::new();
+        for _ in 0..32 {
+            let resource = Arc::new(());
+            let weak = Arc::downgrade(&resource);
+            let iterator = runtime.block_on_stream_thread_safe(move |_| {
+                stream::once(async move {
+                    let _resource = resource;
+                    futures::future::pending::<usize>().await
+                })
+            });
+            let clone = iterator.clone();
+            let barrier = Arc::new(Barrier::new(2));
+            let other = Arc::clone(&barrier);
+            let consumer = thread::spawn(move || {
+                other.wait();
+                drop(clone);
+            });
+            barrier.wait();
+            drop(iterator);
+            assert!(consumer.join().is_ok());
+            assert!(weak.upgrade().is_none());
+        }
     }
 
     #[test]
