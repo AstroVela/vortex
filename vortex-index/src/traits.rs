@@ -314,6 +314,14 @@ pub trait FullTextIndex: Index {
 /// Exact structured attribute filtering for vector retrieval.
 #[async_trait]
 pub trait AttributeIndex: Index {
+    /// Enumerate complete, deterministic scalar blocks for graph construction.
+    /// Reject snapshot coverage or resource-limit violations. This is separate
+    /// from query-time filtering and must not apply a top-k limit or visibility.
+    async fn blocks(
+        &self,
+        request: &crate::attributes::AttributeBlockRequest,
+    ) -> VortexResult<crate::attributes::AttributeBlockPlan>;
+
     /// Return all matching visible rows, without ranking or a top-k limit.
     ///
     /// Validate snapshot identity and reject partial snapshot coverage: otherwise
