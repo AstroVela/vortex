@@ -5,7 +5,7 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 
-const MAGIC: &[u8; 8] = b"VXHNPL02";
+const MAGIC: &[u8; 8] = b"VXHNPL01";
 
 /// Immutable supplementary level-zero adjacency, addressed by native internal IDs.
 /// The bundle descriptor binds this graph to the exact base graph and row mapping.

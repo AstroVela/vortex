@@ -63,7 +63,7 @@ const LIMITS: LocalStoreLimits = LocalStoreLimits {
 
 fn config() -> HnswBuildOptions {
     HnswBuildOptions {
-        format_version: 2,
+        format_version: 1,
         dimension: 8,
         m: 8,
         ef_construction: 64,
@@ -604,7 +604,7 @@ fn equal_distances_are_ordered_by_physical_address() -> VortexResult<()> {
 }
 
 #[rstest]
-#[case("format_version", 1)]
+#[case("format_version", 2)]
 #[case("dimension", 0)]
 #[case("m", 1)]
 #[case("ef_construction", 7)]

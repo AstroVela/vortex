@@ -47,7 +47,7 @@ use crate::import_bundle;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HnswBuildOptions {
-    /// Configuration version, currently 2; old options require rebuilding.
+    /// Configuration version, currently 1.
     pub format_version: u32,
     /// Components per vector, 1..=4096.
     pub dimension: u32,
@@ -72,7 +72,7 @@ pub struct HnswBuildOptions {
 impl HnswBuildOptions {
     pub(crate) fn validate(&self) -> VortexResult<()> {
         self.bundle(1).validate()?;
-        if self.format_version != 2 || self.seed > i32::MAX as u32 {
+        if self.format_version != 1 || self.seed > i32::MAX as u32 {
             vortex_bail!("Invalid hnswlib build version or seed");
         }
         if self.threads != 1 {

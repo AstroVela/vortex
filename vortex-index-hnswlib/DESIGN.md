@@ -5,7 +5,7 @@ SPDX-License-Identifier: CC-BY-4.0
 
 # Vortex filterable HNSW：实现设计与 roadmap
 
-更新：2026-10-29。按最新要求直接增强现有 `hnswlib.static`，不实现 ACORN，不保留旧格式兼容分支，不提供自动扫描 fallback。旧 generation 必须重建。
+更新：2026-10-29。项目仍处于早期开发，直接扩展现有 `hnswlib.static` 格式，沿用版本号 1，不做格式升级或迁移。不实现 ACORN、兼容分支或自动扫描 fallback。
 
 ## 1. 范围与基线
 
@@ -27,7 +27,7 @@ flowchart TD
     Plan --> Build[块内单层 NSW]
     Base --> Build
     Build --> CSR[去重后的补充 CSR 边]
-    Base --> Bundle[v2 bundle]
+    Base --> Bundle[bundle]
     CSR --> Bundle
     Map[物理行地址与标签映射] --> Bundle
     Filter[完整 RowFilter] --> Mask[external-label 位图]
@@ -93,9 +93,9 @@ hnswlib 扩展头文件在 Vortex 仓库维护，直接使用固定上游的距�
 
 同一原生 handle 用 mutex 串行化 ef 修改和搜索；独立 generation 没有全局查询锁。扩展的 visited-list 租借使用 RAII，在异常时归还。
 
-## 6. 格式 v2 与完整性
+## 6. 格式与完整性
 
-继续使用 backend ID `hnswlib.static`，`backend_version=2`、bundle `format_version=2`、build options `format_version=2`。不同时支持 v1。
+继续使用 backend ID `hnswlib.static`，`backend_version=1`、bundle `format_version=1`、build options `format_version=1`。直接在当前开发中的格式里加入补边文件和摘要绑定，不建立新版本或迁移流程。
 
 固定四个 artifact：
 
@@ -106,11 +106,11 @@ hnswlib 扩展头文件在 Vortex 仓库维护，直接使用固定上游的距�
 | `hnswlib/rows.bin` | dense external label 对物理 RowAddress 的完整映射 |
 | `hnswlib/payload.bin` | internal-ID CSR 补充边，关闭补边也必须存在 |
 
-payload 编码为 little endian：8 字节 magic `VXHNPL02`、u64 rows、u64 edges、rows+1 个 u64 offset、edges 个 u32 neighbor。
+payload 编码为 little endian：8 字节 magic `VXHNPL01`、u64 rows、u64 edges、rows+1 个 u64 offset、edges 个 u32 neighbor。
 
 打开流程：完整 inventory/大小检查 → 私有 lease 校验内容摘要 → descriptor 与 metadata/摘要绑定检查 → row mapping 与 CSR 完整验证 → 基础图结构检查 → 原生加载。
 
-CSR 必须 offset 起始为 0、单调、终点等于边数、文件长度精确匹配；邻居在范围内、无自环、每行严格递增，且符合 edge/degree 上限。截断、尾随数据、换配图/行映射、丢失 payload 和旧格式都报错。
+CSR 必须 offset 起始为 0、单调、终点等于边数、文件长度精确匹配；邻居在范围内、无自环、每行严格递增，且符合 edge/degree 上限。截断、尾随数据、换配图/行映射、丢失 payload 和不支持的版本号都报错。
 
 沿用现有 store 的内容摘要，不再增加另一份重复 digest header。首版不持久化完整含行列表的 block plan；边与基础图、行映射通过 descriptor 的三个摘要绑定。构建参数和实际块统计的长期审计文件可在后续诊断工作中增加，不影响读取语义。
 
@@ -120,7 +120,7 @@ CSR 必须 offset 起始为 0、单调、终点等于边数、文件长度精确
 
 ```json
 {
-  "format_version": 2,
+  "format_version": 1,
   "dimension": 128,
   "m": 16,
   "ef_construction": 128,
@@ -152,7 +152,7 @@ builder 必须显式 `with_attributes(opened_attribute_index)`。`payload_m=0` �
 
 - 原生不变量：块内边、不重复、无自环、无跨块新边、基础图字节不变、非 identity label、预算报错。
 - 搜索：payload-only 路径、被过滤导航节点、空/单点集合、复合条件、排除优先、批量一致、独立暴力真值。
-- 持久化：build/seal/reopen、snapshot mismatch、缺失/损坏 CSR、artifact 换配、旧版本拒绝。
+- 持久化：build/seal/reopen、snapshot mismatch、缺失/损坏 CSR、artifact 换配、不支持的版本号拒绝。
 - 并发：同 handle 不同 ef、独立 build/open、受限查询，保持 stateless 距离内核。
 - 检查：受影响 crate tests/doctests、Clippy、Rust/C++ 格式、workflow YAML、ASan/UBSan/LSan 与现有 TSan 流程。
 
@@ -164,7 +164,7 @@ builder 必须显式 `with_attributes(opened_attribute_index)`。`payload_m=0` �
 | --- | --- | --- |
 | P1 原生算法 | 块内单层图、合并 CSR、过滤搜索、原生测试 | 图不变量、真值校验、sanitizer |
 | P2 属性分块 | 通用计划契约、Tantivy 等值与数值窗口 | 与精确谓词逐块对照、coverage 与预算 |
-| P3 Provider 接入 | 位图、FFI、v2 artifact、builder、重新打开、端到端测试 | 构建查询闭环、损坏拒绝、并发与全部受影响检查 |
+| P3 Provider 接入 | 位图、FFI、artifact、builder、重新打开、端到端测试 | 构建查询闭环、损坏拒绝、并发与全部受影响检查 |
 | P4 工作负载性能资格 | 随机/相关/反相关属性，倾斜分布，复合条件，真实业务数据 | recall@k、p50/p95/p99、build time、RSS、artifact bytes；对照同参数原生过滤基线 |
 | P5 扩展与运维 | 按测量结果调整分块/预算、必要时流式计划、诊断统计 | 证明收益、维持硬上限与查询语义 |
 

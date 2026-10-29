@@ -112,7 +112,7 @@ pub(crate) fn validate_rows(
 
 /// Import a trusted, closed pinned native index, matching internal-ID payload graph
 /// and external-label mapping. For a build without supplementary edges pass
-/// [`HnswPayload::empty`]; format v2 always persists and verifies a payload file.
+/// [`HnswPayload::empty`]; the bundle always persists and verifies a payload file.
 ///
 /// The source must be absolute, symlink-free and quiescent, produced by the pinned
 /// revision with the stated bundle shape. This writes private artifacts, not a

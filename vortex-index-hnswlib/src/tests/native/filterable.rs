@@ -300,9 +300,9 @@ fn test_tantivy_payload_build_reload_and_filtered_batch() -> VortexResult<()> {
             .artifacts
             .retain(|artifact| artifact.path != crate::bundle::PAYLOAD);
         assert!(provider.open(&missing, Arc::clone(&store)).await.is_err());
-        let mut old = metadata;
-        old.backend_version = 1;
-        assert!(provider.open(&old, store).await.is_err());
+        let mut unsupported = metadata;
+        unsupported.backend_version = 2;
+        assert!(provider.open(&unsupported, store).await.is_err());
         Ok(())
     })
 }

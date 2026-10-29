@@ -7,7 +7,7 @@
 /// Explicit registry identifier, not an automatically selected default backend.
 pub const HNSWLIB_ID: &str = "hnswlib.static";
 /// Closed descriptor, native-file, physical-row mapping and payload CSR format version.
-pub const HNSWLIB_FORMAT_VERSION: u32 = 2;
+pub const HNSWLIB_FORMAT_VERSION: u32 = 1;
 /// Upstream revision used for the base graph serialization and distance kernels.
 pub const HNSWLIB_REVISION: &str = "d9b3608c83d83b46c96e25088cb1d729b29dcfe9";
 

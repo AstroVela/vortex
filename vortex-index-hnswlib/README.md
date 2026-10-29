@@ -25,7 +25,7 @@ construction and filtered search without changing the upstream serialization.
 - Static, immutable Float32, non-null fixed-size vectors and squared L2 only.
 - Initial construction explicitly attaches `HnswIndexBuilder` to the provider;
   sealing and reference publication remain the owner's responsibility.
-- Required build JSON: `{"format_version":2,"dimension":128,"m":32,
+- Required build JSON: `{"format_version":1,"dimension":128,"m":32,
   "ef_construction":200,"seed":100,"threads":1,"payload_m":0,
   "payload_fields":{},"payload_min_rows":2,"payload_target_rows":4096}`.
   Only `threads=1` is accepted
@@ -39,9 +39,10 @@ construction and filtered search without changing the upstream serialization.
 - Filtered approximate search honors allow-lists and mandatory exclusions;
   batches reuse one label bitmap. Exact search, unknown parameters, native deletes,
   incremental writes and unsupported metrics are rejected.
-- Format v2 bundles bind the complete physical row mapping, source snapshot,
+- Bundles bind the complete physical row mapping, source snapshot,
   coverage, upstream revision, graph shape and payload CSR through content digests.
-  Version 1 must be rebuilt. All four artifacts are mandatory, including an empty
+  The experimental bundle and build formats are extended in place and remain
+  version 1. All four artifacts are mandatory, including an empty
   payload file for payload_m=0. Opening verifies a private artifact lease
   and validates the pinned native file structure before deserialization.
 - Queries synchronize ef changes and search on the same native handle; different

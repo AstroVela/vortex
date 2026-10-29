@@ -73,7 +73,7 @@ fn mapping_requires_complete_coverage_not_native_order() -> VortexResult<()> {
     duplicate[0] = duplicate[1];
     assert!(validate_rows(&metadata, bundle, &duplicate).is_err());
     let mut wrong = metadata;
-    wrong.backend_version = 1;
+    wrong.backend_version = 2;
     assert!(validate_metadata(&wrong).is_err());
     Ok(())
 }
