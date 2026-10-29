@@ -26,11 +26,15 @@ extern "C" int vortex_hnswlib_search(void *,
                                      const float *,
                                      uint32_t,
                                      uint32_t,
+                                     const uint64_t *,
+                                     uint64_t,
                                      uint32_t *,
                                      float *,
                                      uint32_t *,
                                      char *) noexcept;
 extern "C" void vortex_hnswlib_close(void *) noexcept;
+extern "C" int
+vortex_hnswlib_payload_load(void *, const uint64_t *, uint32_t, const uint32_t *, uint64_t, char *) noexcept;
 
 namespace {
 constexpr uint32_t ROWS = 1024;
@@ -54,20 +58,43 @@ Handle open(const std::string &path, uint32_t dimension) {
     void *raw = nullptr;
     const int status = vortex_hnswlib_open(path.c_str(), dimension, ROWS, 8, &raw, error);
     check(status, error);
-    return Handle(raw, vortex_hnswlib_close);
+    Handle handle(raw, vortex_hnswlib_close);
+    std::vector<uint64_t> offsets(ROWS + 1);
+    std::vector<uint32_t> links(ROWS);
+    for (uint32_t row = 0; row < ROWS; ++row) {
+        offsets[row] = row;
+        links[row] = (row + 1) % ROWS;
+    }
+    offsets[ROWS] = ROWS;
+    check(vortex_hnswlib_payload_load(raw, offsets.data(), ROWS, links.data(), ROWS, error), error);
+    return handle;
 }
 
-std::vector<std::pair<uint32_t, float>> search(const Handle &handle, const float *query) {
+std::vector<std::pair<uint32_t, float>>
+search(const Handle &handle, const float *query, bool filtered = false) {
     char error[1024] = {};
     uint32_t ids[10], count = 0;
     float distances[10];
-    const int status = vortex_hnswlib_search(handle.get(), query, 10, 64, ids, distances, &count, error);
+    std::vector<uint64_t> mask((ROWS + 63) / 64, 0xaaaaaaaaaaaaaaaaULL);
+    const int status = vortex_hnswlib_search(handle.get(),
+                                             query,
+                                             10,
+                                             64,
+                                             filtered ? mask.data() : nullptr,
+                                             filtered ? mask.size() : 0,
+                                             ids,
+                                             distances,
+                                             &count,
+                                             error);
     check(status, error);
     if (count != 10) {
         throw std::runtime_error("Unexpected result count");
     }
     std::vector<std::pair<uint32_t, float>> hits;
     for (uint32_t i = 0; i < count; ++i) {
+        if (filtered && ids[i] % 2 != 1) {
+            throw std::runtime_error("Filter violation");
+        }
         hits.emplace_back(ids[i], distances[i]);
     }
     return hits;
@@ -95,6 +122,7 @@ void exercise(const std::filesystem::path &root, uint32_t dimension) {
     const auto handle = open(path, dimension);
     const float *query = values.data() + 7 * dimension;
     const auto expected = search(handle, query);
+    const auto expected_filtered = search(handle, query, true);
     if (expected.front() != std::make_pair(uint32_t(7), 0.0f)) {
         throw std::runtime_error("Self query mismatch");
     }
@@ -112,19 +140,22 @@ void exercise(const std::filesystem::path &root, uint32_t dimension) {
                     const auto built = path + ".worker-" + std::to_string(worker);
                     for (unsigned i = 0; i < 8; ++i) {
                         build(built, values, dimension);
-                        if (search(open(built, dimension), query) != expected) {
+                        if (search(open(built, dimension), query) != expected ||
+                            search(open(built, dimension), query, true) != expected_filtered) {
                             throw std::runtime_error("Independent build mismatch");
                         }
                     }
                 } else if (worker == 2) {
                     for (unsigned i = 0; i < 80; ++i) {
-                        if (search(open(path, dimension), query) != expected) {
+                        if (search(open(path, dimension), query) != expected ||
+                            search(open(path, dimension), query, true) != expected_filtered) {
                             throw std::runtime_error("Reopened search mismatch");
                         }
                     }
                 } else {
                     for (unsigned i = 0; i < 4000; ++i) {
-                        if (search(handle, query) != expected) {
+                        if (search(handle, query) != expected ||
+                            search(handle, query, true) != expected_filtered) {
                             throw std::runtime_error("Concurrent search mismatch");
                         }
                     }

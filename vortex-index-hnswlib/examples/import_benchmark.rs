@@ -81,7 +81,7 @@ fn main() -> VortexResult<()> {
         name: "embedding".into(),
         generation: "hnsw-benchmark-v1".into(),
         backend: HNSWLIB_ID.into(),
-        backend_version: 1,
+        backend_version: vortex_index_hnswlib::HNSWLIB_FORMAT_VERSION,
         fields: vec!["embedding".into()],
         covered_files: reference
             .snapshot
@@ -92,7 +92,14 @@ fn main() -> VortexResult<()> {
         snapshot: reference.snapshot.clone(),
         artifacts: Vec::new(),
     };
-    let metadata = block_on(import_bundle(metadata, &store, native, bundle, &rows))?;
+    let metadata = block_on(import_bundle(
+        metadata,
+        &store,
+        native,
+        bundle,
+        &rows,
+        &vortex_index_hnswlib::HnswPayload::empty(bundle.rows),
+    ))?;
     reference.generation = store.seal(&metadata)?;
     drop(block_on(
         HnswProvider::try_new(output.clone(), HnswLimits::default())?

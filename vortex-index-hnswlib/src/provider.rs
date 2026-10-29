@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -31,9 +32,11 @@ use crate::HNSWLIB_FORMAT_VERSION;
 use crate::HNSWLIB_ID;
 use crate::HNSWLIB_REVISION;
 use crate::HnswIndexBuilder;
+use crate::HnswPayload;
 use crate::bundle::DESCRIPTOR;
 use crate::bundle::Descriptor;
 use crate::bundle::INDEX;
+use crate::bundle::PAYLOAD;
 use crate::bundle::ROWS;
 use crate::bundle::validate_metadata;
 use crate::bundle::validate_rows;
@@ -51,6 +54,10 @@ pub struct HnswLimits {
     pub max_batch_vectors: u32,
     /// Maximum accepted ef search width.
     pub max_ef: u32,
+    /// Maximum directed supplementary edges when loading a generation.
+    pub max_payload_edges: u64,
+    /// Maximum supplementary degree per node when loading a generation.
+    pub max_payload_degree: u32,
 }
 
 impl Default for HnswLimits {
@@ -60,6 +67,8 @@ impl Default for HnswLimits {
             max_rows: 1_000_000,
             max_batch_vectors: 256,
             max_ef: 1_048_576,
+            max_payload_edges: 32_000_000,
+            max_payload_degree: 256,
         }
     }
 }
@@ -127,7 +136,7 @@ impl IndexProvider for HnswProvider {
             .map(|artifact| artifact.path.as_str())
             .collect::<Vec<_>>();
         paths.sort_unstable();
-        let mut expected = [DESCRIPTOR, INDEX, ROWS];
+        let mut expected = [DESCRIPTOR, INDEX, ROWS, PAYLOAD];
         expected.sort_unstable();
         if paths != expected {
             vortex_bail!("hnswlib requires exactly its closed artifact inventory");
@@ -174,7 +183,27 @@ impl IndexProvider for HnswProvider {
         descriptor.bundle.validate()?;
         let rows = validate::mapping(&lease.path().join(ROWS), descriptor.bundle.rows)?;
         validate_rows(metadata, descriptor.bundle, &rows)?;
-        let native = Native::open(&lease.path().join(INDEX), descriptor.bundle)?;
+        for (path, checksum) in [
+            (INDEX, &descriptor.index_checksum),
+            (ROWS, &descriptor.rows_checksum),
+            (PAYLOAD, &descriptor.payload_checksum),
+        ] {
+            if !metadata
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.path == path && &artifact.checksum == checksum)
+            {
+                vortex_bail!("hnswlib descriptor artifact binding mismatch: {path}");
+            }
+        }
+        let payload = HnswPayload::decode(
+            &fs::read(lease.path().join(PAYLOAD))?,
+            descriptor.bundle.rows,
+            self.limits.max_payload_edges,
+            self.limits.max_payload_degree,
+        )?;
+        let mut native = Native::open(&lease.path().join(INDEX), descriptor.bundle)?;
+        native.load_payload(&payload)?;
         let spec = VectorSpec {
             dimension: NonZeroUsize::new(descriptor.bundle.dimension as usize)
                 .ok_or_else(|| vortex_err!("Zero hnswlib dimension"))?,
@@ -184,6 +213,7 @@ impl IndexProvider for HnswProvider {
             native,
             _lease: lease,
             metadata: metadata.clone(),
+            labels: rows.iter().copied().zip(0u32..).collect(),
             rows,
             limits: self.limits,
             spec,
@@ -198,6 +228,7 @@ struct HnswIndex {
     _lease: Box<dyn LocalArtifactLease>,
     metadata: IndexMetadata,
     rows: Vec<RowAddress>,
+    labels: BTreeMap<RowAddress, u32>,
     limits: HnswLimits,
     spec: VectorSpec,
 }
@@ -215,12 +246,11 @@ impl HnswIndex {
         filter: &RowFilter,
     ) -> VortexResult<(u32, u32)> {
         if filter.snapshot() != &self.metadata.snapshot
-            || filter.is_restricted()
             || options.mode != SearchMode::Approximate
             || options.k.get() > 4096
         {
             vortex_bail!(
-                "hnswlib supports only matching-snapshot, unfiltered approximate queries with k <= 4096"
+                "hnswlib supports only matching-snapshot approximate queries with k <= 4096"
             );
         }
         let requested = u32::try_from(options.k.get())?;
@@ -239,42 +269,49 @@ impl HnswIndex {
         }
         Ok((requested.min(u32::try_from(self.rows.len())?), ef))
     }
-}
+    fn mask(&self, filter: &RowFilter) -> Option<Vec<u64>> {
+        if !filter.is_restricted() {
+            return None;
+        }
+        let mut mask = vec![
+            if filter.allowed_rows().is_none() {
+                u64::MAX
+            } else {
+                0
+            };
+            self.rows.len().div_ceil(64)
+        ];
+        if let Some(allowed) = filter.allowed_rows() {
+            for row in allowed {
+                if let Some(label) = self.labels.get(row) {
+                    mask[*label as usize / 64] |= 1u64 << (*label % 64);
+                }
+            }
+        }
+        for row in filter.excluded_rows() {
+            if let Some(label) = self.labels.get(row) {
+                mask[*label as usize / 64] &= !(1u64 << (*label % 64));
+            }
+        }
+        let tail = self.rows.len() % 64;
+        if tail != 0
+            && let Some(last) = mask.last_mut()
+        {
+            *last &= (1u64 << tail) - 1;
+        }
+        Some(mask)
+    }
 
-impl Index for HnswIndex {
-    fn metadata(&self) -> &IndexMetadata {
-        &self.metadata
-    }
-    fn as_vector(&self) -> Option<&dyn VectorIndex> {
-        Some(self)
-    }
-}
-
-#[async_trait]
-impl VectorIndex for HnswIndex {
-    fn spec(&self) -> VectorSpec {
-        self.spec
-    }
-    fn supports_exact(&self) -> bool {
-        false
-    }
-    fn supports_filter(&self) -> bool {
-        false
-    }
-    async fn search(
+    fn search_masked(
         &self,
         query: &[f32],
-        options: &VectorSearchOptions,
-        filter: &RowFilter,
+        k: u32,
+        ef: u32,
+        mask: Option<&[u64]>,
     ) -> VortexResult<Vec<SearchHit>> {
-        let (k, ef) = self.options(options, filter)?;
-        if query.len() != self.spec.dimension.get() || query.iter().any(|value| !value.is_finite())
-        {
-            vortex_bail!("hnswlib query requires the declared dimension and finite components");
-        }
         let mut hits = self
             .native
-            .search(query, k, ef)?
+            .search(query, k, ef, mask)?
             .into_iter()
             .map(|(id, distance)| {
                 let row = *self
@@ -296,13 +333,50 @@ impl VectorIndex for HnswIndex {
         }
         Ok(hits)
     }
+}
+
+impl Index for HnswIndex {
+    fn metadata(&self) -> &IndexMetadata {
+        &self.metadata
+    }
+    fn as_vector(&self) -> Option<&dyn VectorIndex> {
+        Some(self)
+    }
+}
+
+#[async_trait]
+impl VectorIndex for HnswIndex {
+    fn spec(&self) -> VectorSpec {
+        self.spec
+    }
+    fn supports_exact(&self) -> bool {
+        false
+    }
+    fn supports_filter(&self) -> bool {
+        true
+    }
+    async fn search(
+        &self,
+        query: &[f32],
+        options: &VectorSearchOptions,
+        filter: &RowFilter,
+    ) -> VortexResult<Vec<SearchHit>> {
+        let (k, ef) = self.options(options, filter)?;
+        if query.len() != self.spec.dimension.get() || query.iter().any(|value| !value.is_finite())
+        {
+            vortex_bail!("hnswlib query requires the declared dimension and finite components");
+        }
+        let mask = self.mask(filter);
+        self.search_masked(query, k, ef, mask.as_deref())
+    }
+
     async fn search_batch(
         &self,
         queries: &[Buffer<f32>],
         options: &VectorSearchOptions,
         filter: &RowFilter,
     ) -> VortexResult<Vec<Vec<SearchHit>>> {
-        self.options(options, filter)?;
+        let (k, ef) = self.options(options, filter)?;
         if queries.len() as u64 > u64::from(self.limits.max_batch_vectors) {
             vortex_bail!("hnswlib batch exceeds provider limit");
         }
@@ -313,9 +387,10 @@ impl VectorIndex for HnswIndex {
                 vortex_bail!("hnswlib batch contains invalid vectors");
             }
         }
+        let mask = self.mask(filter);
         let mut results = Vec::with_capacity(queries.len());
         for query in queries {
-            results.push(self.search(query, options, filter).await?);
+            results.push(self.search_masked(query, k, ef, mask.as_deref())?);
         }
         Ok(results)
     }

@@ -54,6 +54,8 @@ use crate::HnswProvider;
 use crate::ffi::Native;
 use crate::validate;
 
+mod filterable;
+
 const LIMITS: LocalStoreLimits = LocalStoreLimits {
     max_artifact_bytes: 1024 * 1024,
     max_manifest_bytes: 1024 * 1024,
@@ -61,12 +63,16 @@ const LIMITS: LocalStoreLimits = LocalStoreLimits {
 
 fn config() -> HnswBuildOptions {
     HnswBuildOptions {
-        format_version: 1,
+        format_version: 2,
         dimension: 8,
         m: 8,
         ef_construction: 64,
         seed: 100,
         threads: 1,
+        payload_m: 0,
+        payload_fields: Default::default(),
+        payload_min_rows: 2,
+        payload_target_rows: 64,
     }
 }
 
@@ -177,7 +183,7 @@ async fn prepare(root: &Path) -> VortexResult<(Arc<LocalIndexStore>, IndexMetada
             Arc::clone(&store) as Arc<dyn IndexStore>,
         )
         .await?;
-    assert_eq!(built.artifacts.len(), 3);
+    assert_eq!(built.artifacts.len(), 4);
     let provider = HnswProvider::try_new(root.to_path_buf(), HnswLimits::default())?;
     assert!(
         provider
@@ -205,10 +211,11 @@ fn build_seal_reopen_parity_and_lease_cleanup() -> VortexResult<()> {
             .as_vector()
             .ok_or_else(|| vortex_err!("Missing vector capability"))?;
         assert!(!vector_index.supports_exact());
-        assert!(!vector_index.supports_filter());
+        assert!(vector_index.supports_filter());
         let filter = RowFilter::try_new(built.snapshot.clone(), None, BTreeSet::new())?;
         let mut flat_metadata = built;
         flat_metadata.backend = FlatIndex::ID.into();
+        flat_metadata.backend_version = 1;
         flat_metadata.artifacts.clear();
         let flat = FlatIndex::try_new(
             flat_metadata,
@@ -327,12 +334,10 @@ fn rejects_modes_filters_vectors_and_limits() -> VortexResult<()> {
                 .is_err()
         );
         let restricted = RowFilter::try_new(built.snapshot, None, BTreeSet::from([rows(256)[7]]))?;
-        assert!(
-            vector_index
-                .search(&vector(7), &options(10, "")?, &restricted)
-                .await
-                .is_err()
-        );
+        let hits = vector_index
+            .search(&vector(7), &options(10, "")?, &restricted)
+            .await?;
+        assert!(hits.iter().all(|hit| restricted.includes(hit.row)));
         Ok(())
     })
 }
@@ -472,7 +477,7 @@ fn native_distance_kernels_match_scalar_l2(#[case] dimension: u32) -> VortexResu
     let index = Native::open(&path, bundle)?;
     for id in [7, 257] {
         let query = vector_at_dimension(id, dimension);
-        let hits = index.search(&query, 256, 256)?;
+        let hits = index.search(&query, 256, 256, None)?;
         assert_eq!(hits.len(), 256);
         assert_eq!(
             hits.iter().map(|hit| hit.0).collect::<BTreeSet<_>>().len(),
@@ -508,7 +513,7 @@ fn independent_build_open_and_search_can_overlap(#[case] dimension: u32) -> Vort
     Native::build(&path, &vectors, bundle, &config)?;
     let index = Native::open(&path, bundle)?;
     let query = vector_at_dimension(7, dimension);
-    let expected = index.search(&query, 10, 256)?;
+    let expected = index.search(&query, 10, 256, None)?;
     assert_eq!(expected[0], (7, 0.0));
     let barrier = Barrier::new(4);
     thread::scope(|scope| -> VortexResult<()> {
@@ -529,13 +534,13 @@ fn independent_build_open_and_search_can_overlap(#[case] dimension: u32) -> Vort
                             let built_path = root.join(format!("built-{worker}.bin"));
                             Native::build(&built_path, vectors, bundle, config)?;
                             let opened = Native::open(&built_path, bundle)?;
-                            assert_eq!(opened.search(query, 10, 256)?, *expected);
+                            assert_eq!(opened.search(query, 10, 256, None)?, *expected);
                         } else if worker == 2 {
                             let opened = Native::open(path, bundle)?;
-                            assert_eq!(opened.search(query, 10, 256)?, *expected);
+                            assert_eq!(opened.search(query, 10, 256, None)?, *expected);
                         } else {
                             for _ in 0..32 {
-                                assert_eq!(index.search(query, 10, 256)?, *expected);
+                                assert_eq!(index.search(query, 10, 256, None)?, *expected);
                             }
                         }
                     }
@@ -599,7 +604,7 @@ fn equal_distances_are_ordered_by_physical_address() -> VortexResult<()> {
 }
 
 #[rstest]
-#[case("format_version", 2)]
+#[case("format_version", 1)]
 #[case("dimension", 0)]
 #[case("m", 1)]
 #[case("ef_construction", 7)]
@@ -655,6 +660,7 @@ fn construction_limits_leave_no_published_generation(
                 max_rows,
                 max_vector_bytes,
                 max_native_artifact_bytes,
+                ..HnswBuildLimits::default()
             },
         )?;
         let store: Arc<dyn IndexStore> = Arc::new(LocalIndexStore::create(

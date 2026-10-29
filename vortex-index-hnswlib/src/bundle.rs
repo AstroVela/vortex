@@ -17,10 +17,12 @@ use vortex_index::Snapshot;
 use crate::HNSWLIB_FORMAT_VERSION;
 use crate::HNSWLIB_ID;
 use crate::HNSWLIB_REVISION;
+use crate::HnswPayload;
 
 pub(crate) const DESCRIPTOR: &str = "hnswlib/bundle.json";
 pub(crate) const ROWS: &str = "hnswlib/rows.bin";
 pub(crate) const INDEX: &str = "hnswlib/index.bin";
+pub(crate) const PAYLOAD: &str = "hnswlib/payload.bin";
 pub(crate) const ROW_MAGIC: &[u8; 8] = b"VXHNROW1";
 
 /// Shape of a closed, unquantized native index with dense external labels.
@@ -61,6 +63,9 @@ pub(crate) struct Descriptor {
     pub snapshot: Snapshot,
     pub fields: Vec<String>,
     pub covered_files: Vec<u64>,
+    pub index_checksum: String,
+    pub rows_checksum: String,
+    pub payload_checksum: String,
 }
 
 pub(crate) fn validate_metadata(metadata: &IndexMetadata) -> VortexResult<()> {
@@ -105,7 +110,9 @@ pub(crate) fn validate_rows(
     Ok(())
 }
 
-/// Import a trusted, closed pinned native index and persist its external-label mapping.
+/// Import a trusted, closed pinned native index, matching internal-ID payload graph
+/// and external-label mapping. For a build without supplementary edges pass
+/// [`HnswPayload::empty`]; format v2 always persists and verifies a payload file.
 ///
 /// The source must be absolute, symlink-free and quiescent, produced by the pinned
 /// revision with the stated bundle shape. This writes private artifacts, not a
@@ -118,6 +125,7 @@ pub async fn import_bundle(
     native_index: &Path,
     bundle: HnswBundle,
     rows: &[RowAddress],
+    payload: &HnswPayload,
 ) -> VortexResult<IndexMetadata> {
     validate_metadata(&metadata)?;
     if !metadata.artifacts.is_empty() || !native_index.is_absolute() {
@@ -127,21 +135,7 @@ pub async fn import_bundle(
     let local = store
         .as_local_files()
         .ok_or_else(|| vortex_err!("hnswlib requires a local-file store"))?;
-    let descriptor = Descriptor {
-        format_version: HNSWLIB_FORMAT_VERSION,
-        revision: HNSWLIB_REVISION.into(),
-        value_type: "float32".into(),
-        metric: "squared_l2".into(),
-        bundle,
-        snapshot: metadata.snapshot.clone(),
-        fields: metadata.fields.clone(),
-        covered_files: metadata.covered_files.clone(),
-    };
-    let json =
-        serde_json::to_vec(&descriptor).map_err(|err| vortex_err!("hnswlib descriptor: {err}"))?;
-    if json.len() > 1024 * 1024 {
-        vortex_bail!("hnswlib descriptor exceeds 1 MiB");
-    }
+    let payload = payload.encode(bundle.rows)?;
     let capacity = rows
         .len()
         .checked_mul(16)
@@ -154,14 +148,32 @@ pub async fn import_bundle(
         mapping.extend_from_slice(&row.file_id.to_le_bytes());
         mapping.extend_from_slice(&row.row_offset.to_le_bytes());
     }
-    metadata
-        .artifacts
-        .push(local.import_file(INDEX, native_index)?);
-    metadata
-        .artifacts
-        .push(store.write(DESCRIPTOR, Bytes::from(json)).await?);
-    metadata
-        .artifacts
-        .push(store.write(ROWS, Bytes::from(mapping)).await?);
+    let index = local.import_file(INDEX, native_index)?;
+    let rows = store.write(ROWS, Bytes::from(mapping)).await?;
+    let payload = store.write(PAYLOAD, Bytes::from(payload)).await?;
+    let descriptor = Descriptor {
+        format_version: HNSWLIB_FORMAT_VERSION,
+        revision: HNSWLIB_REVISION.into(),
+        value_type: "float32".into(),
+        metric: "squared_l2".into(),
+        bundle,
+        snapshot: metadata.snapshot.clone(),
+        fields: metadata.fields.clone(),
+        covered_files: metadata.covered_files.clone(),
+        index_checksum: index.checksum.clone(),
+        rows_checksum: rows.checksum.clone(),
+        payload_checksum: payload.checksum.clone(),
+    };
+    let json =
+        serde_json::to_vec(&descriptor).map_err(|err| vortex_err!("hnswlib descriptor: {err}"))?;
+    if json.len() > 1024 * 1024 {
+        vortex_bail!("hnswlib descriptor exceeds 1 MiB");
+    }
+    metadata.artifacts.extend([
+        index,
+        rows,
+        payload,
+        store.write(DESCRIPTOR, Bytes::from(json)).await?,
+    ]);
     Ok(metadata)
 }
