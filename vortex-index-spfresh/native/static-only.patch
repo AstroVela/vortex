@@ -1,3 +1,24 @@
+diff --git a/AnnService/inc/Core/Common/BKTree.h b/AnnService/inc/Core/Common/BKTree.h
+index 5a91ebc..b77a531 100644
+--- a/AnnService/inc/Core/Common/BKTree.h
++++ b/AnnService/inc/Core/Common/BKTree.h
+@@ -63,7 +63,7 @@ namespace SPTAG
+ 
+                 centers = (T*)ALIGN_ALLOC(sizeof(T) * _K * _D);
+                 newTCenters = (T*)ALIGN_ALLOC(sizeof(T) * _K * _D);
+-                counts = new SizeType[_K];
++                counts = new SizeType[_K]();
+                 newCenters = new float[_T * _K * _RD];
+                 newCounts = new SizeType[_T * _K];
+                 label = new int[datasize];
+@@ -324,6 +324,7 @@ namespace SPTAG
+                     SizeType randid = COMMON::Utils::rand(last, first);
+                     std::memcpy(args.centers + k*args._D, data[indices[randid]], sizeof(T)*args._D);
+                 }
++                args.ClearCenters();
+                 args.ClearCounts();
+                 args.ClearDists(-MaxDist);
+                 currDist = KmeansAssign<T, R>(data, indices, first, batchEnd, args, true, 0);
 diff --git a/AnnService/inc/Core/Common/CommonUtils.h b/AnnService/inc/Core/Common/CommonUtils.h
 index 755994c..7c5f630 100644
 --- a/AnnService/inc/Core/Common/CommonUtils.h

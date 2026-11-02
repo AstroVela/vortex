@@ -98,7 +98,7 @@ jobs:
       - name: Install native build tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes cmake g++ libzstd-dev libclang-dev pkg-config
+          sudo apt-get install --yes cmake g++ libzstd-dev libclang-dev pkg-config valgrind
           echo "BINDGEN_EXTRA_CLANG_ARGS=-isystem $(gcc -print-file-name=include)" >> "$GITHUB_ENV"
 
       # No restored native binaries: compile the pinned source and explicit patch,
@@ -107,6 +107,11 @@ jobs:
         run: |
           bash vortex-index-spfresh/native/build.sh
           echo "VORTEX_SPFRESH_NATIVE=$PWD/target/spfresh-native/build" >> "$GITHUB_ENV"
+
+      - name: Check native construction and query memory
+        run: |
+          valgrind --tool=memcheck --track-origins=yes --leak-check=summary \
+            --error-exitcode=87 target/spfresh-native/build/spfresh_workspace_tests
 
       - name: Native parity, persistence and lifetime tests
         run: cargo test --locked -p vortex-index-spfresh --all-features
