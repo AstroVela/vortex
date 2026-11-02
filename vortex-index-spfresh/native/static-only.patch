@@ -227,6 +227,42 @@ index 38143e9..9a4d8d4 100644
  
                  va_end(args);
              }
+diff --git a/AnnService/inc/Helper/ThreadPool.h b/AnnService/inc/Helper/ThreadPool.h
+index fed9139..97bee84 100644
+--- a/AnnService/inc/Helper/ThreadPool.h
++++ b/AnnService/inc/Helper/ThreadPool.h
+@@ -21,13 +21,13 @@ namespace SPTAG
+             class Abort : public IAbortOperation
+             {
+             private:
+-                bool m_stopped;
++                std::atomic<bool> m_stopped;
+ 
+             public:
+-                Abort(bool p_status = true) { m_stopped = p_status; }
++                Abort(bool p_status = true) : m_stopped(p_status) {}
+                 ~Abort() {}
+-                virtual bool ShouldAbort() { return m_stopped; }
+-                void SetAbort(bool p_status) { m_stopped = p_status; }
++                virtual bool ShouldAbort() { return m_stopped.load(); }
++                void SetAbort(bool p_status) { m_stopped.store(p_status); }
+             };
+ 
+             class Job
+@@ -41,8 +41,11 @@ namespace SPTAG
+ 
+             ~ThreadPool() 
+             {
+-                m_abort.SetAbort(true);
+-                m_cond.notify_all();
++                {
++                    std::lock_guard<std::mutex> lock(m_lock);
++                    m_abort.SetAbort(true);
++                    m_cond.notify_all();
++                }
+                 for (auto&& t : m_threads) t.join();
+                 m_threads.clear();
+             }
 diff --git a/AnnService/src/Core/Common/DistanceUtils.cpp b/AnnService/src/Core/Common/DistanceUtils.cpp
 index 5c86cad..c8af316 100644
 --- a/AnnService/src/Core/Common/DistanceUtils.cpp
