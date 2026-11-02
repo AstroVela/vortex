@@ -378,11 +378,13 @@ The existing unfiltered C ABI remains available; the additive
 `vortex_spfresh_search_filtered` accepts a bitmap of exactly ceil(rows / 8) bytes,
 with unused high bits zero, or null/zero for no restriction.
 
-Masked searches retain all valid postings selected by the existing head budget.
-They do not apply the nearest unfiltered head's distance cutoff: that head can
-be excluded while eligible rows lie farther away. Unrestricted searches retain
-the existing cutoff. The same `internal_results`, `max_check` and page limits
-still bound the search; masked queries may visit more postings within them.
+Static searches retain all valid postings selected by the existing head budget.
+They do not apply the nearest head's distance cutoff: a head's distance does not
+bound the distance to rows in other postings, even without a filter. With a mask,
+the nearest head can also be excluded. The same `internal_results`, `max_check`
+and page limits still bound the search; queries may visit more postings within
+them. A regression covers the unrestricted C ABI with all 64 heads inside its
+unchanged budget and verifies the exact top ten for 128 offset queries.
 
 Filtering restricts candidates in the postings reached by ANN. Selective filters
 can still return fewer than k hits or miss nearer matching rows in unvisited
