@@ -299,6 +299,40 @@ void test_filtered_search(const Fixture &fixture) {
     }
 }
 
+void test_unfiltered_posting_radius(const Fixture &fixture) {
+    require(fixture.dimension == 1 && fixture.rows == 128, "Invalid unfiltered routing fixture");
+    auto handle = fixture.open();
+    for (uint32_t row = 0; row < fixture.rows; ++row) {
+        const float query = fixture.vectors[row] + 0.125F;
+        std::vector<std::pair<double, uint32_t>> expected;
+        for (uint32_t candidate = 0; candidate < fixture.rows; ++candidate) {
+            const auto delta = double(fixture.vectors[candidate]) - query;
+            expected.emplace_back(delta * delta, candidate);
+        }
+        std::sort(expected.begin(), expected.end());
+        std::array<int32_t, 10> ids {};
+        std::array<float, 10> distances {};
+        char error[1024] = {};
+        require(vortex_spfresh_search(handle.get(),
+                                      &query,
+                                      fixture.dimension,
+                                      1,
+                                      ids.size(),
+                                      4096,
+                                      64,
+                                      fixture.pages,
+                                      ids.data(),
+                                      distances.data(),
+                                      error) == 0,
+                error);
+        for (size_t rank = 0; rank < ids.size(); ++rank) {
+            require(ids[rank] == int32_t(expected[rank].second),
+                    "Nearest head radius pruned a closer unfiltered posting");
+        }
+        cached(handle.get(), fixture);
+    }
+}
+
 void test_masked_posting_radius(const Fixture &fixture) {
     require(fixture.dimension == 1 && fixture.rows == 128, "Invalid masked routing fixture");
     std::array<uint64_t, 64> heads {};
@@ -397,13 +431,14 @@ int main() {
         test_option_changes(first);
         test_error_cleanup(first);
         test_filtered_search(first);
+        test_unfiltered_posting_radius(masked);
         test_masked_posting_radius(masked);
         test_thread_migration_and_destruction(first);
         test_concurrent_handles(first, second);
         const auto final = vortex_spfresh_test_workspaces(nullptr);
         require(final.thread_detached && final.live_posting_workspaces == 0,
                 "Tests leaked thread-local or handle-owned workspaces");
-        std::cout << "7 workspace and filter checks passed\n";
+        std::cout << "8 workspace and filter checks passed\n";
         return 0;
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';
