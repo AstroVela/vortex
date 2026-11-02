@@ -113,6 +113,11 @@ jobs:
           valgrind --tool=memcheck --track-origins=yes --leak-check=summary \
             --error-exitcode=87 target/spfresh-native/build/spfresh_workspace_tests
 
+      - name: Check native thread-pool shutdown races
+        run: |
+          valgrind --tool=helgrind --error-exitcode=99 \
+            target/spfresh-native/build/spfresh_thread_pool_tests 100
+
       - name: Native parity, persistence and lifetime tests
         run: cargo test --locked -p vortex-index-spfresh --all-features
 
