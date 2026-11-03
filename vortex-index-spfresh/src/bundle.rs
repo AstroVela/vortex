@@ -16,7 +16,9 @@ use vortex_index::Snapshot;
 
 use crate::SPFRESH_FORMAT_VERSION;
 use crate::SPFRESH_ID;
+use crate::SPFRESH_RABITQ_FORMAT_VERSION;
 use crate::SPFRESH_REVISION;
+use crate::rabitq::RaBitQBuildOptions;
 
 pub(crate) const DESCRIPTOR: &str = "spfresh/bundle.json";
 pub(crate) const ROWS: &str = "spfresh/rows.bin";
@@ -69,12 +71,17 @@ pub(crate) struct Descriptor {
     pub snapshot: Snapshot,
     pub fields: Vec<String>,
     pub covered_files: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rabitq: Option<RaBitQBuildOptions>,
 }
 
 pub(crate) fn validate_metadata(metadata: &IndexMetadata) -> VortexResult<()> {
     metadata.validate_for(&metadata.snapshot)?;
     if metadata.backend != SPFRESH_ID
-        || metadata.backend_version != SPFRESH_FORMAT_VERSION
+        || !matches!(
+            metadata.backend_version,
+            SPFRESH_FORMAT_VERSION | SPFRESH_RABITQ_FORMAT_VERSION
+        )
         || metadata.fields.len() != 1
     {
         vortex_bail!("SPFresh requires its supported backend version and exactly one vector field");
@@ -127,12 +134,32 @@ pub(crate) fn validate_rows(
 /// native structure before catalog publication. Failures can leave private artifacts.
 /// All IO is blocking, even though this function is async. Mapping memory is O(rows).
 pub async fn import_bundle(
-    mut metadata: IndexMetadata,
+    metadata: IndexMetadata,
     store: &dyn IndexStore,
     source: &Path,
     bundle: SpFreshBundle,
     rows: &[RowAddress],
 ) -> VortexResult<IndexMetadata> {
+    import_bundle_impl(metadata, store, source, bundle, rows, None).await
+}
+
+pub(crate) async fn import_bundle_impl(
+    mut metadata: IndexMetadata,
+    store: &dyn IndexStore,
+    source: &Path,
+    bundle: SpFreshBundle,
+    rows: &[RowAddress],
+    rabitq: Option<RaBitQBuildOptions>,
+) -> VortexResult<IndexMetadata> {
+    if metadata.backend_version
+        != if rabitq.is_some() {
+            SPFRESH_RABITQ_FORMAT_VERSION
+        } else {
+            SPFRESH_FORMAT_VERSION
+        }
+    {
+        vortex_bail!("SPFresh quantization does not match artifact version");
+    }
     validate_metadata(&metadata)?;
     if !metadata.artifacts.is_empty() || !source.is_absolute() {
         vortex_bail!("SPFresh import requires empty artifacts and an absolute source directory");
@@ -142,7 +169,7 @@ pub async fn import_bundle(
         .as_local_files()
         .ok_or_else(|| vortex_err!("SPFresh requires local-file support"))?;
     let descriptor = Descriptor {
-        format_version: SPFRESH_FORMAT_VERSION,
+        format_version: metadata.backend_version,
         revision: SPFRESH_REVISION.into(),
         value_type: "float32".into(),
         metric: "squared_l2".into(),
@@ -150,6 +177,7 @@ pub async fn import_bundle(
         snapshot: metadata.snapshot.clone(),
         fields: metadata.fields.clone(),
         covered_files: metadata.covered_files.clone(),
+        rabitq,
     };
     let json =
         serde_json::to_vec(&descriptor).map_err(|err| vortex_err!("SPFresh descriptor: {err}"))?;
@@ -172,6 +200,11 @@ pub async fn import_bundle(
         metadata
             .artifacts
             .push(local.import_file(&format!("spfresh/native/{name}"), &source.join(name))?);
+    }
+    if rabitq.is_some() {
+        metadata
+            .artifacts
+            .push(local.import_file("spfresh/rabitq.bin", &source.join("rabitq.bin"))?);
     }
     metadata
         .artifacts

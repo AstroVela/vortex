@@ -84,7 +84,7 @@ fn test_mapping_requires_exact_coverage_but_not_native_id_order() -> VortexResul
     uncovered.covered_files = vec![11];
     assert!(validate_rows(&uncovered, bundle, &rows).is_err());
     let mut wrong_backend = metadata;
-    wrong_backend.backend_version += 1;
+    wrong_backend.backend_version = 3;
     assert!(validate_metadata(&wrong_backend).is_err());
     Ok(())
 }

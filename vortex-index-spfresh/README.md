@@ -406,3 +406,100 @@ These synthetic native-ID masks are benchmark inputs, not attribute predicates.
 ```text
 spfresh_benchmark bridge-filter NATIVE_ROOT QUERIES.f32bin ROWS K MAX_CHECK INTERNAL_RESULTS POSTING_PAGES WARMUP_ROUNDS ROUNDS OUTPUT.csv FILTER_STRIDE
 ```
+
+## RaBitQ coarse search and lazy reranking (bundle version 2)
+
+The static builder can retain the existing SPFresh BKT navigation and original
+Float32 postings while adding a persisted RaBitQ sidecar. Set metadata
+`backend_version` to `SPFRESH_RABITQ_FORMAT_VERSION` (2), and pass:
+
+```json
+{"format_version":2,"dimension":1536,"head_count":64,"posting_page_limit":128,"replicas":4,"rabitq":{"seed":42}}
+```
+
+The provider reads both versions. Existing version-1 bundles and build JSON keep
+their behavior. The common vector API remains squared L2; f16, i8, cosine and
+negative-dot source formats are not added by this change. `import_bundle` remains
+a version-1 importer; use the initial builder to produce a version-2 generation.
+The SQL integration must explicitly allow version 2 before it can consume it.
+
+A version-2 generation contains the original eight artifacts plus
+`spfresh/rabitq.bin`. The sidecar stores a global center, a Haar orthogonal
+rotation, packed sign codes, norm/projection corrections, compact posting IDs,
+head IDs and offsets into the original files. Its magic `VXSRBQ01`, shape,
+reserved field, exact length, rotation, corrections, padding and routing binding
+are validated on open. The complete artifact inventory is still checksum-verified
+and materialized under the existing generation lease. No format or hash check is
+skipped. All original files remain immutable until the reader closes.
+
+Search runs in three stages:
+
+1. BKT navigation returns `internal_results` head ordinals without scanning
+   posting payloads. Every returned head's complete posting is considered. The
+   old full-search distance-ratio posting cutoff is not used on this path.
+2. Allowed native IDs from those compact lists are deduplicated. RaBitQ estimates
+   squared L2 and an error radius using the correction ratio from the paper.
+   Full precision rotated queries use 4-bit lookup tables; no query scalar
+   quantization error is introduced. Interval upper bounds initialize a threshold,
+   and lower bounds prune vectors that cannot beat it.
+3. Only surviving candidates are fetched through positional reads on owned
+   `vectors.bin` / `postings.bin` file descriptors. Distances accumulate from the
+   original f32 values in f64, then round to the common f32 result type. The exact
+   top-k heap tightens the threshold. Row-address tie ordering, exclusions,
+   deduplication, empty filters and batch ordering follow the common contract.
+   Missing, truncated or non-finite original vectors fail the search.
+
+Empty backend options use **deterministic** Cauchy-Schwarz bounds with numerical
+slack. They preserve the exact top-k within the probed candidate set; BKT routing
+is still approximate, so `SearchMode::Exact` is rejected. To use narrower RaBitQ
+confidence intervals, opt in explicitly:
+
+```json
+{"max_check":4096,"internal_results":64,"search_pages":128,"rabitq":{"kind":"probabilistic","epsilon":4.0}}
+```
+
+The probability bound scales by `min(1, epsilon / sqrt(d - 1))`; dimension 1 uses
+the deterministic bound. Epsilon must be finite and positive. These are
+per-comparison probabilistic bounds, not a dataset-wide recall guarantee. Tune
+and measure recall before choosing this mode. Explicit
+`"rabitq":{"kind":"deterministic"}` selects the conservative path. Version-1
+indexes reject RaBitQ query options. `search_pages` still must match the bundle.
+
+At 1536 dimensions the **code alone** is 192 bytes instead of 6144 bytes for f32.
+Each vector additionally stores three f64 correction values and an 8-byte original
+location; routing, row mapping and the shared rotation also consume space. The
+original vectors are retained, including existing SPFresh replicas. This is a
+query-bandwidth optimization, not 32x total-storage compression. The code buffer
+is compact on disk; the initial reader uses per-vector allocations in memory.
+
+The implementation uses Gaussian Householder reflectors to retain the Haar
+rotation distribution assumed by [RaBitQ](https://arxiv.org/abs/2405.12497).
+The shared rotation occupies O(d²) space and preparation costs O(d²) per vector
+or query. Data codes are evaluated with O(d/4) table lookups. This portable first
+implementation has no SIMD, BLAS build acceleration, parallel scatter/gather,
+query quantization or asynchronous IO. Builds retain the existing input limits;
+sidecar output counts toward `max_native_artifact_bytes`. Opens still copy/hash
+and validate the full generation, including originals. Only steady-state
+candidate refinement uses lazy original IO; cold open is not optimized.
+
+Debug tracing emits `scanned_vectors`, `reranked_vectors` and
+`original_vector_bytes` for each RaBitQ query. The byte count is logical payload
+requested by positional reads, not physical disk sectors or page-cache traffic.
+
+Neither the pruning fraction nor end-to-end speedup is guaranteed. In particular,
+turbopuffer's reported <1% refinement fraction is not a benchmark result for this
+backend. The standalone `rabitq` module and its tests run without native support:
+
+```sh
+cargo test -p vortex-index-spfresh --no-default-features
+cargo bench -p vortex-index-spfresh --bench rabitq --no-default-features
+# Linux x86_64, after the native build described above:
+cargo test -p vortex-index-spfresh --all-features
+```
+
+The microbenchmark separates prepared code scoring from exact f64-accumulated f32
+distance scoring; it excludes rotation, disk IO and ANN navigation. Tests cover
+code size, error intervals, zero residuals, non-byte-aligned dimensions, original
+read counts, filters, ties, replica deduplication, truncated/replaced files and
+sidecar corruption. The native suite additionally covers head-only workspace
+lifetime and version-2 build/seal/reopen/filter/batch searches against FlatIndex.
