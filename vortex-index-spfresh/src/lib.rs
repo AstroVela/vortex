@@ -9,14 +9,18 @@
 /// Exact upstream revision defining this backend's native file format.
 pub const SPFRESH_REVISION: &str = "5893eb61ee3b18610b6b00f1939be7dae1af8904";
 
+pub mod rabitq;
+
 mod bundle;
 pub use bundle::SpFreshBundle;
 pub use bundle::import_bundle;
 
 /// Registry identifier for this backend, not the SPFresh source revision.
 pub const SPFRESH_ID: &str = "spfresh.static";
-/// Version of the closed bundle, descriptor and row mapping format.
+/// Legacy unquantized bundle version; the row mapping format remains version 1.
 pub const SPFRESH_FORMAT_VERSION: u32 = 1;
+/// Static bundle version with a RaBitQ sidecar and lazy original-vector reranking.
+pub const SPFRESH_RABITQ_FORMAT_VERSION: u32 = 2;
 
 #[cfg(feature = "native")]
 mod builder;

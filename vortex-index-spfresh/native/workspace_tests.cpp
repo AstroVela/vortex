@@ -297,6 +297,39 @@ void test_filtered_search(const Fixture &fixture) {
     }
 }
 
+void test_head_navigation(const Fixture &fixture) {
+    auto handle = fixture.open();
+    char error[1024] = {};
+    std::vector<int32_t> heads(64, -1);
+    const auto query = fixture.vectors.data() + 7 * fixture.dimension;
+    require(
+        vortex_spfresh_search_heads(handle.get(), query, fixture.dimension, 4096, 64, heads.data(), error) ==
+            0,
+        error);
+    for (auto id : heads) {
+        require(id >= 0 && id < 64, "Head navigation returned a full vector ID");
+    }
+    const auto first = heads;
+    const auto stats = vortex_spfresh_test_workspaces(handle.get());
+    require(stats.thread_detached && stats.postings == nullptr && stats.heads != nullptr,
+            "Head-only navigation allocated posting workspace or leaked TLS");
+    fixture.search(handle.get(), 7, 4096, 64);
+    require(
+        vortex_spfresh_search_heads(handle.get(), query, fixture.dimension, 8192, 64, heads.data(), error) ==
+            0,
+        error);
+    require(heads == first, "Head search changed after a full search");
+    require(vortex_spfresh_search_heads(handle.get(),
+                                        query,
+                                        fixture.dimension + 1,
+                                        4096,
+                                        64,
+                                        heads.data(),
+                                        error) != 0,
+            "Head search accepted a mismatched dimension");
+    require(vortex_spfresh_test_workspaces(handle.get()).thread_detached, "Head search failure leaked TLS");
+}
+
 void test_concurrent_handles(const Fixture &first, const Fixture &second) {
     auto a = first.open();
     auto b = second.open();
@@ -342,10 +375,11 @@ int main() {
         test_filtered_search(first);
         test_thread_migration_and_destruction(first);
         test_concurrent_handles(first, second);
+        test_head_navigation(first);
         const auto final = vortex_spfresh_test_workspaces(nullptr);
         require(final.thread_detached && final.live_posting_workspaces == 0,
                 "Tests leaked thread-local or handle-owned workspaces");
-        std::cout << "6 workspace and filter checks passed\n";
+        std::cout << "7 workspace, filter and head checks passed\n";
         return 0;
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';
