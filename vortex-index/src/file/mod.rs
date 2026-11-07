@@ -82,7 +82,8 @@ pub fn schema_fingerprint(dtype: &DType) -> VortexResult<String> {
 ///
 /// Every physical row is visible. All files must have the same non-nullable
 /// top-level struct dtype; individual fields may be nullable or nested.
-/// `SourceFile::uri` is an absolute native filesystem path, not a URL.
+/// [`Self::open`] requires absolute native filesystem paths, not URLs.
+/// [`Self::from_buffers`] retains URI strings as opaque physical identities.
 /// Subsequent scans read only pinned bytes, so path replacement, deletion, or
 /// in-place writes cannot change an already opened source.
 pub struct LocalFileSource {
@@ -111,6 +112,11 @@ impl LocalFileSource {
         session: VortexSession,
     ) -> VortexResult<Self> {
         Self::validate(&snapshot, &dtype)?;
+        for file in &snapshot.files {
+            if !Path::new(&file.uri).is_absolute() {
+                vortex_bail!("Local file source requires an absolute path: {}", file.uri);
+            }
+        }
 
         session
             .handle()
@@ -168,9 +174,6 @@ impl LocalFileSource {
             vortex_bail!("Local file source schema fingerprint does not match its dtype");
         }
         for file in &snapshot.files {
-            if !Path::new(&file.uri).is_absolute() {
-                vortex_bail!("Local file source requires an absolute path: {}", file.uri);
-            }
             if !file.version.strip_prefix("sha256:").is_some_and(|digest| {
                 digest.len() == 64
                     && digest
@@ -189,8 +192,9 @@ impl LocalFileSource {
 
     /// Open an exact inventory of owned encoded buffers without filesystem access.
     ///
-    /// Keys must match the complete snapshot inventory. URI strings retain the
-    /// caller's physical identities; they are never opened or used as a fallback.
+    /// Keys must match the complete snapshot inventory. URI strings are opaque
+    /// physical identities and may be relative paths or URLs; they are never
+    /// opened or used as a fallback.
     /// Contents, schema, row counts and the aggregate byte budget are verified
     /// through the same contract as [`Self::open`]. Immutable buffers are retained
     /// by the source and may be released by the caller after this function returns.
