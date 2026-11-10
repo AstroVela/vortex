@@ -14,8 +14,8 @@ explicit and currently qualified on Linux x86_64 with GCC:
 sudo apt-get install cmake g++ libzstd-dev libclang-dev pkg-config
 bash vortex-index-spfresh/native/build.sh
 export VORTEX_SPFRESH_NATIVE="$PWD/target/spfresh-native/build"
-cargo test --locked -p vortex-index-spfresh --all-features
-cargo clippy --locked -p vortex-index-spfresh --all-targets --all-features -- -D warnings
+cargo test --locked -p vortex-index-spfresh --features native
+cargo clippy --locked -p vortex-index-spfresh --all-targets --features native -- -D warnings
 ```
 
 The explicit build script fetches SPFresh/SPFresh revision
@@ -38,6 +38,29 @@ Core archives are PIC and a shared bridge is actually linked with no unresolved
 symbols during qualification. The fixture executable is a test-only builder, not
 an exposed `IndexBuilder`. Native source revision and patch fingerprints are
 checked by Cargo. CMake/system dependencies are not hermetically vendored.
+
+## VectorDBBench query worker
+
+`vectordbbench_worker` opens a sealed `bench_sift_fixture` generation once and
+serves newline-delimited JSON queries over a private Unix socket. It connects to
+the socket supplied by its parent and sends `{"ready":true,"rows":N}` only after
+verifying and opening the generation. Native diagnostic output stays outside the
+query socket. Build both examples with the `native` feature for a benchmark client:
+
+```sh
+cargo build --locked --release -p vortex-index-spfresh --features native \
+  --example bench_sift_fixture --example vectordbbench_worker
+```
+
+The worker takes `INDEX.json SOCKET` as its arguments. A request contains `query`
+(Float32 components), `k`, `max_check`, `internal_results`, and `search_pages`.
+Responses contain `positions` in the fixture's ordered input corpus, or an
+`error`. Clients must translate positions to original dataset IDs, keep the
+generation unchanged, and include serialization and IPC in reported client
+latency. Closing the socket releases the native handle and private artifacts.
+
+This is an experimental benchmark interface for static unfiltered L2 indexes,
+not a database server or SQL integration.
 
 ## Frozen Bundle Contract
 
@@ -417,11 +440,16 @@ Float32 postings while adding a persisted RaBitQ sidecar. Set metadata
 {"format_version":2,"dimension":1536,"head_count":64,"posting_page_limit":128,"replicas":4,"rabitq":{"seed":42}}
 ```
 
-The provider reads both versions. Existing version-1 bundles and build JSON keep
+The provider reads versions 1 and 2 with `native`, and version 3 additionally
+requires `rabitq-official`. Existing version-1 bundles and build JSON keep
 their behavior. The common vector API remains squared L2; f16, i8, cosine and
 negative-dot source formats are not added by this change. `import_bundle` remains
 a version-1 importer; use the initial builder to produce a version-2 generation.
 The SQL integration must explicitly allow version 2 before it can consume it.
+Both benchmark generations retain Float32 vectors. The version-1 baseline uses
+native full-precision scoring; enabling version 2 adds RaBitQ rather than replacing
+a PQ index. The sidecar uses one global center; the paper's IVF configuration uses
+per-cluster centering and dedicated fast scoring kernels.
 
 A version-2 generation contains the original eight artifacts plus
 `spfresh/rabitq.bin`. The sidecar stores a global center, a Haar orthogonal
@@ -469,22 +497,43 @@ At 1536 dimensions the **code alone** is 192 bytes instead of 6144 bytes for f32
 Each vector additionally stores three f64 correction values and an 8-byte original
 location; routing, row mapping and the shared rotation also consume space. The
 original vectors are retained, including existing SPFresh replicas. This is a
-query-bandwidth optimization, not 32x total-storage compression. The code buffer
-is compact on disk; the initial reader uses per-vector allocations in memory.
+query-bandwidth optimization, not 32x total-storage compression. Code records stay
+packed in one contiguous buffer in memory, ordered by their first posting
+occurrence. A native-ID-to-record map preserves ID lookup and replica semantics;
+the on-disk format is unchanged.
+
+Original-vector reads reuse query-local decode buffers. If at least half of the
+scanned candidates survive the initial interval threshold, the reader caches
+16 KiB blocks, capped at 64 MiB per query. Sparse survivors use individual vector
+reads to avoid fetching unused neighbors. Both paths use the already-owned file
+descriptors and discard cached blocks when the query ends. The cache uses hash
+lookup and retains the same payload cap. The cache is a read policy; it does not
+change pruning bounds or candidate ordering.
+
+Exact scoring converts the query once and uses four independent f64 accumulators.
+A conservative rounding interval verifies that the resulting f32 score matches
+the original ordered f64 sum. Ambiguous rounding falls back to that ordered sum.
+Code estimates also run four at a time, preserving each estimate's addition
+order. These optimizations preserve pruning decisions and returned f32 scores.
 
 The implementation uses Gaussian Householder reflectors to retain the Haar
 rotation distribution assumed by [RaBitQ](https://arxiv.org/abs/2405.12497).
 The shared rotation occupies O(d²) space and preparation costs O(d²) per vector
 or query. Data codes are evaluated with O(d/4) table lookups. This portable first
-implementation has no SIMD, BLAS build acceleration, parallel scatter/gather,
+implementation has no explicit SIMD kernels, BLAS build acceleration, parallel scatter/gather,
 query quantization or asynchronous IO. Builds retain the existing input limits;
 sidecar output counts toward `max_native_artifact_bytes`. Opens still copy/hash
 and validate the full generation, including originals. Only steady-state
 candidate refinement uses lazy original IO; cold open is not optimized.
 
-Debug tracing emits `scanned_vectors`, `reranked_vectors` and
-`original_vector_bytes` for each RaBitQ query. The byte count is logical payload
-requested by positional reads, not physical disk sectors or page-cache traffic.
+Debug tracing emits `scanned_vectors`, `retained_vectors`, `reranked_vectors`,
+`original_vector_bytes`, `original_read_calls`, `original_read_bytes` and
+`original_cache_bytes`, plus `exact_fallbacks`, for each RaBitQ query. The latter
+counts ambiguous rounding handled by the ordered sum. `retained_vectors` counts candidates
+after the initial interval threshold; later exact scores can prune more.
+`original_vector_bytes` counts the logical payload of reranked vectors, while
+`original_read_bytes` counts requested file bytes, including block prefetch.
+Neither measures physical disk sectors or page-cache traffic.
 
 Neither the pruning fraction nor end-to-end speedup is guaranteed. In particular,
 turbopuffer's reported <1% refinement fraction is not a benchmark result for this
@@ -494,7 +543,7 @@ backend. The standalone `rabitq` module and its tests run without native support
 cargo test -p vortex-index-spfresh --no-default-features
 cargo bench -p vortex-index-spfresh --bench rabitq --no-default-features
 # Linux x86_64, after the native build described above:
-cargo test -p vortex-index-spfresh --all-features
+cargo test -p vortex-index-spfresh --features native
 ```
 
 The microbenchmark separates prepared code scoring from exact f64-accumulated f32
@@ -503,3 +552,121 @@ code size, error intervals, zero residuals, non-byte-aligned dimensions, origina
 read counts, filters, ties, replica deduplication, truncated/replaced files and
 sidecar corruption. The native suite additionally covers head-only workspace
 lifetime and version-2 build/seal/reopen/filter/batch searches against FlatIndex.
+
+The bounded `bench_sift_fixture` example accepts both build versions. A version-2
+configuration may include an absolute `unquantized_twin` output directory to
+import and seal a version-1 generation with the same native files, physical row
+order and source snapshot. This supports paired query benchmarks without
+retraining the BKT index. Both output directories must be new.
+
+The `vectordbbench_worker` example accepts the optional `rabitq` query object
+shown above. Set `VORTEX_SPFRESH_TRACE=1` for refinement counters in its stderr
+log; collect these diagnostics separately from timed measurements.
+
+## Official two-bit RaBitQ (bundle version 3)
+
+`rabitq-official` is an opt-in backend built against RaBitQ-Library commit
+`dabfdb8c200a6f155df4edd0b9c825e6728b14a1`. Set up SPFresh as above, then:
+
+```sh
+bash vortex-index-spfresh/native/build-rabitq.sh
+export VORTEX_RABITQ_NATIVE="$PWD/target/rabitq-native/build"
+cargo test --locked -p vortex-index-spfresh --all-features
+cargo build --locked --release -p vortex-index-spfresh --features rabitq-official \
+  --example bench_sift_fixture --example vectordbbench_worker
+```
+
+The explicit dependency build verifies the clean pinned checkout and builds
+PIC core/FastScan archives with native-only ISA flags and OpenMP disabled.
+Individual SIMD kernels use runtime ISA dispatch. Cargo verifies the revision,
+checkout and relevant CMake settings without fetching sources. The Apache-2.0
+dependency notice is in `native/RaBitQ.LICENSE`.
+
+Use metadata backend version `SPFRESH_OFFICIAL_RABITQ_FORMAT_VERSION` (3) and:
+
+```json
+{"format_version":3,"dimension":768,"head_count":16384,"posting_page_limit":3031,"replicas":1,"rabitq_official":{"seed":42}}
+```
+
+This layout requires exactly one posting replica, complete native row coverage,
+and a distinct official sidecar. Conflicting legacy `rabitq` options are rejected.
+Native head selection uses the existing SPFresh builder; `unquantized_twin`
+shares its exact native files for paired benchmarks. `rabitq_official.seed`
+controls the numerical rotation independently of native routing.
+The source vectors must have squared norms no greater than `f32::MAX / 64`, so
+the official Float32 encoding arithmetic stays finite. Query vectors have the
+same bound. The common squared-L2 metric is unchanged; callers normalize both
+database and queries themselves when using cosine ground truth.
+
+The ninth artifact is `spfresh/rabitq-official.bin`. Its `VXORBQ04` header records
+original/padded dimensions, bits, grouping, rotation kind and exact extents.
+It contains the saved official rotation, rotated per-posting database means,
+grouped native IDs, batch offsets, one-bit FastScan batches and their extension
+bits/factors. Dimensions are padded to multiples of 32; dimensions below 64 use
+the official matrix rotation and larger dimensions use FHT/Kac. Loading restores
+the saved rotation, checks finite metadata/factors and binds every group to the
+validated original native routing. It does not regenerate a random rotation.
+
+Search retains Float32 BKT navigation, estimates **every** complete selected
+posting group with official FastScan plus the second bit, and selects Top-R by
+estimate then physical row address. A query may specify:
+
+```json
+{"max_check":4096,"internal_results":1024,"search_pages":3031,"rerank":500}
+```
+
+`rerank` defaults to `min(rows,max(k,500))` and must be between k and rows.
+Version-1/2 generations reject it; version 3 rejects legacy interval-bound
+options. Visibility filtering applies before shortlist selection, so excluded
+rows never consume its budget. Complete groups are still estimated to preserve
+the SIMD layout. Exact reranking reads the immutable original Float32 files with
+buffered synchronous `pread` and uses the same four-chain Float64 accumulation
+and rounding fallback as the legacy reranker. Results use the common Float32
+distance and row-address tie order.
+The fixed shortlist is approximate; workload-specific recall qualification is
+required. Original Float32 vectors remain part of the generation.
+
+The original-vector reader sorts and merges overlapping/adjacent 4 KiB ranges,
+caps each request at 128 KiB and processes at most 512 shortlist entries per
+bounded batch. It restores shortlist order for exact scoring, bounds reads by
+file length and handles interrupted and partial reads explicitly. Truncation
+and short reads fail the query. The existing index mutex serializes its reusable
+buffers.
+This reader can use the OS page cache and is independent of the native posting
+reader controlled by `VORTEX_SPFRESH_POSTING_VIEW`.
+
+`VORTEX_SPFRESH_TRACE` additionally records original-reader requests/bytes,
+candidate/shortlist fingerprints and phase timings. Fingerprints and clocks are
+disabled otherwise. Requested aligned bytes are not physical disk bytes; use
+process `/proc/PID/io` and cgroup counters to measure actual storage traffic.
+
+The extra-bit AVX2 kernel shares query loads across four records and retains the
+official accumulation/reduction order; other dispatched ISA paths use the stock
+official implementation. Tests compare optimized and stock scores bit for bit,
+qualify scalar-LUT rounding at the input scale, and independently full-sort the
+shortlist and exact distances. Native routing retains the existing global mutex;
+official query scratch is serialized separately per opened index. Filters,
+batches, errors and cross-thread calls retain the common lifetime contract.
+
+### Explicit high-dimensional fixture budgets
+
+`bench_sift_fixture` also accepts a contiguous little-endian Float32 corpus via
+`"base_format":"float32"`; the default remains `"fvecs"`. It never normalizes
+either input. The optional `limits` object supplies the existing typed build and
+provider budgets, which are recorded in the reference consumed by the worker:
+
+```json
+{
+  "build":{"max_rows":1000000,"max_vector_bytes":4294967296,"max_native_artifact_bytes":6442450944},
+  "provider":{"max_rows":1000000,"max_materialized_bytes":6442450944,"max_batch_vectors":256,"max_posting_buffer_bytes":17179869184}
+}
+```
+
+This object is the value of `limits`, alongside `base`, `rows`, `options` and
+`output_dir`. Defaults retain the bounded SIFT fixture limits. Explicit vector
+budgets can exceed 2 GiB using checked native `size_t` byte lengths; Rust still
+checks allocation/address-space bounds and native row counts remain signed 32-bit.
+The posting-buffer budget bounds reserved address space, independently of a
+benchmark's cgroup RSS/cache limit; mapped posting views borrow file pages.
+`unquantized_twin` works for version 3 too and seals a raw generation with identical
+native files, source snapshot and row mapping for the paired regression.

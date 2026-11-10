@@ -16,8 +16,11 @@ use vortex_index::Snapshot;
 
 use crate::SPFRESH_FORMAT_VERSION;
 use crate::SPFRESH_ID;
+use crate::SPFRESH_OFFICIAL_RABITQ_FORMAT_VERSION;
 use crate::SPFRESH_RABITQ_FORMAT_VERSION;
 use crate::SPFRESH_REVISION;
+use crate::rabitq::OFFICIAL_SIDECAR;
+use crate::rabitq::OfficialRaBitQBuildOptions;
 use crate::rabitq::RaBitQBuildOptions;
 
 pub(crate) const DESCRIPTOR: &str = "spfresh/bundle.json";
@@ -73,6 +76,8 @@ pub(crate) struct Descriptor {
     pub covered_files: Vec<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rabitq: Option<RaBitQBuildOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rabitq_official: Option<OfficialRaBitQBuildOptions>,
 }
 
 pub(crate) fn validate_metadata(metadata: &IndexMetadata) -> VortexResult<()> {
@@ -80,7 +85,9 @@ pub(crate) fn validate_metadata(metadata: &IndexMetadata) -> VortexResult<()> {
     if metadata.backend != SPFRESH_ID
         || !matches!(
             metadata.backend_version,
-            SPFRESH_FORMAT_VERSION | SPFRESH_RABITQ_FORMAT_VERSION
+            SPFRESH_FORMAT_VERSION
+                | SPFRESH_RABITQ_FORMAT_VERSION
+                | SPFRESH_OFFICIAL_RABITQ_FORMAT_VERSION
         )
         || metadata.fields.len() != 1
     {
@@ -140,7 +147,7 @@ pub async fn import_bundle(
     bundle: SpFreshBundle,
     rows: &[RowAddress],
 ) -> VortexResult<IndexMetadata> {
-    import_bundle_impl(metadata, store, source, bundle, rows, None).await
+    import_bundle_impl(metadata, store, source, bundle, rows, None, None).await
 }
 
 pub(crate) async fn import_bundle_impl(
@@ -150,14 +157,15 @@ pub(crate) async fn import_bundle_impl(
     bundle: SpFreshBundle,
     rows: &[RowAddress],
     rabitq: Option<RaBitQBuildOptions>,
+    rabitq_official: Option<OfficialRaBitQBuildOptions>,
 ) -> VortexResult<IndexMetadata> {
-    if metadata.backend_version
-        != if rabitq.is_some() {
-            SPFRESH_RABITQ_FORMAT_VERSION
-        } else {
-            SPFRESH_FORMAT_VERSION
-        }
-    {
+    let expected_version = match (rabitq.is_some(), rabitq_official.is_some()) {
+        (false, false) => SPFRESH_FORMAT_VERSION,
+        (true, false) => SPFRESH_RABITQ_FORMAT_VERSION,
+        (false, true) => SPFRESH_OFFICIAL_RABITQ_FORMAT_VERSION,
+        _ => vortex_bail!("Conflicting SPFresh quantization options"),
+    };
+    if metadata.backend_version != expected_version {
         vortex_bail!("SPFresh quantization does not match artifact version");
     }
     validate_metadata(&metadata)?;
@@ -178,6 +186,7 @@ pub(crate) async fn import_bundle_impl(
         fields: metadata.fields.clone(),
         covered_files: metadata.covered_files.clone(),
         rabitq,
+        rabitq_official,
     };
     let json =
         serde_json::to_vec(&descriptor).map_err(|err| vortex_err!("SPFresh descriptor: {err}"))?;
@@ -205,6 +214,11 @@ pub(crate) async fn import_bundle_impl(
         metadata
             .artifacts
             .push(local.import_file("spfresh/rabitq.bin", &source.join("rabitq.bin"))?);
+    }
+    if rabitq_official.is_some() {
+        metadata
+            .artifacts
+            .push(local.import_file(OFFICIAL_SIDECAR, &source.join("rabitq-official.bin"))?);
     }
     metadata
         .artifacts

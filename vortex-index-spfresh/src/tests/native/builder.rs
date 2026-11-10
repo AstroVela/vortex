@@ -76,6 +76,7 @@ fn config() -> SpFreshBuildOptions {
         posting_page_limit: 12,
         replicas: 4,
         rabitq: None,
+        rabitq_official: None,
     }
 }
 
@@ -150,7 +151,11 @@ async fn prepare_with_options(
         .await?;
     assert_eq!(
         metadata.artifacts.len(),
-        if build_options.rabitq.is_some() { 9 } else { 8 }
+        if build_options.rabitq.is_some() || build_options.rabitq_official.is_some() {
+            9
+        } else {
+            8
+        }
     );
     assert_eq!(fs::read_dir(root.join("scratch"))?.count(), 0);
     // Construction does not seal the store or make an index visible.
@@ -996,4 +1001,129 @@ fn test_rabitq_build_reopen_filter_and_flat_parity() -> VortexResult<()> {
         assert_eq!(fs::read_dir(root.join("scratch"))?.count(), 0);
         Ok(())
     })
+}
+
+#[cfg(feature = "rabitq-official")]
+#[test]
+fn test_official_rabitq_builder_store_reopen_filter_and_budget() -> VortexResult<()> {
+    block_on(|handle| async move {
+        let session = session(handle)?;
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        let config = SpFreshBuildOptions {
+            format_version: 3,
+            replicas: 1,
+            rabitq_official: Some(crate::rabitq::OfficialRaBitQBuildOptions { seed: 42 }),
+            ..config()
+        };
+        let (store, metadata, control) = prepare_with_options(root, &session, &config).await?;
+        drop(store);
+        let (store, reopened) = LocalIndexStore::open(
+            root.join("store"),
+            &control.generation,
+            &control.snapshot,
+            LIMITS,
+        )?;
+        let index = provider(root)?.open(&reopened, Arc::new(store)).await?;
+        let ann = index
+            .as_vector()
+            .ok_or_else(|| vortex_err!("Missing official vector capability"))?;
+        let flat = FlatIndex::try_new(
+            IndexMetadata {
+                backend: FlatIndex::ID.into(),
+                backend_version: 1,
+                artifacts: vec![],
+                ..metadata.clone()
+            },
+            ann.spec(),
+            rows(),
+            Buffer::from_iter((0..256u16).flat_map(vector)),
+        )?;
+        let all = filter(&metadata.snapshot)?;
+        let selected = RowFilter::try_new(
+            metadata.snapshot.clone(),
+            Some(rows().into_iter().step_by(3).collect()),
+            Default::default(),
+        )?;
+        let empty = RowFilter::try_new(
+            metadata.snapshot.clone(),
+            Some(Default::default()),
+            Default::default(),
+        )?;
+        for visibility in [&all, &selected, &empty] {
+            for id in [7, 80, 129, 242] {
+                let query = vector(id);
+                let hits = ann.search(&query, &options(10)?, visibility).await?;
+                assert_eq!(hits, flat.search(&query, &options(10)?, visibility).await?);
+                assert_eq!(
+                    ann.search_batch(&[Buffer::from(query)], &options(10)?, visibility)
+                        .await?,
+                    vec![hits]
+                );
+            }
+        }
+        for value in [
+            serde_json::json!({"rerank":9}),
+            serde_json::json!({"rerank":257}),
+            serde_json::json!({"rabitq":{"kind":"deterministic"}}),
+        ] {
+            let mut backend =
+                serde_json::json!({"max_check":4096,"internal_results":64,"search_pages":12});
+            for (key, value) in value
+                .as_object()
+                .ok_or_else(|| vortex_err!("Invalid test options"))?
+            {
+                backend[key] = value.clone();
+            }
+            let invalid = VectorSearchOptions {
+                backend_options: Bytes::from(
+                    serde_json::to_vec(&backend).map_err(|err| vortex_err!("{err}"))?,
+                ),
+                ..options(10)?
+            };
+            assert!(ann.search(&vector(7), &invalid, &all).await.is_err());
+        }
+        drop(index);
+        assert_eq!(fs::read_dir(root.join("scratch"))?.count(), 0);
+        Ok(())
+    })
+}
+
+#[test]
+fn test_build_byte_limits_support_explicit_large_float32_input() -> VortexResult<()> {
+    block_on(|handle| async move {
+        let session = session(handle)?;
+        let directory = tempfile::tempdir()?;
+        fs::create_dir(directory.path().join("scratch"))?;
+        let builder = SpFreshIndexBuilder::try_new(
+            directory.path().join("scratch"),
+            session,
+            SpFreshBuildLimits {
+                max_vector_bytes: 4 * 1024 * 1024 * 1024,
+                ..SpFreshBuildLimits::default()
+            },
+        )?;
+        drop(builder);
+        Ok(())
+    })
+}
+
+#[test]
+fn test_official_options_require_feature_version_and_single_replica() {
+    let mut options = config();
+    options.format_version = 3;
+    options.replicas = 1;
+    options.rabitq_official = Some(crate::rabitq::OfficialRaBitQBuildOptions { seed: 42 });
+    assert_eq!(
+        options.validate(256).is_ok(),
+        cfg!(feature = "rabitq-official")
+    );
+    options.replicas = 2;
+    assert!(options.validate(256).is_err());
+    options.replicas = 1;
+    options.rabitq = Some(RaBitQBuildOptions { seed: 42 });
+    assert!(options.validate(256).is_err());
+    options.rabitq = None;
+    options.format_version = 2;
+    assert!(options.validate(256).is_err());
 }

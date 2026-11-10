@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! One-bit RaBitQ with a Haar orthogonal rotation and asymmetric queries.
+//! RaBitQ sidecars with original-vector reranking.
+//!
+//! Version 2 uses the one-bit Haar implementation below. The optional
+//! `rabitq-official` backend uses pinned official two-bit encoding and FastScan,
+//! per-posting means, and a fixed exact-rerank budget in version-3 bundles.
 //!
 //! The estimator follows Gao and Long, SIGMOD 2024, §3.2:
 //! <https://arxiv.org/abs/2405.12497>. Full precision query components avoid the
@@ -10,9 +14,18 @@
 
 mod codec;
 #[cfg(all(unix, any(feature = "native", test)))]
+mod distance;
+#[cfg(feature = "rabitq-official")]
+mod official;
+#[cfg(all(unix, any(feature = "native", test)))]
 mod search;
 #[cfg(all(unix, any(feature = "native", test)))]
 mod storage;
+#[cfg(feature = "rabitq-official")]
+pub(crate) use official::OfficialIndex;
+#[cfg(feature = "rabitq-official")]
+pub(crate) use official::build_official_sidecar;
+pub(crate) const OFFICIAL_SIDECAR: &str = "spfresh/rabitq-official.bin";
 
 pub use codec::DistanceEstimate;
 pub use codec::EncodedVector;
@@ -36,6 +49,19 @@ use vortex_error::vortex_bail;
 pub struct RaBitQBuildOptions {
     /// Seed for independent Gaussian Householder reflectors.
     pub seed: u64,
+}
+
+/// Official two-bit encoding with per-posting database means and persisted rotation.
+///
+/// Requires the `rabitq-official` feature, artifact version 3 and one posting replica.
+/// Queries estimate every candidate, select a fixed rerank budget, then use original
+/// Float32 vectors for exact squared-L2 distances. Approximate routing and shortlist
+/// selection require workload-specific recall qualification.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OfficialRaBitQBuildOptions {
+    /// Seed for the official rotation. Readers restore the saved rotation directly.
+    pub seed: u32,
 }
 
 /// Error bound used when discarding candidates before full precision reranking.
