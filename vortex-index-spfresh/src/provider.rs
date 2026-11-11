@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
+use serde::Serialize;
 use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -30,6 +31,7 @@ use vortex_index::VectorSpec;
 
 use crate::SPFRESH_FORMAT_VERSION;
 use crate::SPFRESH_ID;
+use crate::SPFRESH_OFFICIAL_RABITQ_FORMAT_VERSION;
 use crate::SPFRESH_RABITQ_FORMAT_VERSION;
 use crate::SPFRESH_REVISION;
 use crate::SpFreshBundle;
@@ -41,13 +43,17 @@ use crate::bundle::ROWS;
 use crate::bundle::validate_metadata;
 use crate::bundle::validate_rows;
 use crate::ffi::Native;
+use crate::rabitq::OFFICIAL_SIDECAR;
+#[cfg(feature = "rabitq-official")]
+use crate::rabitq::OfficialIndex;
 use crate::rabitq::QuantizedIndex;
 use crate::rabitq::RaBitQErrorBound;
 use crate::rabitq::SIDECAR;
 use crate::validate;
 
 /// Explicit bounds on local copies, mapping and query work, not a total RSS limit.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SpFreshLimits {
     /// Sum of all materialized artifact sizes; the store also enforces its own limits.
     pub max_materialized_bytes: u64,
@@ -123,7 +129,8 @@ impl IndexProvider for SpFreshProvider {
         matches!(
             version,
             SPFRESH_FORMAT_VERSION | SPFRESH_RABITQ_FORMAT_VERSION
-        )
+        ) || (cfg!(feature = "rabitq-official")
+            && version == SPFRESH_OFFICIAL_RABITQ_FORMAT_VERSION)
     }
 
     fn local_materialization_limit(&self) -> Option<u64> {
@@ -142,6 +149,9 @@ impl IndexProvider for SpFreshProvider {
         store: Arc<dyn IndexStore>,
     ) -> VortexResult<Arc<dyn Index>> {
         validate_metadata(metadata)?;
+        if !self.supports_version(metadata.backend_version) {
+            vortex_bail!("SPFresh version requires the rabitq-official build feature");
+        }
         validate_inventory(metadata, self.limits)?;
         let local = store
             .as_local_files()
@@ -157,6 +167,8 @@ impl IndexProvider for SpFreshProvider {
         if descriptor.format_version != metadata.backend_version
             || descriptor.rabitq.is_some()
                 != (metadata.backend_version == SPFRESH_RABITQ_FORMAT_VERSION)
+            || descriptor.rabitq_official.is_some()
+                != (metadata.backend_version == SPFRESH_OFFICIAL_RABITQ_FORMAT_VERSION)
             || descriptor.revision != SPFRESH_REVISION
             || descriptor.value_type != "float32"
             || descriptor.metric != "squared_l2"
@@ -179,12 +191,21 @@ impl IndexProvider for SpFreshProvider {
             .rabitq
             .map(|_| QuantizedIndex::open(&root, &lease.path().join(SIDECAR), bundle))
             .transpose()?;
+        #[cfg(feature = "rabitq-official")]
+        let official = descriptor
+            .rabitq_official
+            .map(|_| {
+                OfficialIndex::open(&root, &lease.path().join(OFFICIAL_SIDECAR), bundle, &rows)
+            })
+            .transpose()?;
         let native = Native::open(&root, bundle)?;
         let dimension = NonZeroUsize::new(bundle.dimension as usize)
             .ok_or_else(|| vortex_err!("Zero SPFresh dimension"))?;
         Ok(Arc::new(SpFreshIndex {
             native,
             quantized,
+            #[cfg(feature = "rabitq-official")]
+            official,
             _lease: lease,
             metadata: metadata.clone(),
             bundle,
@@ -206,6 +227,9 @@ fn validate_inventory(metadata: &IndexMetadata, limits: SpFreshLimits) -> Vortex
     expected.extend([DESCRIPTOR.to_owned(), ROWS.to_owned()]);
     if metadata.backend_version == SPFRESH_RABITQ_FORMAT_VERSION {
         expected.push(SIDECAR.to_owned());
+    }
+    if metadata.backend_version == SPFRESH_OFFICIAL_RABITQ_FORMAT_VERSION {
+        expected.push(OFFICIAL_SIDECAR.to_owned());
     }
     expected.sort_unstable();
     let mut actual = metadata
@@ -242,6 +266,8 @@ struct SpFreshIndex {
     // Rust drops fields in declaration order: close native IO before releasing files.
     native: Native,
     quantized: Option<QuantizedIndex>,
+    #[cfg(feature = "rabitq-official")]
+    official: Option<OfficialIndex>,
     _lease: Box<dyn LocalArtifactLease>,
     metadata: IndexMetadata,
     bundle: SpFreshBundle,
@@ -258,9 +284,22 @@ struct QueryOptions {
     search_pages: u32,
     #[serde(default)]
     rabitq: Option<RaBitQErrorBound>,
+    #[serde(default)]
+    rerank: Option<u32>,
 }
 
 impl SpFreshIndex {
+    fn has_official(&self) -> bool {
+        #[cfg(feature = "rabitq-official")]
+        {
+            self.official.is_some()
+        }
+        #[cfg(not(feature = "rabitq-official"))]
+        {
+            false
+        }
+    }
+
     fn options(
         &self,
         options: &VectorSearchOptions,
@@ -284,6 +323,7 @@ impl SpFreshIndex {
                 internal_results: k.max(64),
                 search_pages: self.bundle.posting_page_limit,
                 rabitq: None,
+                rerank: None,
             }
         } else {
             if options.backend_options.len() > 4096 {
@@ -304,11 +344,17 @@ impl SpFreshIndex {
             vortex_bail!("RaBitQ query options require a quantized generation");
         }
         native.rabitq.unwrap_or_default().validate()?;
+        if let Some(rerank) = native.rerank
+            && (!self.has_official() || rerank < k || rerank > self.bundle.rows)
+        {
+            vortex_bail!("Rerank requires official RaBitQ and a budget between k and rows");
+        }
         // Posting reads are truncated by the bundle page limit when the index is
         // opened; search_pages must equal that limit (validated above), so each
         // native page buffer holds exactly posting_page_limit pages.
         let pages = u64::from(self.bundle.posting_page_limit);
         if self.quantized.is_none()
+            && !self.has_official()
             && pages * u64::from(native.internal_results) * 4096
                 > self.limits.max_posting_buffer_bytes
         {
@@ -332,6 +378,57 @@ impl SpFreshIndex {
         options: QueryOptions,
         filter: &RowFilter,
     ) -> VortexResult<Vec<Vec<SearchHit>>> {
+        #[cfg(feature = "rabitq-official")]
+        if let Some(official) = &self.official {
+            let allowed = self.allowed_mask(filter);
+            if allowed
+                .as_ref()
+                .is_some_and(|mask| mask.iter().all(|byte| *byte == 0))
+            {
+                return Ok(vec![Vec::new(); queries.len() / self.spec.dimension.get()]);
+            }
+            let rerank = options
+                .rerank
+                .unwrap_or_else(|| k.max(500).min(self.bundle.rows));
+            return queries
+                .chunks_exact(self.spec.dimension.get())
+                .map(|query| {
+                    let heads = self.native.search_heads(
+                        query,
+                        options.max_check,
+                        options.internal_results,
+                    )?;
+                    let (hits, stats) =
+                        official.search(query, &heads, k, rerank, allowed.as_deref())?;
+                    tracing::debug!(
+                        scanned_vectors = stats.scanned,
+                        retained_vectors = stats.retained,
+                        reranked_vectors = stats.reranked,
+                        exact_fallbacks = stats.exact_fallbacks,
+                        original_io = "pread",
+                        original_vector_bytes = stats.original_bytes,
+                        original_read_calls = stats.original_read_calls,
+                        original_read_bytes = stats.original_read_bytes,
+                        candidate_hash = stats.candidate_hash,
+                        shortlist_hash = stats.shortlist_hash,
+                        original_read_ns = stats.original_read_ns,
+                        estimate_ns = stats.estimate_ns,
+                        shortlist_ns = stats.shortlist_ns,
+                        exact_ns = stats.exact_ns,
+                        "SPFresh official RaBitQ refinement"
+                    );
+                    hits.into_iter()
+                        .map(|(id, distance)| {
+                            let row = self.rows[id as usize];
+                            if !filter.includes(row) {
+                                vortex_bail!("Official RaBitQ returned a row outside the filter");
+                            }
+                            Ok(SearchHit { row, distance })
+                        })
+                        .collect()
+                })
+                .collect();
+        }
         if let Some(quantized) = &self.quantized {
             return queries
                 .chunks_exact(self.spec.dimension.get())
@@ -351,8 +448,13 @@ impl SpFreshIndex {
                     )?;
                     tracing::debug!(
                         scanned_vectors = stats.scanned,
+                        retained_vectors = stats.retained,
                         reranked_vectors = stats.reranked,
                         original_vector_bytes = stats.original_bytes,
+                        original_read_calls = stats.original_read_calls,
+                        original_read_bytes = stats.original_read_bytes,
+                        original_cache_bytes = stats.original_cache_bytes,
+                        exact_fallbacks = stats.exact_fallbacks,
                         "SPFresh RaBitQ refinement"
                     );
                     Ok(hits)
@@ -360,15 +462,7 @@ impl SpFreshIndex {
                 .collect();
         }
         // Convert once per batch, using the validated native-ID -> row dictionary.
-        let allowed = filter.is_restricted().then(|| {
-            let mut mask = vec![0u8; self.rows.len().div_ceil(8)];
-            for (id, row) in self.rows.iter().enumerate() {
-                if filter.includes(*row) {
-                    mask[id / 8] |= 1 << (id % 8);
-                }
-            }
-            mask
-        });
+        let allowed = self.allowed_mask(filter);
         if allowed
             .as_ref()
             .is_some_and(|mask| mask.iter().all(|byte| *byte == 0))
@@ -412,6 +506,18 @@ impl SpFreshIndex {
                 Ok(hits)
             })
             .collect()
+    }
+
+    fn allowed_mask(&self, filter: &RowFilter) -> Option<Vec<u8>> {
+        filter.is_restricted().then(|| {
+            let mut mask = vec![0u8; self.rows.len().div_ceil(8)];
+            for (id, row) in self.rows.iter().enumerate() {
+                if filter.includes(*row) {
+                    mask[id / 8] |= 1 << (id % 8);
+                }
+            }
+            mask
+        })
     }
 }
 

@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <memory>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -138,7 +139,7 @@ extern "C" int vortex_spfresh_build(const char *root,
         const uint64_t components = static_cast<uint64_t>(dimension) * rows;
         if (vectors == nullptr || dimension == 0 || dimension > 4096 || rows < 64 || rows > INT32_MAX ||
             heads < 32 || heads >= rows || posting_pages == 0 || posting_pages > 4096 || replicas == 0 ||
-            replicas > 8 || components * sizeof(float) > INT32_MAX) {
+            replicas > 8 || components > std::numeric_limits<size_t>::max() / sizeof(float)) {
             throw std::runtime_error("Invalid SPFresh static build options");
         }
         for (uint64_t component = 0; component < components; ++component) {
