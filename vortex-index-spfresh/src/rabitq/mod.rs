@@ -57,6 +57,8 @@ pub struct RaBitQBuildOptions {
 /// Queries estimate every candidate, select a fixed rerank budget, then use original
 /// Float32 vectors for exact squared-L2 distances. Approximate routing and shortlist
 /// selection require workload-specific recall qualification.
+/// Source and query squared norms must not exceed `sqrt(f32::MAX) / 64` to leave
+/// headroom for the official Float32 factor computation's intermediate products.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OfficialRaBitQBuildOptions {

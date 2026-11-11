@@ -74,8 +74,11 @@ void validate_vector(const float *values, uint32_t dimension) {
         }
         norm += value * value;
     }
-    if (norm > double(std::numeric_limits<float>::max()) / 64) {
-        throw std::runtime_error("RaBitQ vector norm exceeds safe Float32 encoding range");
+    // Official factors multiply a residual squared norm by a center/code inner
+    // product before dividing. Leave headroom for these intermediate products.
+    const double limit = std::sqrt(double(std::numeric_limits<float>::max())) / 64;
+    if (norm > limit) {
+        throw std::runtime_error("RaBitQ vector squared norm exceeds safe Float32 factor range");
     }
 }
 struct Model {
@@ -169,13 +172,16 @@ struct Model {
             batch_offsets.front() || batch_offsets.back() != batches) {
             throw std::runtime_error("Invalid official model extents");
         }
-        owner.assign(N, UINT32_MAX);
-        position.resize(N);
         for (uint32_t h = 0; h < H; ++h) {
-            if (offsets[h] >= offsets[h + 1] ||
+            if (offsets[h] >= offsets[h + 1] || offsets[h + 1] > N ||
+                batch_offsets[h] >= batch_offsets[h + 1] || batch_offsets[h + 1] > batches ||
                 batch_offsets[h + 1] - batch_offsets[h] != (offsets[h + 1] - offsets[h] + 31) / 32) {
                 throw std::runtime_error("Invalid official group");
             }
+        }
+        owner.assign(N, UINT32_MAX);
+        position.resize(N);
+        for (uint32_t h = 0; h < H; ++h) {
             for (uint32_t i = offsets[h]; i < offsets[h + 1]; ++i) {
                 const auto id = ids[i];
                 if (id >= N || owner[id] != UINT32_MAX) {

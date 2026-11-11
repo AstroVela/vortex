@@ -593,10 +593,13 @@ and a distinct official sidecar. Conflicting legacy `rabitq` options are rejecte
 Native head selection uses the existing SPFresh builder; `unquantized_twin`
 shares its exact native files for paired benchmarks. `rabitq_official.seed`
 controls the numerical rotation independently of native routing.
-The source vectors must have squared norms no greater than `f32::MAX / 64`, so
-the official Float32 encoding arithmetic stays finite. Query vectors have the
-same bound. The common squared-L2 metric is unchanged; callers normalize both
-database and queries themselves when using cosine ground truth.
+Source and query vectors must have squared norms no greater than
+`sqrt(f32::MAX) / 64` (approximately `2.88e17`). This conservative limit leaves
+headroom for intermediate products in the official Float32 factor computation;
+checking only the representability of a squared norm is insufficient. Vectors
+outside this range fail with a norm-range error. The common squared-L2 metric is
+unchanged; callers normalize both database and queries themselves when using
+cosine ground truth.
 
 The ninth artifact is `spfresh/rabitq-official.bin`. Its `VXORBQ04` header records
 original/padded dimensions, bits, grouping, rotation kind and exact extents.

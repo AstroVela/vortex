@@ -298,6 +298,33 @@ fn test_official_corruption_and_query_errors_preserve_loaded_index() -> VortexRe
 }
 
 #[test]
+fn test_official_review_group_offsets_are_validated_before_ids() -> VortexResult<()> {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().join("native");
+    let (bundle, _, rows) = fixture(&root, 65)?;
+    let original = fs::read(root.join("rabitq-official.bin"))?;
+    let rotation_bytes = u64::from_le_bytes(std::array::from_fn(|i| original[48 + i]));
+    let batches = u64::from_le_bytes(std::array::from_fn(|i| original[40 + i]));
+    let batch_offsets = 64 + usize::try_from(rotation_bytes)? + 32 * 96 * 4;
+    let offsets = batch_offsets + 33 * 8;
+    let malformed = root.join("malformed.bin");
+    for (end, batch_end) in [(98, 4), (u32::MAX, batches + 1), (0, 0)] {
+        let mut bytes = original.clone();
+        bytes[offsets + 4..offsets + 8].copy_from_slice(&end.to_le_bytes());
+        bytes[batch_offsets + 8..batch_offsets + 16].copy_from_slice(&batch_end.to_le_bytes());
+        fs::write(&malformed, bytes)?;
+        let error = OfficialIndex::open(&root, &malformed, bundle, &rows)
+            .err()
+            .ok_or_else(|| vortex_err!("Malformed group offsets were accepted"))?;
+        assert!(
+            error.to_string().contains("Invalid official group"),
+            "{error}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn test_official_query_state_is_serialized_across_threads() -> VortexResult<()> {
     let directory = tempfile::tempdir()?;
     let root = directory.path().join("native");

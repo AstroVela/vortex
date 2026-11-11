@@ -1090,6 +1090,160 @@ fn test_official_rabitq_builder_store_reopen_filter_and_budget() -> VortexResult
 }
 
 #[test]
+#[cfg(feature = "rabitq-official")]
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    reason = "Fixture components and scales fit Float32; norms are independently checked in Float64"
+)]
+fn test_official_review_builder_rejects_unsafe_factor_products() -> VortexResult<()> {
+    block_on(|handle| async move {
+        let session = session(handle)?;
+        let directory = tempfile::tempdir()?;
+        for dimension in [1, 65, 4096] {
+            let root = directory.path().join(format!("dimension-{dimension}"));
+            fs::create_dir(&root)?;
+            fs::create_dir(root.join("scratch"))?;
+            fs::create_dir(root.join("store"))?;
+            let snapshot = Snapshot {
+                dataset_id: "official-norm".into(),
+                version: "v1".into(),
+                schema_fingerprint: "schema".into(),
+                files: vec![SourceFile {
+                    id: 11,
+                    uri: "test".into(),
+                    version: "v1".into(),
+                    row_count: 97,
+                }],
+            };
+            let base = (0..97)
+                .flat_map(|id| {
+                    (0..dimension)
+                        .map(move |j| ((id * 37 + j * 17 + id * j * 3) % 1009) as f32 - 504.0)
+                })
+                .collect::<Vec<_>>();
+            let base_norm = base
+                .chunks_exact(dimension as usize)
+                .map(|v| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>())
+                .fold(0.0f64, f64::max);
+            let limit = f64::from(f32::MAX).sqrt() / 64.0;
+            let boundary_scale = (limit / base_norm).sqrt() as f32;
+            let config = SpFreshBuildOptions {
+                format_version: 3,
+                dimension,
+                posting_page_limit: 128,
+                head_count: 32,
+                replicas: 1,
+                rabitq_official: Some(crate::rabitq::OfficialRaBitQBuildOptions { seed: 42 }),
+                ..config()
+            };
+            let builder = builder(&root, &session)?;
+            for (generation, scale, accepted) in [
+                ("overflow-repro", 1e12, false),
+                ("inside-bound", boundary_scale * 0.99, true),
+                ("outside-bound", boundary_scale * 1.01, false),
+            ] {
+                let values = base.iter().map(|value| value * scale).collect::<Vec<_>>();
+                let max_norm = values
+                    .chunks_exact(dimension as usize)
+                    .map(|v| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>())
+                    .fold(0.0f64, f64::max);
+                assert!(max_norm < f64::from(f32::MAX) / 64.0);
+                assert_eq!(max_norm <= limit, accepted);
+                let rows = (0..97)
+                    .map(|row_offset| RowAddress {
+                        file_id: 11,
+                        row_offset,
+                    })
+                    .collect::<Vec<_>>();
+                let input = TestSource {
+                    snapshot: snapshot.clone(),
+                    rows: rows.clone(),
+                    data: projected(values.clone(), dimension, Validity::NonNullable)?,
+                    fail: false,
+                    scans: AtomicUsize::new(0),
+                };
+                let store = Arc::new(LocalIndexStore::create(
+                    root.join("store"),
+                    generation,
+                    LIMITS,
+                )?);
+                let result = builder
+                    .build(
+                        request(
+                            IndexMetadata {
+                                backend_version: 3,
+                                generation: generation.into(),
+                                ..metadata(snapshot.clone())
+                            },
+                            &config,
+                        )?,
+                        Arc::new(input),
+                        Arc::clone(&store) as Arc<dyn IndexStore>,
+                    )
+                    .await;
+                if accepted {
+                    let metadata = result?;
+                    store.seal(&metadata)?;
+                    let index = provider(&root)?.open(&metadata, store).await?;
+                    let ann = index
+                        .as_vector()
+                        .ok_or_else(|| vortex_err!("Missing official vector capability"))?;
+                    let query = values[..dimension as usize].to_vec();
+                    let flat = FlatIndex::try_new(
+                        IndexMetadata {
+                            backend: FlatIndex::ID.into(),
+                            backend_version: 1,
+                            artifacts: vec![],
+                            ..metadata
+                        },
+                        ann.spec(),
+                        rows,
+                        Buffer::from(values),
+                    )?;
+                    let options = VectorSearchOptions {
+                    backend_options: Bytes::from_static(
+                        br#"{"max_check":4096,"internal_results":32,"search_pages":128,"rerank":97}"#,
+                    ),
+                    ..options(10)?
+                };
+                    let visibility = filter(&snapshot)?;
+                    assert_eq!(
+                        ann.search(&query, &options, &visibility).await?,
+                        flat.search(&query, &super::options(10)?, &visibility)
+                            .await?
+                    );
+                    let mut query = vec![0.0; dimension as usize];
+                    query[0] = limit.sqrt() as f32 * 1.01;
+                    let error = ann
+                        .search(&query, &options, &visibility)
+                        .await
+                        .err()
+                        .ok_or_else(|| vortex_err!("Unsafe official query was accepted"))?;
+                    assert!(error.to_string().contains("norm exceeds"), "{error}");
+                    drop(index);
+                } else {
+                    let error = result
+                        .err()
+                        .ok_or_else(|| vortex_err!("Unsafe official input was accepted"))?;
+                    assert!(
+                        error.to_string().contains("norm exceeds"),
+                        "squared norm {max_norm:e}: {error}"
+                    );
+                    assert_eq!(
+                        fs::read_dir(root.join("store").join(generation).join("artifacts"))?
+                            .count(),
+                        0
+                    );
+                }
+                assert_eq!(fs::read_dir(root.join("scratch"))?.count(), 0);
+            }
+        }
+        Ok(())
+    })
+}
+
+#[test]
 fn test_build_byte_limits_support_explicit_large_float32_input() -> VortexResult<()> {
     block_on(|handle| async move {
         let session = session(handle)?;
