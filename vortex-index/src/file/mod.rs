@@ -93,7 +93,7 @@ pub struct VerifiedFile {
 impl VerifiedFile {
     /// Verify and open encoded bytes once, without accessing the source URI.
     ///
-    /// The expected entry must use an absolute URI and lowercase SHA-256 identity.
+    /// The entry retains its opaque URI and must use a lowercase SHA-256 identity.
     /// The file must embed its dtype. The byte budget excludes decoded data and
     /// reader allocations. This object retains the bytes until it is dropped or
     /// transferred into [`LocalFileSource::from_verified`].
@@ -143,9 +143,6 @@ impl VerifiedFile {
 }
 
 fn validate_file(file: &SourceFile) -> VortexResult<()> {
-    if !Path::new(&file.uri).is_absolute() {
-        vortex_bail!("Local file source requires an absolute path: {}", file.uri);
-    }
     if !file.version.strip_prefix("sha256:").is_some_and(|digest| {
         digest.len() == 64
             && digest
@@ -165,7 +162,7 @@ fn validate_file(file: &SourceFile) -> VortexResult<()> {
 /// Every physical row is visible. All files must have the same non-nullable
 /// top-level struct dtype; individual fields may be nullable or nested.
 /// [`Self::open`] requires absolute native filesystem paths, not URLs.
-/// [`Self::from_buffers`] retains URI strings as opaque physical identities.
+/// [`Self::from_buffers`] and [`Self::from_verified`] retain opaque URI identities.
 /// Subsequent scans read only pinned bytes, so path replacement, deletion, or
 /// in-place writes cannot change an already opened source.
 pub struct LocalFileSource {
