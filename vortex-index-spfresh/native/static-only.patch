@@ -185,6 +185,27 @@ index b583d38..f98ead6 100644
              virtual std::uint64_t WriteBinary(std::uint64_t writeSize, const char* buffer, std::uint64_t offset = UINT64_MAX) = 0;
  
              virtual std::uint64_t ReadString(std::uint64_t& readSize, std::unique_ptr<char[]>& buffer, char delim = '\n', std::uint64_t offset = UINT64_MAX) = 0;
+diff --git a/AnnService/inc/Helper/Logging.h b/AnnService/inc/Helper/Logging.h
+index 38143e9..9a4d8d4 100644
+--- a/AnnService/inc/Helper/Logging.h
++++ b/AnnService/inc/Helper/Logging.h
+@@ -43,13 +43,13 @@ namespace SPTAG
+             {
+                 if (level < m_level) return;
+ 
+-                if (level != LogLevel::LL_Empty) printf("[%d] ", (int)level);
++                if (level != LogLevel::LL_Empty) fprintf(stderr, "[%d] ", (int)level);
+ 
+                 va_list args;
+                 va_start(args, format);
+                 
+-                vprintf(format, args);
+-                fflush(stdout);
++                vfprintf(stderr, format, args);
++                fflush(stderr);
+ 
+                 va_end(args);
+             }
 diff --git a/AnnService/src/Core/Common/DistanceUtils.cpp b/AnnService/src/Core/Common/DistanceUtils.cpp
 index 5c86cad..c8af316 100644
 --- a/AnnService/src/Core/Common/DistanceUtils.cpp
