@@ -208,6 +208,7 @@ impl Fixture {
 mod persistence;
 
 mod buffers;
+mod verified;
 
 fn assert_error<T>(result: VortexResult<T>, message: &str) -> VortexResult<()> {
     let err = result
