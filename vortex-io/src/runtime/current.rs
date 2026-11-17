@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
@@ -18,6 +19,7 @@ use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::future::Shared;
 use futures::future::join_all;
+use futures::future::poll_fn;
 use futures::stream::BoxStream;
 use parking_lot::Mutex;
 use smol::block_on;
@@ -73,19 +75,80 @@ impl Default for CurrentThreadRuntime {
 thread_local! {
     static CANCELLATIONS: RefCell<Cancellations> = RefCell::new(Cancellations::default());
     static EXECUTING_TASKS: RefCell<Vec<Arc<TaskCleanup>>> = const { RefCell::new(Vec::new()) };
+    static DRIVING_CLEANUP: Cell<bool> = const { Cell::new(false) };
 }
 
 static CANCELLATION_GRAPH: Mutex<()> = Mutex::new(());
 
-#[derive(Default)]
 struct TaskCleanup {
+    executor: Weak<smol::Executor<'static>>,
     children: Mutex<Vec<ChildCleanup>>,
+}
+
+impl TaskCleanup {
+    fn new(executor: Weak<smol::Executor<'static>>) -> Self {
+        Self {
+            executor,
+            children: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+struct CleanupDrive;
+
+impl CleanupDrive {
+    fn enter() -> Option<Self> {
+        DRIVING_CLEANUP.with(|driving| {
+            if driving.replace(true) {
+                None
+            } else {
+                Some(Self)
+            }
+        })
+    }
+}
+
+impl Drop for CleanupDrive {
+    fn drop(&mut self) {
+        DRIVING_CLEANUP.with(|driving| driving.set(false));
+    }
 }
 
 #[derive(Clone)]
 struct ChildCleanup {
     token: Weak<TaskCleanup>,
     completion: Shared<BoxFuture<'static, ()>>,
+}
+
+async fn join_child(mut child: ChildCleanup, driving: Weak<smol::Executor<'static>>) {
+    poll_fn(|cx| {
+        if Pin::new(&mut child.completion).poll(cx).is_ready() {
+            return Poll::Ready(());
+        }
+        // A peer runtime may have no worker. Borrow its executor only for this poll.
+        let target = child
+            .token
+            .upgrade()
+            .map(|token| Weak::clone(&token.executor));
+        if let Some(target) = target {
+            if Weak::ptr_eq(&target, &driving) {
+                return Poll::Pending;
+            }
+            let Some(executor) = target.upgrade() else {
+                return Poll::Pending;
+            };
+            if let Some(_drive) = CleanupDrive::enter() {
+                if executor.try_tick() {
+                    cx.waker().wake_by_ref();
+                }
+            } else {
+                // An outer tick drives this runnable; defer further executor re-entry.
+                cx.waker().wake_by_ref();
+            }
+        }
+        Poll::Pending
+    })
+    .await;
 }
 
 fn depends_on(start: &Arc<TaskCleanup>, target: &Arc<TaskCleanup>) -> bool {
@@ -168,7 +231,7 @@ impl Drop for CurrentThreadFuture {
 
 impl Executor for CurrentThreadExecutor {
     fn spawn(&self, future: BoxFuture<'static, ()>) -> AbortHandleRef {
-        let token = Arc::new(TaskCleanup::default());
+        let token = Arc::new(TaskCleanup::new(Arc::downgrade(&self.inner)));
         let task = self.inner.spawn(CurrentThreadFuture {
             future: Some(future),
             token: Arc::clone(&token),
@@ -237,13 +300,13 @@ fn cancel_and_join(
             drop(AssertUnwindSafe(task.cancel()).catch_unwind().await);
         }
         // Keep pending links visible while joining so another worker can detect a cycle.
-        let children = cleanup_token
-            .children
-            .lock()
-            .iter()
-            .map(|child| child.completion.clone())
-            .collect::<Vec<_>>();
-        join_all(children).await;
+        let children = cleanup_token.children.lock().clone();
+        join_all(
+            children
+                .into_iter()
+                .map(|child| join_child(child, Weak::clone(&cleanup_token.executor))),
+        )
+        .await;
     }
     .boxed();
     let cancellation = CurrentThreadFuture {
@@ -286,15 +349,24 @@ fn cancel_and_join(
         return;
     }
     if parent.is_some() {
-        // A running task must finish its poll before an ancestor can acknowledge cancellation.
-        // Drive this receipt asynchronously; the outer close boundary still joins descendants.
-        executor
-            .inner
-            .spawn(async move {
-                cancellation.clone().await;
-                retire_receipt(parent.as_ref(), &cancellation);
-            })
-            .detach();
+        // Progress on the active caller's runtime, including peers with no background worker.
+        let caller = parent
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .and_then(|token| token.executor.upgrade());
+        if let Some(caller) = caller {
+            let driving = Arc::downgrade(&caller);
+            let child = ChildCleanup {
+                token: Arc::downgrade(&token),
+                completion: cancellation.clone(),
+            };
+            caller
+                .spawn(async move {
+                    join_child(child, driving).await;
+                    retire_receipt(parent.as_ref(), &cancellation);
+                })
+                .detach();
+        }
         return;
     }
     let drain = CANCELLATIONS.with(|cancellations| {
@@ -357,7 +429,7 @@ impl CurrentThreadRuntime {
         // ready item without every one of them having to become an executor.
         let capacity = get_available_parallelism().unwrap_or(1).max(1);
         let (result_tx, result_rx) = kanal::bounded_async(capacity);
-        let token = Arc::new(TaskCleanup::default());
+        let token = Arc::new(TaskCleanup::new(Arc::downgrade(&self.executor.inner)));
         let future = async move {
             futures::pin_mut!(stream);
             while let Some(item) = stream.next().await {
