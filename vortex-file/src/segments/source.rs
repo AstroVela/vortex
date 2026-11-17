@@ -5,6 +5,7 @@ use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Weak;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::task::Context;
@@ -87,6 +88,7 @@ type DriverPanic = Arc<Mutex<Option<Box<dyn Any + Send>>>>;
 
 pub struct FileSegmentSource {
     segments: Arc<[SegmentSpec]>,
+    reader: Arc<dyn VortexReadAt>,
     /// A queue for sending read request events to the I/O stream.
     events: mpsc::UnboundedSender<ReadEvent>,
     /// Background request driver, joined by readers to surface a driver panic.
@@ -102,6 +104,7 @@ impl FileSegmentSource {
     ///
     /// The returned source spawns a background driver on `handle` that coalesces and executes
     /// random-access read requests.
+    /// The source and live read futures own the reader; an idle driver holds only a weak reference.
     pub fn open<R: VortexReadAt + Clone>(
         segments: Arc<[SegmentSpec]>,
         reader: R,
@@ -138,11 +141,18 @@ impl FileSegmentSource {
         )
         .boxed();
 
+        let reader = Arc::new(reader);
+        let reader_ref = Arc::downgrade(&reader);
+
         let drive_fut = async move {
             stream
                 .map(move |req| {
-                    let reader = reader.clone();
+                    let reader = Weak::clone(&reader_ref);
                     async move {
+                        // No source or request remains to consume this cancelled read.
+                        let Some(reader) = reader.upgrade() else {
+                            return;
+                        };
                         let result = reader
                             .read_at(req.offset(), req.len(), req.alignment())
                             .await;
@@ -187,6 +197,7 @@ impl FileSegmentSource {
 
         Self {
             segments,
+            reader,
             events: send,
             driver,
             driver_panic,
@@ -235,6 +246,7 @@ impl SegmentSource for FileSegmentSource {
             events: self.events.clone(),
             driver: self.driver.clone(),
             driver_panic: Arc::clone(&self.driver_panic),
+            _reader: Arc::clone(&self.reader),
         };
 
         // One allocation: we only box the returned SegmentFuture, not the inner ReadFuture.
@@ -254,6 +266,8 @@ struct ReadFuture {
     events: mpsc::UnboundedSender<ReadEvent>,
     driver: SharedDriver,
     driver_panic: DriverPanic,
+    // Requests can outlive their source; idle driver tasks must not own this lease.
+    _reader: Arc<dyn VortexReadAt>,
 }
 
 impl Future for ReadFuture {
@@ -383,6 +397,8 @@ mod tests {
     use std::panic::AssertUnwindSafe;
 
     use futures::future::BoxFuture;
+    use vortex_io::runtime::BlockingRuntime;
+    use vortex_io::runtime::current::CurrentThreadRuntime;
     use vortex_io::runtime::tokio::TokioRuntime;
     use vortex_layout::segments::SegmentSource;
     use vortex_metrics::DefaultMetricsRegistry;
@@ -427,6 +443,80 @@ mod tests {
             TokioRuntime::current(),
             RequestMetrics::new(&metrics, vec![]),
         )
+    }
+
+    #[test]
+    fn source_drop_releases_reader_without_driving_runtime() {
+        let runtime = CurrentThreadRuntime::new();
+        let reader = Arc::new(PanickingReadAt);
+        let weak = Arc::downgrade(&reader);
+        let metrics = DefaultMetricsRegistry::default();
+        let source = FileSegmentSource::open(
+            Arc::from([SegmentSpec {
+                offset: 0,
+                length: 4,
+                alignment: Alignment::none(),
+            }]),
+            reader,
+            runtime.handle(),
+            RequestMetrics::new(&metrics, vec![]),
+        );
+        drop(source);
+        assert!(
+            weak.upgrade().is_none(),
+            "Idle read drivers must not keep their reader alive after source drop"
+        );
+    }
+
+    fn buffer_source(runtime: &CurrentThreadRuntime) -> (FileSegmentSource, Weak<ByteBuffer>) {
+        let reader = Arc::new(ByteBuffer::from(vec![1_u8, 2, 3, 4]));
+        let weak = Arc::downgrade(&reader);
+        let source = FileSegmentSource::open(
+            Arc::from([SegmentSpec {
+                offset: 0,
+                length: 4,
+                alignment: Alignment::none(),
+            }]),
+            reader,
+            runtime.handle(),
+            RequestMetrics::new(&DefaultMetricsRegistry::default(), vec![]),
+        );
+        (source, weak)
+    }
+
+    #[test]
+    fn completed_source_releases_reader_without_another_runtime_poll() -> VortexResult<()> {
+        let runtime = CurrentThreadRuntime::new();
+        let (source, reader) = buffer_source(&runtime);
+        let result = runtime.block_on(source.request(SegmentId::from(0)))?;
+        assert_eq!(result.try_into_host_sync()?.as_slice(), &[1, 2, 3, 4]);
+        drop(source);
+        assert!(reader.upgrade().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn request_keeps_reader_alive_after_source_drop() -> VortexResult<()> {
+        let runtime = CurrentThreadRuntime::new();
+        let (source, reader) = buffer_source(&runtime);
+        let request = source.request(SegmentId::from(0));
+        drop(source);
+        assert!(reader.upgrade().is_some());
+        let result = runtime.block_on(request)?;
+        assert_eq!(result.try_into_host_sync()?.as_slice(), &[1, 2, 3, 4]);
+        assert!(reader.upgrade().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_request_releases_reader_without_driving_runtime() {
+        let runtime = CurrentThreadRuntime::new();
+        let (source, reader) = buffer_source(&runtime);
+        let request = source.request(SegmentId::from(0));
+        drop(source);
+        assert!(reader.upgrade().is_some());
+        drop(request);
+        assert!(reader.upgrade().is_none());
     }
 
     fn panic_message(payload: &(dyn Any + Send)) -> &str {
