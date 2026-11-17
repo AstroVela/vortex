@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
@@ -35,6 +36,10 @@ pub use crate::runtime::pool::CurrentThreadWorkerPool;
 ///
 /// Blocking calls drive work on their calling thread. Cancelling owned tasks also drives their
 /// cleanup and the cancellation of child tasks before the outermost cleanup returns.
+/// Nested task cancellation registers its completion so the calling task can finish its poll.
+/// The outer close boundary joins these completions and their descendants.
+/// Cancelling an active ancestor requests cancellation without joining its current poll,
+/// including when the dependency chain runs across worker threads.
 /// Started blocking I/O retains its own resources until the operation finishes.
 ///
 /// It's also possible to clone the runtime onto other threads, each of which can call `block_on`
@@ -70,9 +75,48 @@ thread_local! {
     static EXECUTING_TASKS: RefCell<Vec<Arc<TaskCleanup>>> = const { RefCell::new(Vec::new()) };
 }
 
+static CANCELLATION_GRAPH: Mutex<()> = Mutex::new(());
+
 #[derive(Default)]
 struct TaskCleanup {
-    children: Mutex<Vec<Shared<BoxFuture<'static, ()>>>>,
+    children: Mutex<Vec<ChildCleanup>>,
+}
+
+#[derive(Clone)]
+struct ChildCleanup {
+    token: Weak<TaskCleanup>,
+    completion: Shared<BoxFuture<'static, ()>>,
+}
+
+fn depends_on(start: &Arc<TaskCleanup>, target: &Arc<TaskCleanup>) -> bool {
+    let mut pending = vec![Arc::clone(start)];
+    let mut visited = BTreeSet::new();
+    while let Some(current) = pending.pop() {
+        if Arc::ptr_eq(&current, target) {
+            return true;
+        }
+        if !visited.insert(Arc::as_ptr(&current)) {
+            continue;
+        }
+        pending.extend(
+            current
+                .children
+                .lock()
+                .iter()
+                .filter(|child| child.completion.peek().is_none())
+                .filter_map(|child| child.token.upgrade()),
+        );
+    }
+    false
+}
+
+fn retire_receipt(parent: Option<&Weak<TaskCleanup>>, completion: &Shared<BoxFuture<'static, ()>>) {
+    if let Some(parent) = parent.and_then(Weak::upgrade) {
+        parent
+            .children
+            .lock()
+            .retain(|child| !child.completion.ptr_eq(completion));
+    }
 }
 
 #[derive(Default)]
@@ -186,38 +230,79 @@ fn cancel_and_join(
         drop(task);
         return;
     }
-    let mut cancellation = async move {
+    let cleanup_token = Arc::clone(&token);
+    let future = async move {
         if let Some(task) = task {
             // Normal next() still propagates a driver panic. Cleanup consumes a late panic.
             drop(AssertUnwindSafe(task.cancel()).catch_unwind().await);
         }
-        let children = std::mem::take(&mut *token.children.lock());
+        // Keep pending links visible while joining so another worker can detect a cycle.
+        let children = cleanup_token
+            .children
+            .lock()
+            .iter()
+            .map(|child| child.completion.clone())
+            .collect::<Vec<_>>();
         join_all(children).await;
+    }
+    .boxed();
+    let cancellation = CurrentThreadFuture {
+        future: Some(future),
+        token: Arc::clone(&token),
     }
     .boxed()
     .shared();
-    // Request cancellation immediately, including when another cancellation is being joined.
-    let mut context = Context::from_waker(futures::task::noop_waker_ref());
-    if Pin::new(&mut cancellation).poll(&mut context).is_ready() {
+    let parent = EXECUTING_TASKS.with(|tasks| tasks.borrow().last().map(Arc::clone));
+    let cyclic = if let Some(parent) = &parent {
+        // Serialize graph additions so concurrent workers cannot both introduce a cycle.
+        let _graph = CANCELLATION_GRAPH.lock();
+        if depends_on(&token, parent) {
+            true
+        } else {
+            parent.children.lock().push(ChildCleanup {
+                token: Arc::downgrade(&token),
+                completion: cancellation.clone(),
+            });
+            false
+        }
+    } else {
+        false
+    };
+    if cyclic {
+        // An ancestor on another worker cannot be joined from its own dependency chain.
+        // Dropping the unpolled cancellation still requests cancellation of its raw task.
         return;
     }
-    let parent = EXECUTING_TASKS.with(|tasks| {
-        tasks.borrow().last().map(|parent| {
-            parent.children.lock().push(cancellation.clone());
-            Arc::downgrade(parent)
-        })
-    });
+    let parent = parent.as_ref().map(Arc::downgrade);
+    // Request cancellation immediately, including when another cancellation is being joined.
+    // Keep the original Shared unpolled for receipt identity comparison after completion.
+    let ready = {
+        let mut request = cancellation.clone();
+        let mut context = Context::from_waker(futures::task::noop_waker_ref());
+        Pin::new(&mut request).poll(&mut context).is_ready()
+    };
+    if ready {
+        retire_receipt(parent.as_ref(), &cancellation);
+        return;
+    }
+    if parent.is_some() {
+        // A running task must finish its poll before an ancestor can acknowledge cancellation.
+        // Drive this receipt asynchronously; the outer close boundary still joins descendants.
+        executor
+            .inner
+            .spawn(async move {
+                cancellation.clone().await;
+                retire_receipt(parent.as_ref(), &cancellation);
+            })
+            .detach();
+        return;
+    }
     let drain = CANCELLATIONS.with(|cancellations| {
         let mut cancellations = cancellations.borrow_mut();
         cancellations.joins.push_back(Box::new(move || {
             block_on(executor.inner.run(cancellation.clone()));
-            if let Some(parent) = parent.and_then(|parent| parent.upgrade()) {
-                // Completed receipts must not accumulate in a long-lived parent.
-                parent
-                    .children
-                    .lock()
-                    .retain(|pending| !pending.ptr_eq(&cancellation));
-            }
+            // Completed receipts must not accumulate in a long-lived parent.
+            retire_receipt(parent.as_ref(), &cancellation);
         }));
         !std::mem::replace(&mut cancellations.draining, true)
     });
