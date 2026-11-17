@@ -201,15 +201,23 @@ fn cancel_and_join(
     if Pin::new(&mut cancellation).poll(&mut context).is_ready() {
         return;
     }
-    EXECUTING_TASKS.with(|tasks| {
-        if let Some(parent) = tasks.borrow().last() {
+    let parent = EXECUTING_TASKS.with(|tasks| {
+        tasks.borrow().last().map(|parent| {
             parent.children.lock().push(cancellation.clone());
-        }
+            Arc::downgrade(parent)
+        })
     });
     let drain = CANCELLATIONS.with(|cancellations| {
         let mut cancellations = cancellations.borrow_mut();
         cancellations.joins.push_back(Box::new(move || {
-            block_on(executor.inner.run(cancellation));
+            block_on(executor.inner.run(cancellation.clone()));
+            if let Some(parent) = parent.and_then(|parent| parent.upgrade()) {
+                // Completed receipts must not accumulate in a long-lived parent.
+                parent
+                    .children
+                    .lock()
+                    .retain(|pending| !pending.ptr_eq(&cancellation));
+            }
         }));
         !std::mem::replace(&mut cancellations.draining, true)
     });
