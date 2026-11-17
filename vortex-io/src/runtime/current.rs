@@ -203,15 +203,15 @@ impl Drop for ExecutingTask {
     }
 }
 
-struct CurrentThreadFuture {
-    future: Option<BoxFuture<'static, ()>>,
+struct CurrentThreadFuture<F: Future + ?Sized> {
+    future: Option<Pin<Box<F>>>,
     token: Arc<TaskCleanup>,
 }
 
-impl Future for CurrentThreadFuture {
-    type Output = ();
+impl<F: Future + ?Sized> Future for CurrentThreadFuture<F> {
+    type Output = F::Output;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
         let this = self.get_mut();
         let _executing = ExecutingTask::enter(&this.token);
         this.future
@@ -222,10 +222,39 @@ impl Future for CurrentThreadFuture {
     }
 }
 
-impl Drop for CurrentThreadFuture {
+impl<F: Future + ?Sized> Drop for CurrentThreadFuture<F> {
     fn drop(&mut self) {
         let _executing = ExecutingTask::enter(&self.token);
         drop(self.future.take());
+    }
+}
+
+struct RootCleanup {
+    executor: Arc<CurrentThreadExecutor>,
+    token: Arc<TaskCleanup>,
+}
+
+impl Drop for RootCleanup {
+    fn drop(&mut self) {
+        cancel_and_join(Arc::clone(&self.executor), None, Arc::clone(&self.token));
+    }
+}
+
+impl CurrentThreadExecutor {
+    fn block_on<F: Future>(self: &Arc<Self>, future: F) -> F::Output {
+        let cleanup = RootCleanup {
+            executor: Arc::clone(self),
+            token: Arc::new(TaskCleanup::new(Arc::downgrade(&self.inner))),
+        };
+        let future = CurrentThreadFuture {
+            future: Some(Box::pin(future)),
+            token: Arc::clone(&cleanup.token),
+        };
+        // Root future destruction registers children too. Join after run() has also
+        // returned its prefetched local tasks, including during panic unwinding.
+        let output = block_on(self.inner.run(future));
+        drop(cleanup);
+        output
     }
 }
 
@@ -470,7 +499,7 @@ impl BlockingRuntime for CurrentThreadRuntime {
     where
         Fut: Future<Output = R>,
     {
-        block_on(self.executor.inner.run(fut))
+        self.executor.block_on(fut)
     }
 
     fn block_on_stream<'a, S, R>(&self, stream: S) -> Self::BlockingIterator<'a, R>
@@ -495,7 +524,7 @@ impl<T> Iterator for CurrentThreadIterator<'_, T> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        block_on(self.executor.inner.run(self.stream.next()))
+        self.executor.block_on(self.stream.next())
     }
 }
 
@@ -548,7 +577,7 @@ impl<T> Iterator for ThreadSafeIterator<T> {
             Err(_) => return self.get_task_error(),
         }
 
-        match block_on(self.executor.inner.run(self.results.recv())) {
+        match self.executor.block_on(self.results.recv()) {
             Ok(item) => Some(item),
             Err(_) => self.get_task_error(),
         }
@@ -560,7 +589,7 @@ impl<T> ThreadSafeIterator<T> {
     fn get_task_error(&self) -> Option<T> {
         let task = self.driver.task.lock().take();
         if let Some(task) = task {
-            block_on(self.executor.inner.run(task));
+            self.executor.block_on(task);
         }
         None
     }
