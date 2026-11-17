@@ -1,16 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Weak;
+use std::task::Context;
+use std::task::Poll;
 
+use futures::FutureExt;
 use futures::Stream;
 use futures::StreamExt;
+use futures::future::BoxFuture;
+use futures::future::Shared;
+use futures::future::join_all;
 use futures::stream::BoxStream;
 use parking_lot::Mutex;
 use smol::block_on;
+use vortex_error::VortexExpect;
 use vortex_utils::parallelism::get_available_parallelism;
 
+use crate::runtime::AbortHandle;
+use crate::runtime::AbortHandleRef;
 use crate::runtime::BlockingRuntime;
 use crate::runtime::Executor;
 use crate::runtime::Handle;
@@ -19,8 +33,9 @@ pub use crate::runtime::pool::CurrentThreadWorkerPool;
 /// A current thread runtime allows callers to much more explicitly drive Vortex futures than with
 /// a Tokio runtime.
 ///
-/// The current thread runtime will do no work unless `block_on` is called. In other words, the
-/// default behavior is single-threaded with code running on the thread that called `block_on`.
+/// Blocking calls drive work on their calling thread. Cancelling owned tasks also drives their
+/// cleanup and the cancellation of child tasks before the outermost cleanup returns.
+/// Started blocking I/O retains its own resources until the operation finishes.
 ///
 /// It's also possible to clone the runtime onto other threads, each of which can call `block_on`
 /// to drive work on that thread. Each thread shares the same underlying executor with the same
@@ -29,9 +44,186 @@ pub use crate::runtime::pool::CurrentThreadWorkerPool;
 /// For automatic driving of work, a [`CurrentThreadWorkerPool`] can be created from the runtime
 /// by calling [`new_pool`](CurrentThreadRuntime::new_pool). The returned pool can be configured
 /// with the desired number of worker threads that will drive work on behalf of the runtime.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct CurrentThreadRuntime {
-    executor: Arc<smol::Executor<'static>>,
+    executor: Arc<CurrentThreadExecutor>,
+}
+
+struct CurrentThreadExecutor {
+    inner: Arc<smol::Executor<'static>>,
+    weak: Weak<CurrentThreadExecutor>,
+}
+
+impl Default for CurrentThreadRuntime {
+    fn default() -> Self {
+        Self {
+            executor: Arc::new_cyclic(|weak| CurrentThreadExecutor {
+                inner: Arc::new(smol::Executor::new()),
+                weak: Weak::clone(weak),
+            }),
+        }
+    }
+}
+
+thread_local! {
+    static CANCELLATIONS: RefCell<Cancellations> = RefCell::new(Cancellations::default());
+    static EXECUTING_TASKS: RefCell<Vec<Arc<TaskCleanup>>> = const { RefCell::new(Vec::new()) };
+}
+
+#[derive(Default)]
+struct TaskCleanup {
+    children: Mutex<Vec<Shared<BoxFuture<'static, ()>>>>,
+}
+
+#[derive(Default)]
+struct Cancellations {
+    draining: bool,
+    joins: VecDeque<Box<dyn FnOnce()>>,
+}
+
+struct ExecutingTask;
+
+impl ExecutingTask {
+    fn enter(token: &Arc<TaskCleanup>) -> Self {
+        EXECUTING_TASKS.with(|tasks| tasks.borrow_mut().push(Arc::clone(token)));
+        Self
+    }
+}
+
+impl Drop for ExecutingTask {
+    fn drop(&mut self) {
+        EXECUTING_TASKS.with(|tasks| tasks.borrow_mut().pop());
+    }
+}
+
+struct CurrentThreadFuture {
+    future: Option<BoxFuture<'static, ()>>,
+    token: Arc<TaskCleanup>,
+}
+
+impl Future for CurrentThreadFuture {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        let _executing = ExecutingTask::enter(&this.token);
+        this.future
+            .as_mut()
+            .vortex_expect("Current-thread task future is present until drop")
+            .as_mut()
+            .poll(cx)
+    }
+}
+
+impl Drop for CurrentThreadFuture {
+    fn drop(&mut self) {
+        let _executing = ExecutingTask::enter(&self.token);
+        drop(self.future.take());
+    }
+}
+
+impl Executor for CurrentThreadExecutor {
+    fn spawn(&self, future: BoxFuture<'static, ()>) -> AbortHandleRef {
+        let token = Arc::new(TaskCleanup::default());
+        let task = self.inner.spawn(CurrentThreadFuture {
+            future: Some(future),
+            token: Arc::clone(&token),
+        });
+        Box::new(CurrentThreadAbortHandle {
+            task: Some(task),
+            executor: Weak::clone(&self.weak),
+            token,
+        })
+    }
+
+    fn spawn_cpu(&self, task: Box<dyn FnOnce() + Send + 'static>) -> AbortHandleRef {
+        self.spawn(async move { task() }.boxed())
+    }
+
+    fn spawn_blocking_io(&self, task: Box<dyn FnOnce() + Send + 'static>) -> AbortHandleRef {
+        // Blocking I/O owns its live handle and can finish independently of this executor.
+        self.inner.spawn_blocking_io(task)
+    }
+}
+
+struct CurrentThreadAbortHandle {
+    task: Option<smol::Task<()>>,
+    executor: Weak<CurrentThreadExecutor>,
+    token: Arc<TaskCleanup>,
+}
+
+impl AbortHandle for CurrentThreadAbortHandle {
+    fn abort(mut self: Box<Self>) {
+        let task = self.task.take().vortex_expect("Abort handle owns its task");
+        if let Some(executor) = self.executor.upgrade() {
+            cancel_and_join(executor, Some(task), Arc::clone(&self.token));
+        }
+        // Dropping the task also requests cancellation when its own poll or destructor is active.
+    }
+}
+
+impl Drop for CurrentThreadAbortHandle {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.detach();
+        }
+    }
+}
+
+fn cancel_and_join(
+    executor: Arc<CurrentThreadExecutor>,
+    task: Option<smol::Task<()>>,
+    token: Arc<TaskCleanup>,
+) {
+    let executing = EXECUTING_TASKS.with(|tasks| {
+        tasks
+            .borrow()
+            .iter()
+            .any(|active| Arc::ptr_eq(active, &token))
+    });
+    if executing {
+        // A task can cancel its own handle while it is polling or releasing its future.
+        drop(task);
+        return;
+    }
+    let mut cancellation = async move {
+        if let Some(task) = task {
+            // Normal next() still propagates a driver panic. Cleanup consumes a late panic.
+            drop(AssertUnwindSafe(task.cancel()).catch_unwind().await);
+        }
+        let children = std::mem::take(&mut *token.children.lock());
+        join_all(children).await;
+    }
+    .boxed()
+    .shared();
+    // Request cancellation immediately, including when another cancellation is being joined.
+    let mut context = Context::from_waker(futures::task::noop_waker_ref());
+    if Pin::new(&mut cancellation).poll(&mut context).is_ready() {
+        return;
+    }
+    EXECUTING_TASKS.with(|tasks| {
+        if let Some(parent) = tasks.borrow().last() {
+            parent.children.lock().push(cancellation.clone());
+        }
+    });
+    let drain = CANCELLATIONS.with(|cancellations| {
+        let mut cancellations = cancellations.borrow_mut();
+        cancellations.joins.push_back(Box::new(move || {
+            block_on(executor.inner.run(cancellation));
+        }));
+        !std::mem::replace(&mut cancellations.draining, true)
+    });
+    if drain {
+        loop {
+            let join =
+                CANCELLATIONS.with(|cancellations| cancellations.borrow_mut().joins.pop_front());
+            match join {
+                Some(join) => join(),
+                None => break,
+            }
+        }
+        CANCELLATIONS.with(|cancellations| cancellations.borrow_mut().draining = false);
+    }
 }
 
 impl CurrentThreadRuntime {
@@ -48,7 +240,7 @@ impl CurrentThreadRuntime {
     /// By default, the pool has no worker threads; the caller must set the desired number of
     /// worker threads using the `set_workers` method on the returned pool.
     pub fn new_pool(&self) -> CurrentThreadWorkerPool {
-        CurrentThreadWorkerPool::new(Arc::clone(&self.executor))
+        CurrentThreadWorkerPool::new(Arc::clone(&self.executor.inner))
     }
 
     /// Returns an iterator wrapper around a stream, blocking the current thread for each item.
@@ -72,7 +264,8 @@ impl CurrentThreadRuntime {
         // ready item without every one of them having to become an executor.
         let capacity = get_available_parallelism().unwrap_or(1).max(1);
         let (result_tx, result_rx) = kanal::bounded_async(capacity);
-        let driver = self.executor.spawn(async move {
+        let token = Arc::new(TaskCleanup::default());
+        let future = async move {
             futures::pin_mut!(stream);
             while let Some(item) = stream.next().await {
                 // If all receivers are dropped, we stop driving the stream.
@@ -81,6 +274,11 @@ impl CurrentThreadRuntime {
                     break;
                 }
             }
+        }
+        .boxed();
+        let driver = self.executor.inner.spawn(CurrentThreadFuture {
+            future: Some(future),
+            token: Arc::clone(&token),
         });
 
         ThreadSafeIterator {
@@ -89,6 +287,7 @@ impl CurrentThreadRuntime {
             driver: Arc::new(StreamDriver {
                 executor: Arc::clone(&self.executor),
                 task: Mutex::new(Some(driver)),
+                token,
             }),
         }
     }
@@ -106,7 +305,7 @@ impl BlockingRuntime for CurrentThreadRuntime {
     where
         Fut: Future<Output = R>,
     {
-        block_on(self.executor.run(fut))
+        block_on(self.executor.inner.run(fut))
     }
 
     fn block_on_stream<'a, S, R>(&self, stream: S) -> Self::BlockingIterator<'a, R>
@@ -123,7 +322,7 @@ impl BlockingRuntime for CurrentThreadRuntime {
 
 /// An iterator that wraps up a stream to drive it using the current thread execution.
 pub struct CurrentThreadIterator<'a, T> {
-    executor: Arc<smol::Executor<'static>>,
+    executor: Arc<CurrentThreadExecutor>,
     stream: BoxStream<'a, T>,
 }
 
@@ -131,14 +330,14 @@ impl<T> Iterator for CurrentThreadIterator<'_, T> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        block_on(self.executor.run(self.stream.next()))
+        block_on(self.executor.inner.run(self.stream.next()))
     }
 }
 
 /// An iterator that drives a stream from multiple threads.
 /// Dropping the last clone cancels and joins the task driving its stream.
 pub struct ThreadSafeIterator<T> {
-    executor: Arc<smol::Executor<'static>>,
+    executor: Arc<CurrentThreadExecutor>,
     results: kanal::AsyncReceiver<T>,
     /// Handle to the task driving the stream. Once the stream ends, the first consumer to
     /// observe it joins the task so a panic raised while driving the stream is re-raised rather
@@ -147,16 +346,18 @@ pub struct ThreadSafeIterator<T> {
 }
 
 struct StreamDriver {
-    executor: Arc<smol::Executor<'static>>,
+    executor: Arc<CurrentThreadExecutor>,
     task: Mutex<Option<smol::Task<()>>>,
+    token: Arc<TaskCleanup>,
 }
 
 impl Drop for StreamDriver {
     fn drop(&mut self) {
-        if let Some(task) = self.task.get_mut().take() {
-            // Cancellation must be driven even when no later query polls this executor.
-            block_on(self.executor.run(task.cancel()));
-        }
+        cancel_and_join(
+            Arc::clone(&self.executor),
+            self.task.get_mut().take(),
+            Arc::clone(&self.token),
+        );
     }
 }
 
@@ -182,7 +383,7 @@ impl<T> Iterator for ThreadSafeIterator<T> {
             Err(_) => return self.get_task_error(),
         }
 
-        match block_on(self.executor.run(self.results.recv())) {
+        match block_on(self.executor.inner.run(self.results.recv())) {
             Ok(item) => Some(item),
             Err(_) => self.get_task_error(),
         }
@@ -194,7 +395,7 @@ impl<T> ThreadSafeIterator<T> {
     fn get_task_error(&self) -> Option<T> {
         let task = self.driver.task.lock().take();
         if let Some(task) = task {
-            block_on(self.executor.run(task));
+            block_on(self.executor.inner.run(task));
         }
         None
     }
