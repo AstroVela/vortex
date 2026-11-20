@@ -46,11 +46,57 @@ fn verified(fixture: &Fixture) -> VortexResult<BTreeMap<u64, VerifiedFile>> {
         .collect()
 }
 
-#[test]
-fn test_verified_files_retain_readers_through_assembly_and_path_removal() -> VortexResult<()> {
-    block_on(|handle| async move {
+#[rstest::rstest]
+#[case::absolute(None)]
+#[case::relative(Some("relative/source"))]
+#[case::file_uri(Some("file:/unopened/source"))]
+fn test_verified_files_retain_readers_through_assembly_and_path_removal(
+    #[case] uri_prefix: Option<&str>,
+) -> VortexResult<()> {
+    block_on(move |handle| async move {
         let fixture = Fixture::new(handle).await?;
-        let files = verified(&fixture)?;
+        let buffers = fixture
+            .snapshot
+            .files
+            .iter()
+            .map(|entry| Ok((entry.id, ByteBuffer::from(fs::read(&entry.uri)?))))
+            .collect::<VortexResult<BTreeMap<_, _>>>()?;
+        let mut snapshot = fixture.snapshot.clone();
+        if let Some(prefix) = uri_prefix {
+            for entry in &mut snapshot.files {
+                entry.uri = format!("{prefix}/{}.vortex", entry.id);
+            }
+            assert_error(
+                LocalFileSource::open(
+                    snapshot.clone(),
+                    fixture.dtype.clone(),
+                    BUDGET,
+                    fixture.session.clone(),
+                )
+                .await,
+                "absolute path",
+            )?;
+        }
+        fs::remove_dir_all(fixture.dir.path())?;
+        let files = snapshot
+            .files
+            .iter()
+            .map(|entry| {
+                let bytes = buffers
+                    .get(&entry.id)
+                    .ok_or_else(|| vortex_err!("Missing fixture buffer"))?;
+                Ok((
+                    entry.id,
+                    VerifiedFile::from_buffer(
+                        entry.clone(),
+                        bytes.clone(),
+                        BUDGET,
+                        fixture.session.clone(),
+                    )?,
+                ))
+            })
+            .collect::<VortexResult<BTreeMap<_, _>>>()?;
+        drop(buffers);
         let total = files
             .values()
             .map(VerifiedFile::pinned_bytes)
@@ -58,8 +104,8 @@ fn test_verified_files_retain_readers_through_assembly_and_path_removal() -> Vor
         for file in files.values() {
             assert_eq!(file.dtype(), &fixture.dtype);
         }
-        fs::remove_dir_all(fixture.dir.path())?;
-        let source = LocalFileSource::from_verified(fixture.snapshot, fixture.dtype, files, total)?;
+        let source = LocalFileSource::from_verified(snapshot.clone(), fixture.dtype, files, total)?;
+        assert_eq!(source.snapshot(), &snapshot);
         assert_eq!(source.pinned_bytes(), total);
         let selected = [row(30, 1), row(10, 4), row(30, 1), row(10, 0)];
         let taken = source
@@ -192,9 +238,6 @@ fn test_verified_file_checks_contents_rows_budget_and_descriptor() -> VortexResu
         let mut changed = entry.clone();
         changed.row_count += 1;
         assert_error(open(changed, bytes.clone(), BUDGET), "row count mismatch")?;
-        let mut changed = entry.clone();
-        changed.uri = "relative.vortex".into();
-        assert_error(open(changed, bytes.clone(), BUDGET), "absolute path")?;
         let mut changed = entry;
         changed.version = "sha256:bad".into();
         assert_error(open(changed, bytes, BUDGET), "lowercase SHA-256")?;
