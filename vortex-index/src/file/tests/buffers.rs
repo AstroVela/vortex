@@ -34,21 +34,43 @@ fn buffers(fixture: &Fixture) -> VortexResult<BTreeMap<u64, ByteBuffer>> {
         .collect()
 }
 
-#[test]
-fn test_buffers_preserve_scan_take_and_ownership_without_paths() -> VortexResult<()> {
-    block_on(|handle| async move {
+#[rstest::rstest]
+#[case::absolute(None)]
+#[case::relative(Some("relative/source"))]
+#[case::file_uri(Some("file:/unopened/source"))]
+fn test_buffers_preserve_scan_take_and_ownership_without_paths(
+    #[case] uri_prefix: Option<&str>,
+) -> VortexResult<()> {
+    block_on(move |handle| async move {
         let fixture = Fixture::new(handle).await?;
         let bytes = buffers(&fixture)?;
         let expected_bytes = bytes.values().map(|buffer| buffer.len()).sum::<usize>();
+        let mut snapshot = fixture.snapshot.clone();
+        if let Some(prefix) = uri_prefix {
+            for file in &mut snapshot.files {
+                file.uri = format!("{prefix}/{}.vortex", file.id);
+            }
+            assert_error(
+                LocalFileSource::open(
+                    snapshot.clone(),
+                    fixture.dtype.clone(),
+                    BUDGET,
+                    fixture.session.clone(),
+                )
+                .await,
+                "absolute path",
+            )?;
+        }
         fs::remove_dir_all(fixture.dir.path())?;
         let source = LocalFileSource::from_buffers(
-            fixture.snapshot.clone(),
+            snapshot.clone(),
             fixture.dtype.clone(),
             bytes.clone(),
             BUDGET,
             fixture.session.clone(),
         )?;
         drop(bytes);
+        assert_eq!(source.snapshot(), &snapshot);
         assert_eq!(source.pinned_bytes(), expected_bytes);
         let selected = [row(30, 1), row(10, 4), row(30, 1), row(10, 0)];
         let taken = source
@@ -162,7 +184,7 @@ fn test_buffers_validate_snapshot_schema_and_rows() -> VortexResult<()> {
             "schema or row count mismatch",
         )?;
         let mut changed = fixture.snapshot.clone();
-        changed.files[0].uri = "relative.vortex".into();
+        changed.files[0].version = "etag:abc".into();
         assert_error(
             LocalFileSource::from_buffers(
                 changed,
@@ -171,7 +193,7 @@ fn test_buffers_validate_snapshot_schema_and_rows() -> VortexResult<()> {
                 BUDGET,
                 fixture.session.clone(),
             ),
-            "absolute path",
+            "lowercase SHA-256",
         )?;
         let mut empty = fixture.snapshot.clone();
         empty.files.clear();

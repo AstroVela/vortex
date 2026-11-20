@@ -353,6 +353,18 @@ void test_masked_posting_radius(const Fixture &fixture) {
     fixture.search(handle.get(), 7);
 }
 
+void test_large_initialization_score(const std::filesystem::path &path) {
+    constexpr uint32_t rows = 128;
+    constexpr uint32_t dimension = rows;
+    std::vector<float> vectors(size_t(rows) * dimension);
+    // Each pairwise distance fits in a float. The initialization score can exceed MaxDist.
+    for (uint32_t row = 0; row < rows; ++row) {
+        vectors[size_t(row) * dimension + row] = 8e17F;
+    }
+    char error[1024] = {};
+    require(vortex_spfresh_build(path.c_str(), vectors.data(), dimension, rows, 64, 12, 1, error) == 0, error);
+}
+
 void test_concurrent_handles(const Fixture &first, const Fixture &second) {
     auto a = first.open();
     auto b = second.open();
@@ -398,12 +410,13 @@ int main() {
         test_error_cleanup(first);
         test_filtered_search(first);
         test_masked_posting_radius(masked);
+        test_large_initialization_score(scratch.path / "large-initialization-score");
         test_thread_migration_and_destruction(first);
         test_concurrent_handles(first, second);
         const auto final = vortex_spfresh_test_workspaces(nullptr);
         require(final.thread_detached && final.live_posting_workspaces == 0,
                 "Tests leaked thread-local or handle-owned workspaces");
-        std::cout << "7 workspace and filter checks passed\n";
+        std::cout << "8 workspace and filter checks passed\n";
         return 0;
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';
