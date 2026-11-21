@@ -2,10 +2,12 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 #include "bridge.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -297,6 +299,60 @@ void test_filtered_search(const Fixture &fixture) {
     }
 }
 
+void test_masked_posting_radius(const Fixture &fixture) {
+    require(fixture.dimension == 1 && fixture.rows == 128, "Invalid masked routing fixture");
+    std::array<uint64_t, 64> heads {};
+    std::ifstream input(fixture.path / "head_ids.bin", std::ios::binary);
+    input.read(reinterpret_cast<char *>(heads.data()), sizeof(heads));
+    require(bool(input) && input.peek() == std::ifstream::traits_type::eof(), "Invalid fixture head IDs");
+    std::vector<bool> is_head(fixture.rows, false);
+    for (auto head : heads) {
+        require(head < fixture.rows && !is_head[head], "Invalid fixture head ID");
+        is_head[head] = true;
+    }
+    auto handle = fixture.open();
+    for (auto head : heads) {
+        const float query = fixture.vectors[head] + 0.125F;
+        std::vector<std::pair<double, uint32_t>> eligible;
+        for (uint32_t row = 0; row < fixture.rows; ++row) {
+            if (!is_head[row]) {
+                const auto delta = double(fixture.vectors[row]) - query;
+                eligible.emplace_back(delta * delta, row);
+            }
+        }
+        std::sort(eligible.rbegin(), eligible.rend());
+        eligible.resize(16);
+        std::sort(eligible.begin(), eligible.end());
+        std::vector<uint8_t> allowed((fixture.rows + 7) / 8, 0);
+        for (const auto &entry : eligible) {
+            allowed[entry.second / 8] |= uint8_t(1) << (entry.second % 8);
+        }
+        std::array<int32_t, 4> ids {};
+        std::array<float, 4> distances {};
+        char error[1024] = {};
+        require(vortex_spfresh_search_filtered(handle.get(),
+                                               &query,
+                                               fixture.dimension,
+                                               1,
+                                               ids.size(),
+                                               4096,
+                                               64,
+                                               fixture.pages,
+                                               allowed.data(),
+                                               allowed.size(),
+                                               ids.data(),
+                                               distances.data(),
+                                               error) == 0,
+                error);
+        for (size_t rank = 0; rank < ids.size(); ++rank) {
+            require(ids[rank] == int32_t(eligible[rank].second),
+                    "Unfiltered head radius pruned eligible postings");
+        }
+        cached(handle.get(), fixture);
+    }
+    fixture.search(handle.get(), 7);
+}
+
 void test_concurrent_handles(const Fixture &first, const Fixture &second) {
     auto a = first.open();
     auto b = second.open();
@@ -336,16 +392,18 @@ int main() {
         Scratch scratch;
         const Fixture first(scratch.path / "first", 8, 256, 12);
         const Fixture second(scratch.path / "second", 16, 320, 4);
+        const Fixture masked(scratch.path / "masked", 1, 128, 12);
         test_reuse_and_handle_isolation(first, second);
         test_option_changes(first);
         test_error_cleanup(first);
         test_filtered_search(first);
+        test_masked_posting_radius(masked);
         test_thread_migration_and_destruction(first);
         test_concurrent_handles(first, second);
         const auto final = vortex_spfresh_test_workspaces(nullptr);
         require(final.thread_detached && final.live_posting_workspaces == 0,
                 "Tests leaked thread-local or handle-owned workspaces");
-        std::cout << "6 workspace and filter checks passed\n";
+        std::cout << "7 workspace and filter checks passed\n";
         return 0;
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';
