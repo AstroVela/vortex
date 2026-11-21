@@ -32,6 +32,8 @@ using namespace duckdb;
 
 namespace {
 
+constexpr char FULL_TEXT_BACKEND[] = "tantivy.static";
+
 void CheckAccess(ClientContext &context) {
     Value enabled;
     if (!context.TryGetCurrentSetting("enable_external_access", enabled) || !enabled.GetValue<bool>()) {
@@ -356,7 +358,7 @@ unique_ptr<FunctionData> BindIndex(ClientContext &context,
         input.table_function.name == "vortex_index_build" || input.table_function.name == "vortex_fts_build";
     auto values = input.inputs;
     if (build && full_text) {
-        values.push_back(Value("tantivy.static"));
+        values.push_back(Value(FULL_TEXT_BACKEND));
         values.push_back(Value(""));
     }
     if (!build) {
@@ -422,6 +424,10 @@ vector<TableFunction> Functions() {
                          InitIndex);
     search.named_parameters["backend_options"] = LogicalType::VARCHAR;
     search.named_parameters["validation_mode"] = LogicalType::VARCHAR;
+    if (!vortex_index_provider_registered(FULL_TEXT_BACKEND)) {
+        return {build, search};
+    }
+
     TableFunction fts_build("vortex_fts_build",
                             {LogicalType::LIST(LogicalType::VARCHAR),
                              LogicalType::VARCHAR,

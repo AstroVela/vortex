@@ -3,6 +3,8 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::ffi::CStr;
+use std::ffi::c_char;
 use std::ffi::c_void;
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -84,6 +86,17 @@ fn indexed_fields(value: &ValueRef, full_text: bool) -> VortexResult<Vec<String>
     Ok(fields)
 }
 
+fn provider_registered(backend: &str) -> bool {
+    FACTORIES.read().contains_key(backend)
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C-unwind" fn vortex_index_provider_registered(backend: *const c_char) -> bool {
+    // The C++ catalog passes the NUL-terminated backend name used at bind time.
+    let backend = unsafe { CStr::from_ptr(backend) };
+    backend.to_str().is_ok_and(provider_registered)
+}
+
 fn bind(build: bool, full_text: bool, inputs: &[&ValueRef]) -> VortexResult<Request> {
     if build && inputs.len() == 5 {
         let ExtractedValue::List(files) = inputs[0].extract() else {
@@ -103,7 +116,7 @@ fn bind(build: bool, full_text: bool, inputs: &[&ValueRef]) -> VortexResult<Requ
         root(&reference)?;
         let fields = indexed_fields(inputs[2], full_text)?;
         let backend = string(inputs[3])?;
-        if !FACTORIES.read().contains_key(&backend) {
+        if !provider_registered(&backend) {
             vortex_bail!("Unknown SQL index backend: {backend}");
         }
         Ok(Request::Build {
