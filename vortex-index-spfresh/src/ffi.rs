@@ -51,6 +51,15 @@ unsafe extern "C" {
         distances: *mut f32,
         error: *mut c_char,
     ) -> i32;
+    fn vortex_spfresh_search_heads(
+        handle: *mut c_void,
+        query: *const f32,
+        dimension: u32,
+        max_check: u32,
+        probes: u32,
+        heads: *mut i32,
+        error: *mut c_char,
+    ) -> i32;
     fn vortex_spfresh_close(handle: *mut c_void);
 }
 
@@ -136,6 +145,49 @@ impl Native {
             handle: NonNull::new(handle).ok_or_else(|| vortex_err!("Null SPFresh handle"))?,
             bundle,
         })
+    }
+
+    pub(crate) fn search_heads(
+        &self,
+        query: &[f32],
+        max_check: u32,
+        probes: u32,
+    ) -> VortexResult<Vec<u32>> {
+        if query.len() != self.bundle.dimension as usize
+            || query.iter().any(|x| !x.is_finite())
+            || !(1..=4096).contains(&probes)
+            || max_check < probes
+            || max_check > 1_048_576
+        {
+            vortex_bail!("Invalid SPFresh head query");
+        }
+        let mut heads = vec![-1i32; probes as usize];
+        let mut error = [0u8; 1024];
+        // SAFETY: live serialized handle, dimension-sized query, probes-sized
+        // output and 1024-byte error buffer. No borrowed pointer survives return.
+        let code = unsafe {
+            vortex_spfresh_search_heads(
+                self.handle.as_ptr(),
+                query.as_ptr(),
+                self.bundle.dimension,
+                max_check,
+                probes,
+                heads.as_mut_ptr(),
+                error.as_mut_ptr().cast(),
+            )
+        };
+        result(code, &error)?;
+        heads
+            .into_iter()
+            .filter(|id| *id != -1)
+            .map(|id| {
+                let id = u32::try_from(id)?;
+                if id >= self.bundle.rows {
+                    vortex_bail!("SPFresh head ID outside row domain");
+                }
+                Ok(id)
+            })
+            .collect()
     }
 
     #[cfg(test)]

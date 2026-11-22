@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use futures::executor::block_on;
+use futures::FutureExt;
 use vortex_array::dtype::DType;
 use vortex_array::memory::MemorySessionExt;
 use vortex_array::session::ArraySessionExt;
@@ -268,9 +268,18 @@ impl VortexOpenOptions {
         let include_metadata = self.include_metadata;
         let mut opts = self.with_initial_read_size(0);
 
+        // The buffer reader and segment source produce ready futures, so this
+        // path can run inside an executor without starting another one.
         let footer = match opts.footer.take() {
             Some(footer) => footer,
-            None => block_on(opts.read_footer(&buffer))?.footer,
+            None => {
+                opts.read_footer(&buffer)
+                    .now_or_never()
+                    .ok_or_else(|| {
+                        vortex_err!("In-memory footer read did not complete immediately")
+                    })??
+                    .footer
+            }
         };
         footer.validate_file_size(buffer.len() as u64)?;
 
@@ -279,7 +288,11 @@ impl VortexOpenOptions {
             footer.segment_specs_with_metadata(),
         ));
         let metadata = if include_metadata {
-            block_on(resolve_metadata(&footer, Arc::clone(&segment_source)))?
+            resolve_metadata(&footer, Arc::clone(&segment_source))
+                .now_or_never()
+                .ok_or_else(|| {
+                    vortex_err!("In-memory metadata read did not complete immediately")
+                })??
         } else {
             Arc::new(HashMap::new())
         };
@@ -812,11 +825,13 @@ mod tests {
         let footer = summary.footer().clone();
         let bytes = ByteBuffer::from(output);
 
-        let file = session
-            .open_options()
-            .with_footer(footer.clone())
-            .include_metadata()
-            .open_buffer(bytes.clone())?;
+        let file = futures::executor::block_on(async {
+            session
+                .open_options()
+                .with_footer(footer.clone())
+                .include_metadata()
+                .open_buffer(bytes.clone())
+        })?;
         assert_eq!(
             file.metadata_segment("key").map(ByteBuffer::as_slice),
             Some(value.as_slice())

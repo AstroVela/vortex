@@ -38,6 +38,7 @@ use vortex_index::IndexStore;
 use vortex_index::LocalArtifactLease;
 use vortex_index::LocalIndexFiles;
 use vortex_index::RowAddress;
+use vortex_index::RowFilter;
 use vortex_index::SearchMode;
 use vortex_index::Snapshot;
 use vortex_index::SourceBatch;
@@ -64,6 +65,7 @@ use crate::SPFRESH_ID;
 use crate::SpFreshBuildLimits;
 use crate::SpFreshBuildOptions;
 use crate::SpFreshIndexBuilder;
+use crate::rabitq::RaBitQBuildOptions;
 use crate::tests::metadata;
 
 fn config() -> SpFreshBuildOptions {
@@ -73,6 +75,7 @@ fn config() -> SpFreshBuildOptions {
         head_count: 64,
         posting_page_limit: 12,
         replicas: 4,
+        rabitq: None,
     }
 }
 
@@ -100,6 +103,14 @@ async fn prepare(
     root: &Path,
     session: &VortexSession,
 ) -> VortexResult<(Arc<LocalIndexStore>, IndexMetadata, Control)> {
+    prepare_with_options(root, session, &config()).await
+}
+
+async fn prepare_with_options(
+    root: &Path,
+    session: &VortexSession,
+    build_options: &SpFreshBuildOptions,
+) -> VortexResult<(Arc<LocalIndexStore>, IndexMetadata, Control)> {
     fs::create_dir(root.join("scratch"))?;
     fs::create_dir(root.join("store"))?;
     let snapshot = snapshot(root, session).await?;
@@ -126,12 +137,21 @@ async fn prepare(
         .builder()
         .ok_or_else(|| vortex_err!("Missing initial build capability"))?
         .build(
-            request(metadata(snapshot.clone()), &config())?,
+            request(
+                IndexMetadata {
+                    backend_version: build_options.format_version,
+                    ..metadata(snapshot.clone())
+                },
+                build_options,
+            )?,
             source,
             Arc::clone(&store) as Arc<dyn IndexStore>,
         )
         .await?;
-    assert_eq!(metadata.artifacts.len(), 8);
+    assert_eq!(
+        metadata.artifacts.len(),
+        if build_options.rabitq.is_some() { 9 } else { 8 }
+    );
     assert_eq!(fs::read_dir(root.join("scratch"))?.count(), 0);
     // Construction does not seal the store or make an index visible.
     assert!(
@@ -895,6 +915,85 @@ fn test_static_builder_real_multipage_postings() -> VortexResult<()> {
             assert!(vector.search_batch(&[], &invalid, &filter).await.is_err());
         }
         assert_eq!(vector.search(&query, &options(5)?, &filter).await?, hits);
+        Ok(())
+    })
+}
+
+#[test]
+fn test_rabitq_build_reopen_filter_and_flat_parity() -> VortexResult<()> {
+    block_on(|handle| async move {
+        let session = session(handle)?;
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let config = SpFreshBuildOptions {
+            format_version: 2,
+            rabitq: Some(RaBitQBuildOptions { seed: 42 }),
+            ..config()
+        };
+        let (store, metadata, control) = prepare_with_options(root, &session, &config).await?;
+        drop(store);
+        let (store, reopened) = LocalIndexStore::open(
+            root.join("store"),
+            &control.generation,
+            &control.snapshot,
+            LIMITS,
+        )?;
+        let index = provider(root)?.open(&reopened, Arc::new(store)).await?;
+        let ann = index
+            .as_vector()
+            .ok_or_else(|| vortex_err!("Missing RaBitQ vector capability"))?;
+        let flat = FlatIndex::try_new(
+            IndexMetadata {
+                backend: FlatIndex::ID.into(),
+                backend_version: 1,
+                artifacts: vec![],
+                ..metadata.clone()
+            },
+            ann.spec(),
+            rows(),
+            Buffer::from_iter((0..256u16).flat_map(vector)),
+        )?;
+        let all = filter(&metadata.snapshot)?;
+        let selected = RowFilter::try_new(
+            metadata.snapshot.clone(),
+            Some(rows().into_iter().step_by(3).collect()),
+            Default::default(),
+        )?;
+        let empty = RowFilter::try_new(
+            metadata.snapshot.clone(),
+            Some(Default::default()),
+            Default::default(),
+        )?;
+        for visibility in [&all, &selected, &empty] {
+            for id in [7, 80, 129, 242] {
+                let query = vector(id);
+                let hits = ann.search(&query, &options(10)?, visibility).await?;
+                let truth = flat.search(&query, &options(10)?, visibility).await?;
+                assert_eq!(hits, truth);
+                let confidence = VectorSearchOptions { backend_options: Bytes::from_static(br#"{"max_check":4096,"internal_results":64,"search_pages":12,"rabitq":{"kind":"probabilistic","epsilon":4.0}}"#), ..options(10)? };
+                assert_eq!(ann.search(&query, &confidence, visibility).await?, truth);
+                let batch = ann
+                    .search_batch(&[Buffer::from(query)], &options(10)?, visibility)
+                    .await?;
+                assert_eq!(batch, vec![hits]);
+            }
+        }
+        let invalid = VectorSearchOptions { backend_options: Bytes::from_static(br#"{"max_check":4096,"internal_results":64,"search_pages":12,"rabitq":{"kind":"probabilistic","epsilon":0.0}}"#), ..options(10)? };
+        assert!(ann.search_batch(&[], &invalid, &all).await.is_err());
+        assert!(
+            ann.search(
+                &vector(7),
+                &VectorSearchOptions {
+                    mode: SearchMode::Exact,
+                    ..options(10)?
+                },
+                &all
+            )
+            .await
+            .is_err()
+        );
+        drop(index);
+        assert_eq!(fs::read_dir(root.join("scratch"))?.count(), 0);
         Ok(())
     })
 }

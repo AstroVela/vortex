@@ -34,20 +34,22 @@ use vortex_session::VortexSession;
 
 use crate::SpFreshBundle;
 use crate::bundle::NATIVE_FILES;
+use crate::bundle::import_bundle_impl;
 use crate::bundle::validate_metadata;
 use crate::bundle::validate_rows;
 use crate::ffi::Native;
-use crate::import_bundle;
+use crate::rabitq::RaBitQBuildOptions;
+use crate::rabitq::build_sidecar;
 use crate::validate;
 
-/// Versioned JSON in [`IndexBuildRequest::backend_options`]. All fields are required.
+/// Versioned JSON in [`IndexBuildRequest::backend_options`]. Shape fields are required.
 ///
 /// Builds only non-nullable `FixedSizeList<Float32>` vectors with squared L2.
-/// Other metrics, quantization, filters and incremental mutation are unsupported.
+/// Version 2 adds RaBitQ; other metrics and incremental mutation are unsupported.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpFreshBuildOptions {
-    /// Build configuration version, currently 1 (separate from the artifact version).
+    /// Build configuration version: 1 for original postings, 2 for RaBitQ.
     pub format_version: u32,
     /// Number of Float32 components per vector, 1..=4096.
     pub dimension: u32,
@@ -60,11 +62,14 @@ pub struct SpFreshBuildOptions {
     pub posting_page_limit: u32,
     /// Maximum posting replicas per non-head vector, 1..=8.
     pub replicas: u32,
+    /// Version 2 requires RaBitQ options; version 1 requires this to be absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rabitq: Option<RaBitQBuildOptions>,
 }
 
 impl SpFreshBuildOptions {
     pub(crate) fn validate(&self, rows: u32) -> VortexResult<()> {
-        if self.format_version != 1
+        if self.format_version != if self.rabitq.is_some() { 2 } else { 1 }
             || rows < 64
             || !(1..=4096).contains(&self.dimension)
             || self.head_count < 32
@@ -85,7 +90,7 @@ pub struct SpFreshBuildLimits {
     pub max_rows: u32,
     /// Maximum flattened Float32 input bytes. Vectors are materialized before native build.
     pub max_vector_bytes: u64,
-    /// Maximum total size of the six native output files, checked before validation/import.
+    /// Maximum total size of native files plus any RaBitQ sidecar, checked before import.
     ///
     /// This is not a limit on temporary native files during construction.
     pub max_native_artifact_bytes: u64,
@@ -199,6 +204,9 @@ impl IndexBuilder for SpFreshIndexBuilder {
         }
         let count = u32::try_from(count)?;
         options.validate(count)?;
+        if metadata.backend_version != options.format_version {
+            vortex_bail!("SPFresh build and artifact versions must match");
+        }
         let vector_bytes = u64::from(count) * u64::from(options.dimension) * 4;
         if vector_bytes > self.limits.max_vector_bytes {
             vortex_bail!("SPFresh build exceeds vector byte limit");
@@ -280,6 +288,24 @@ impl IndexBuilder for SpFreshIndexBuilder {
         validate::native_files(&root, bundle)?;
         drop(Native::open(&root, bundle)?);
         metadata.validate_for(source.snapshot())?;
-        import_bundle(metadata, store.as_ref(), &root, bundle, &rows).await
+        if let Some(options) = options.rabitq {
+            build_sidecar(&root, bundle, options.seed)?;
+            bytes = bytes
+                .checked_add(fs::metadata(root.join("rabitq.bin"))?.len())
+                .ok_or_else(|| vortex_err!("SPFresh output byte count overflow"))?;
+            if bytes > self.limits.max_native_artifact_bytes {
+                vortex_bail!("SPFresh quantized artifacts exceed byte limit");
+            }
+        }
+        metadata.validate_for(source.snapshot())?;
+        import_bundle_impl(
+            metadata,
+            store.as_ref(),
+            &root,
+            bundle,
+            &rows,
+            options.rabitq,
+        )
+        .await
     }
 }
