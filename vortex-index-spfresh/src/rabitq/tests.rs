@@ -3,6 +3,7 @@
 
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::FileExt;
 
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -17,6 +18,7 @@ use vortex_index::SourceFile;
 
 use super::RaBitQ;
 use super::RaBitQErrorBound;
+use super::distance::ExactQuery;
 use super::storage::QuantizedIndex;
 use super::storage::build_sidecar;
 use crate::SpFreshBundle;
@@ -66,6 +68,39 @@ fn test_zero_residual_and_invalid_inputs() -> VortexResult<()> {
     );
     assert!(RaBitQ::new(Vec::new(), 0).is_err());
     assert!(RaBitQ::new(vec![f64::INFINITY], 0).is_err());
+    Ok(())
+}
+
+#[test]
+fn test_prepared_bound_constants_preserve_error_bits() -> VortexResult<()> {
+    for dimension in [1, 7, 128] {
+        let quantizer = RaBitQ::new(vec![1.0; dimension], 42)?;
+        let vector: Vec<f32> = (0..dimension).map(|i| (i % 11) as f32 / 3.0).collect();
+        let query: Vec<f32> = (0..dimension).map(|i| (i % 7) as f32 / 13.0).collect();
+        let code = quantizer.encode(&vector)?;
+        let norm_squared = query
+            .iter()
+            .map(|x| (f64::from(*x) - 1.0).powi(2))
+            .sum::<f64>();
+        for bound in [
+            RaBitQErrorBound::Deterministic,
+            RaBitQErrorBound::Probabilistic { epsilon: 1.0 },
+        ] {
+            let prepared = quantizer.query(&query, bound)?;
+            let expected = 2.0 * code.residual * norm_squared.sqrt() * bound.factor(dimension)
+                + 128.0
+                    * (dimension as f64).powi(2)
+                    * f64::EPSILON
+                    * (code.norm_squared
+                        + norm_squared
+                        + 2.0 * code.scale * norm_squared.sqrt()
+                        + 1.0);
+            assert_eq!(
+                prepared.estimate(&code)?.error.to_bits(),
+                expected.to_bits()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -170,6 +205,245 @@ fn test_persistence_pruning_and_exact_rerank() -> VortexResult<()> {
             )
             .is_err()
     );
+    Ok(())
+}
+
+#[test]
+fn test_original_distance_matches_ordered_f64_sum() -> VortexResult<()> {
+    let values: Vec<Vec<f32>> = (0..17)
+        .map(|i| (0..9).map(|j| (i * 7 + j * 13) as f32 / 11.0).collect())
+        .collect();
+    let (dir, bundle, ..) = fixture(&values)?;
+    build_sidecar(dir.path(), bundle, 7)?;
+    let index = QuantizedIndex::open(dir.path(), &dir.path().join("rabitq.bin"), bundle)?;
+    let mut reader = index.original_reader(0)?;
+    for query in [&values[3], &vec![-0.0; 9], &vec![f32::MAX; 9]] {
+        for (id, value) in values.iter().enumerate() {
+            let expected = value
+                .iter()
+                .zip(query)
+                .map(|(left, right)| {
+                    let delta = f64::from(*left) - f64::from(*right);
+                    delta * delta
+                })
+                .sum::<f64>();
+            assert_eq!(
+                reader.exact_distance(u32::try_from(id)?, query)?.to_bits(),
+                expected.to_bits()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_parallel_distance_preserves_f32_rounding() -> VortexResult<()> {
+    let mut rng = StdRng::seed_from_u64(91);
+    for dimension in [1, 3, 4, 7, 128, 257, 4096] {
+        let query: Vec<f32> = (0..dimension)
+            .map(|_| StandardNormal.sample(&mut rng))
+            .collect();
+        let prepared = ExactQuery::new(&query)?;
+        for vector in [
+            query.clone(),
+            vec![-0.0; dimension],
+            vec![f32::MAX; dimension],
+            vec![f32::from_bits(1); dimension],
+            (0..dimension)
+                .map(|_| StandardNormal.sample(&mut rng))
+                .collect(),
+        ] {
+            let expected = vector
+                .iter()
+                .zip(&query)
+                .map(|(left, right)| {
+                    let delta = f64::from(*left) - f64::from(*right);
+                    delta * delta
+                })
+                .sum::<f64>();
+            assert_eq!(
+                prepared.score(&vector)?.0.to_bits(),
+                super::search::score(expected).to_bits()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_parallel_distance_falls_back_at_rounding_boundary() -> VortexResult<()> {
+    let query = vec![0.0; 130];
+    let mut vector = vec![2.0f32.powi(-28); 130];
+    vector[0] = 1.0;
+    vector[1] = 2.0f32.powi(-12);
+    let (distance, fallback) = ExactQuery::new(&query)?.score(&vector)?;
+    assert_eq!(distance, 1.0);
+    assert!(fallback);
+    Ok(())
+}
+
+#[test]
+fn test_parallel_distance_rejects_invalid_inputs() -> VortexResult<()> {
+    assert!(ExactQuery::new(&[]).is_err());
+    assert!(ExactQuery::new(&[f32::NAN]).is_err());
+    assert!(ExactQuery::new(&[0.0; 4097]).is_err());
+    let query = ExactQuery::new(&[0.0; 4])?;
+    assert!(query.score(&[0.0; 3]).is_err());
+    assert!(query.score(&[f32::INFINITY; 4]).is_err());
+    assert!(query.score(&[f32::NAN; 4]).is_err());
+    Ok(())
+}
+
+#[test]
+fn test_parallel_distance_with_mixed_exponents() -> VortexResult<()> {
+    let mut rng = StdRng::seed_from_u64(407);
+    for dimension in [1, 2, 3, 4, 5, 7, 8, 127, 128, 129, 4095, 4096] {
+        for trial in 0..16 {
+            let mut query = Vec::with_capacity(dimension);
+            let mut vector = Vec::with_capacity(dimension);
+            for values in [&mut query, &mut vector] {
+                for component in 0..dimension {
+                    let value: f32 = StandardNormal.sample(&mut rng);
+                    let exponent = u32::try_from((component * 17 + trial * 7) % 80 + 85)?;
+                    values.push(f32::from_bits(
+                        (value.to_bits() & 0x807f_ffff) | (exponent << 23),
+                    ));
+                }
+            }
+            let expected = vector
+                .iter()
+                .zip(&query)
+                .map(|(left, right)| {
+                    let delta = f64::from(*left) - f64::from(*right);
+                    delta * delta
+                })
+                .sum::<f64>();
+            assert_eq!(
+                ExactQuery::new(&query)?.score(&vector)?.0.to_bits(),
+                super::search::score(expected).to_bits(),
+                "dimension={dimension}, trial={trial}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_non_finite_original_after_open_is_rejected() -> VortexResult<()> {
+    let values = vec![vec![0.0; 9]; 17];
+    let (dir, bundle, rows, filter) = fixture(&values)?;
+    build_sidecar(dir.path(), bundle, 7)?;
+    let index = QuantizedIndex::open(dir.path(), &dir.path().join("rabitq.bin"), bundle)?;
+    fs::OpenOptions::new()
+        .write(true)
+        .open(dir.path().join("vectors.bin"))?
+        .write_all_at(&f32::NAN.to_le_bytes(), 8)?;
+    assert!(
+        index
+            .search(
+                &[0.0; 9],
+                &[0],
+                &rows,
+                &filter,
+                3,
+                RaBitQErrorBound::Deterministic
+            )
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn test_original_reads_are_amortized_over_candidates() -> VortexResult<()> {
+    let values = vec![vec![0.0; 128]; 512];
+    let (dir, bundle, rows, filter) = fixture(&values)?;
+    build_sidecar(dir.path(), bundle, 7)?;
+    let index = QuantizedIndex::open(dir.path(), &dir.path().join("rabitq.bin"), bundle)?;
+    let (hits, stats) = index.search(
+        &[0.0; 128],
+        &[0],
+        &rows,
+        &filter,
+        3,
+        RaBitQErrorBound::Deterministic,
+    )?;
+    assert_eq!(
+        hits.iter().map(|hit| hit.row).collect::<Vec<_>>(),
+        rows.iter().rev().take(3).copied().collect::<Vec<_>>()
+    );
+    assert_eq!(stats.reranked, values.len());
+    assert!(
+        stats.original_read_calls < stats.reranked / 4,
+        "{} reads for {} candidates",
+        stats.original_read_calls,
+        stats.reranked
+    );
+    Ok(())
+}
+
+#[test]
+fn test_original_reader_boundaries_and_cache_limit() -> VortexResult<()> {
+    let values: Vec<Vec<f32>> = (0..512).map(|id| vec![id as f32; 128]).collect();
+    let (dir, bundle, ..) = fixture(&values)?;
+    build_sidecar(dir.path(), bundle, 7)?;
+    let index = QuantizedIndex::open(dir.path(), &dir.path().join("rabitq.bin"), bundle)?;
+    let mut reader = index.original_reader(32 * 1024)?;
+    for id in [0u32, 1, 24, 31, 55, 87, 120, 128, 255, 256, 510, 511] {
+        let delta = f64::from(id) - 121.0;
+        assert_eq!(
+            reader.exact_distance(id, &[121.0; 128])?,
+            128.0 * delta * delta
+        );
+        assert!(reader.cached_bytes <= 32 * 1024);
+    }
+    Ok(())
+}
+
+#[test]
+fn test_packed_codes_match_public_encoding() -> VortexResult<()> {
+    let values: Vec<Vec<f32>> = (0..17)
+        .map(|id| (0..65).map(|i| (id * 7 + i * 13) as f32 / 17.0).collect())
+        .collect();
+    let (dir, bundle, ..) = fixture(&values)?;
+    let path = dir.path().join("postings.bin");
+    let mut postings = fs::read(&path)?;
+    let stride = 4 + values[0].len() * 4;
+    let end = 4096 + (values.len() - 1) * stride;
+    let payload = postings[4096..end].to_vec();
+    for (record, original) in postings[4096..end]
+        .chunks_exact_mut(stride)
+        .zip(payload.chunks_exact(stride).rev())
+    {
+        record.copy_from_slice(original);
+    }
+    fs::write(path, postings)?;
+    build_sidecar(dir.path(), bundle, 7)?;
+    let index = QuantizedIndex::open(dir.path(), &dir.path().join("rabitq.bin"), bundle)?;
+    assert_eq!(index.codes.len(), values.len());
+    for query in [&values[0], &values[8], &values[16]] {
+        for bound in [
+            RaBitQErrorBound::Deterministic,
+            RaBitQErrorBound::Probabilistic { epsilon: 1.0 },
+        ] {
+            let prepared = index.quantizer.query(query, bound)?;
+            for (id, value) in values.iter().enumerate() {
+                let expected = prepared.estimate(&index.quantizer.encode(value)?)?;
+                let actual = index.codes.estimate(&prepared, id)?;
+                assert_eq!(actual.estimate.to_bits(), expected.estimate.to_bits());
+                assert_eq!(actual.error.to_bits(), expected.error.to_bits());
+            }
+            for start in [0u32, 4, 8, 12] {
+                let ids = [start, start + 1, start + 2, start + 3];
+                let batch = index.codes.estimate_four(&prepared, ids)?;
+                for (id, actual) in ids.into_iter().zip(batch) {
+                    let expected =
+                        prepared.estimate(&index.quantizer.encode(&values[id as usize])?)?;
+                    assert_eq!(actual.estimate.to_bits(), expected.estimate.to_bits());
+                    assert_eq!(actual.error.to_bits(), expected.error.to_bits());
+                }
+            }
+        }
+    }
     Ok(())
 }
 

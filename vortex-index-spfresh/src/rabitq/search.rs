@@ -11,13 +11,19 @@ use vortex_index::RowFilter;
 use vortex_index::SearchHit;
 
 use super::RaBitQErrorBound;
+use super::distance::ExactQuery;
 use super::storage::QuantizedIndex;
 
 #[derive(Debug, Default)]
 pub(crate) struct SearchStats {
     pub scanned: usize,
+    pub retained: usize,
     pub reranked: usize,
     pub original_bytes: usize,
+    pub original_read_calls: usize,
+    pub original_read_bytes: usize,
+    pub original_cache_bytes: usize,
+    pub exact_fallbacks: usize,
 }
 
 #[derive(PartialEq)]
@@ -28,7 +34,7 @@ impl Ord for Ranked {
         self.0
             .distance
             .total_cmp(&other.0.distance)
-            .then(self.0.row.cmp(&other.0.row))
+            .then_with(|| self.0.row.cmp(&other.0.row))
     }
 }
 impl PartialOrd for Ranked {
@@ -43,7 +49,7 @@ impl PartialOrd for Ranked {
     clippy::cast_possible_truncation,
     reason = "The shared search API returns f32 distances"
 )]
-fn score(value: f64) -> f32 {
+pub(super) fn score(value: f64) -> f32 {
     value as f32
 }
 
@@ -62,8 +68,9 @@ impl QuantizedIndex {
         }
         let prepared = self.quantizer.query(query, bound)?;
         let mut seen = vec![0u8; self.codes.len().div_ceil(8)];
-        let mut candidates = Vec::new();
+        let mut ids = Vec::new();
         let mut stats = SearchStats::default();
+        let restricted = filter.is_restricted();
         for head in heads {
             let head = *head as usize;
             if head >= self.head_ids.len() {
@@ -72,13 +79,26 @@ impl QuantizedIndex {
             for id in std::iter::once(&self.head_ids[head]).chain(&self.postings[head]) {
                 let index = *id as usize;
                 let bit = 1 << (index % 8);
-                if seen[index / 8] & bit != 0 || !filter.includes(rows[index]) {
+                if seen[index / 8] & bit != 0 || (restricted && !filter.includes(rows[index])) {
                     continue;
                 }
                 seen[index / 8] |= bit;
                 stats.scanned += 1;
-                candidates.push((*id, prepared.estimate(&self.codes[index])?));
+                ids.push(*id);
             }
+        }
+        let mut candidates = Vec::with_capacity(ids.len());
+        let (batches, tail) = ids.as_chunks::<4>();
+        for batch in batches {
+            candidates.extend(
+                batch
+                    .iter()
+                    .copied()
+                    .zip(self.codes.estimate_four(&prepared, *batch)?),
+            );
+        }
+        for id in tail {
+            candidates.push((*id, self.codes.estimate(&prepared, *id as usize)?));
         }
         // An interval upper bound supplies a threshold before any original IO.
         // In confidence mode both this threshold and lower bounds are probabilistic.
@@ -94,13 +114,25 @@ impl QuantizedIndex {
             f64::INFINITY
         };
         candidates.retain(|(_, interval)| score(interval.lower()) <= score(limit));
+        stats.retained = candidates.len();
         candidates.sort_unstable_by(|left, right| {
             left.1
                 .estimate
                 .total_cmp(&right.1.estimate)
-                .then(rows[left.0 as usize].cmp(&rows[right.0 as usize]))
+                .then_with(|| rows[left.0 as usize].cmp(&rows[right.0 as usize]))
         });
+        if candidates.is_empty() {
+            return Ok((Vec::new(), stats));
+        }
         let mut best = BinaryHeap::<Ranked>::with_capacity(k.min(candidates.len()));
+        // Dense survivors amortize chunk reads; sparse reranks avoid prefetching unused vectors.
+        let cache_bytes = if stats.retained * 2 >= stats.scanned {
+            64 * 1024 * 1024
+        } else {
+            0
+        };
+        let mut originals = self.original_reader(cache_bytes)?;
+        let exact = ExactQuery::new(query)?;
         for (id, interval) in candidates {
             if best.len() == k
                 && best
@@ -109,19 +141,10 @@ impl QuantizedIndex {
             {
                 continue;
             }
-            let vector = self.read_vector(id)?;
+            let (distance, fallback) = originals.exact_score(id, &exact)?;
+            stats.exact_fallbacks += usize::from(fallback);
             stats.reranked += 1;
-            stats.original_bytes += vector.len() * 4;
-            let distance = score(
-                vector
-                    .iter()
-                    .zip(query)
-                    .map(|(left, right)| {
-                        let delta = f64::from(*left) - f64::from(*right);
-                        delta * delta
-                    })
-                    .sum::<f64>(),
-            );
+            stats.original_bytes += query.len() * 4;
             if !distance.is_finite() {
                 vortex_bail!("Squared L2 distance exceeds finite f32 range");
             }
@@ -136,6 +159,9 @@ impl QuantizedIndex {
                 best.push(hit);
             }
         }
+        stats.original_read_calls = originals.read_calls;
+        stats.original_read_bytes = originals.read_bytes;
+        stats.original_cache_bytes = originals.cached_bytes;
         Ok((
             best.into_sorted_vec()
                 .into_iter()

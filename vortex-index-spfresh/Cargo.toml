@@ -15,7 +15,8 @@ publish = false
 
 [features]
 default = []
-native = ["dep:base16ct", "dep:cc", "dep:sha2", "dep:futures", "dep:tempfile", "dep:vortex-array", "dep:vortex-session", "dep:tracing"]
+native = ["dep:base16ct", "dep:cc", "dep:sha2", "dep:futures", "dep:hashbrown", "dep:tempfile", "dep:vortex-array", "dep:vortex-session", "dep:tracing"]
+rabitq-official = ["native", "dep:parking_lot"]
 
 [dependencies]
 rand.workspace = true
@@ -23,6 +24,8 @@ rand_distr.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 futures = { workspace = true, optional = true }
+hashbrown = { workspace = true, optional = true }
+parking_lot = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tempfile = { workspace = true, optional = true }
@@ -40,10 +43,12 @@ sha2 = { workspace = true, optional = true }
 
 [dev-dependencies]
 divan.workspace = true
+hashbrown.workspace = true
 vortex-fts = { path = "../vortex-fts" }
 futures = { workspace = true, features = ["executor"] }
 rustix.workspace = true
 tempfile.workspace = true
+tracing-subscriber.workspace = true
 vortex.workspace = true
 vortex-array = { workspace = true, features = ["_test-harness"] }
 vortex-edition.workspace = true
@@ -62,6 +67,10 @@ required-features = ["native"]
 
 [[example]]
 name = "bench_sift_fixture"
+required-features = ["native"]
+
+[[example]]
+name = "vectordbbench_worker"
 required-features = ["native"]
 
 [[bench]]

@@ -21,6 +21,10 @@ pub const SPFRESH_ID: &str = "spfresh.static";
 pub const SPFRESH_FORMAT_VERSION: u32 = 1;
 /// Static bundle version with a RaBitQ sidecar and lazy original-vector reranking.
 pub const SPFRESH_RABITQ_FORMAT_VERSION: u32 = 2;
+/// Static bundle with official two-bit RaBitQ, grouped FastScan and exact reranking.
+pub const SPFRESH_OFFICIAL_RABITQ_FORMAT_VERSION: u32 = 3;
+/// Pinned official RaBitQ numerical-library revision used by the optional backend.
+pub const RABITQ_OFFICIAL_REVISION: &str = "dabfdb8c200a6f155df4edd0b9c825e6728b14a1";
 
 #[cfg(feature = "native")]
 mod builder;

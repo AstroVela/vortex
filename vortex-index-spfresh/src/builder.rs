@@ -38,6 +38,7 @@ use crate::bundle::import_bundle_impl;
 use crate::bundle::validate_metadata;
 use crate::bundle::validate_rows;
 use crate::ffi::Native;
+use crate::rabitq::OfficialRaBitQBuildOptions;
 use crate::rabitq::RaBitQBuildOptions;
 use crate::rabitq::build_sidecar;
 use crate::validate;
@@ -45,11 +46,12 @@ use crate::validate;
 /// Versioned JSON in [`IndexBuildRequest::backend_options`]. Shape fields are required.
 ///
 /// Builds only non-nullable `FixedSizeList<Float32>` vectors with squared L2.
-/// Version 2 adds RaBitQ; other metrics and incremental mutation are unsupported.
+/// Version 2 adds one-bit RaBitQ; version 3 adds the optional official two-bit backend.
+/// Other metrics and incremental mutation are unsupported.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpFreshBuildOptions {
-    /// Build configuration version: 1 for original postings, 2 for RaBitQ.
+    /// Build version: 1 for original postings, 2 for one-bit or 3 for official two-bit RaBitQ.
     pub format_version: u32,
     /// Number of Float32 components per vector, 1..=4096.
     pub dimension: u32,
@@ -65,11 +67,23 @@ pub struct SpFreshBuildOptions {
     /// Version 2 requires RaBitQ options; version 1 requires this to be absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rabitq: Option<RaBitQBuildOptions>,
+    /// Version 3 requires official two-bit options and `replicas=1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rabitq_official: Option<OfficialRaBitQBuildOptions>,
 }
 
 impl SpFreshBuildOptions {
     pub(crate) fn validate(&self, rows: u32) -> VortexResult<()> {
-        if self.format_version != if self.rabitq.is_some() { 2 } else { 1 }
+        if self.rabitq_official.is_some() && !cfg!(feature = "rabitq-official") {
+            vortex_bail!("Official RaBitQ requires the rabitq-official build feature");
+        }
+        let version = match (self.rabitq.is_some(), self.rabitq_official.is_some()) {
+            (false, false) => 1,
+            (true, false) => 2,
+            (false, true) if cfg!(feature = "rabitq-official") && self.replicas == 1 => 3,
+            _ => vortex_bail!("Unsupported or conflicting SPFresh quantization options"),
+        };
+        if self.format_version != version
             || rows < 64
             || !(1..=4096).contains(&self.dimension)
             || self.head_count < 32
@@ -84,7 +98,8 @@ impl SpFreshBuildOptions {
 }
 
 /// Bounds on buffered input and produced native artifacts, not total native RSS or disk quota.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SpFreshBuildLimits {
     /// Maximum physical rows in the requested coverage; row mapping also uses memory.
     pub max_rows: u32,
@@ -133,7 +148,7 @@ impl SpFreshIndexBuilder {
         validate_scratch(&scratch_root)?;
         if !(64..=i32::MAX as u32).contains(&limits.max_rows)
             || limits.max_vector_bytes == 0
-            || limits.max_vector_bytes > i32::MAX as u64
+            || limits.max_vector_bytes > isize::MAX as u64
             || limits.max_native_artifact_bytes == 0
         {
             vortex_bail!("Invalid SPFresh build limits");
@@ -297,6 +312,16 @@ impl IndexBuilder for SpFreshIndexBuilder {
                 vortex_bail!("SPFresh quantized artifacts exceed byte limit");
             }
         }
+        #[cfg(feature = "rabitq-official")]
+        if let Some(official) = options.rabitq_official {
+            crate::rabitq::build_official_sidecar(&root, bundle, &vectors, official.seed)?;
+            bytes = bytes
+                .checked_add(fs::metadata(root.join("rabitq-official.bin"))?.len())
+                .ok_or_else(|| vortex_err!("SPFresh output byte count overflow"))?;
+            if bytes > self.limits.max_native_artifact_bytes {
+                vortex_bail!("SPFresh official RaBitQ artifacts exceed byte limit");
+            }
+        }
         metadata.validate_for(source.snapshot())?;
         import_bundle_impl(
             metadata,
@@ -305,6 +330,7 @@ impl IndexBuilder for SpFreshIndexBuilder {
             bundle,
             &rows,
             options.rabitq,
+            options.rabitq_official,
         )
         .await
     }

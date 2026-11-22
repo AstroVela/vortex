@@ -40,6 +40,7 @@ use vortex_index::IndexBuilder;
 use vortex_index::IndexMetadata;
 use vortex_index::IndexProvider;
 use vortex_index::IndexStore;
+use vortex_index::RowAddress;
 use vortex_index::Snapshot;
 use vortex_index::SourceFile;
 use vortex_index::file::LocalFileSource;
@@ -50,15 +51,16 @@ use vortex_index::store::LocalStoreLimits;
 use vortex_index_spfresh::SPFRESH_ID;
 use vortex_index_spfresh::SpFreshBuildLimits;
 use vortex_index_spfresh::SpFreshBuildOptions;
+use vortex_index_spfresh::SpFreshBundle;
 use vortex_index_spfresh::SpFreshIndexBuilder;
 use vortex_index_spfresh::SpFreshLimits;
 use vortex_index_spfresh::SpFreshProvider;
+use vortex_index_spfresh::import_bundle;
 use vortex_io::runtime::single::block_on;
 use vortex_io::session::RuntimeSessionExt;
 use vortex_session::VortexSession;
 
 const INPUT_LIMIT: u64 = 512 * 1024 * 1024;
-const SOURCE_LIMIT: usize = 512 * 1024 * 1024;
 const STORE_LIMITS: LocalStoreLimits = LocalStoreLimits {
     max_artifact_bytes: 1024 * 1024 * 1024,
     max_manifest_bytes: 16 * 1024 * 1024,
@@ -71,6 +73,39 @@ struct Config {
     output_dir: PathBuf,
     rows: u32,
     options: SpFreshBuildOptions,
+    #[serde(default)]
+    unquantized_twin: Option<PathBuf>,
+    #[serde(default)]
+    base_format: BaseFormat,
+    #[serde(default)]
+    limits: FixtureLimits,
+}
+
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BaseFormat {
+    #[default]
+    Fvecs,
+    Float32,
+}
+
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FixtureLimits {
+    build: SpFreshBuildLimits,
+    provider: SpFreshLimits,
+}
+
+impl Default for FixtureLimits {
+    fn default() -> Self {
+        Self {
+            build: SpFreshBuildLimits {
+                max_vector_bytes: INPUT_LIMIT,
+                ..SpFreshBuildLimits::default()
+            },
+            provider: SpFreshLimits::default(),
+        }
+    }
 }
 
 fn array(start: u64, rows: usize, dimension: u32, values: Vec<f32>) -> VortexResult<ArrayRef> {
@@ -97,14 +132,26 @@ fn array(start: u64, rows: usize, dimension: u32, values: Vec<f32>) -> VortexRes
     .into_array())
 }
 
+#[cfg(test)]
 fn read_vectors(reader: &mut impl Read, rows: usize, dimension: u32) -> VortexResult<Vec<f32>> {
+    read_input_vectors(reader, rows, dimension, BaseFormat::Fvecs)
+}
+
+fn read_input_vectors(
+    reader: &mut impl Read,
+    rows: usize,
+    dimension: u32,
+    format: BaseFormat,
+) -> VortexResult<Vec<f32>> {
     let mut record = vec![0u8; dimension as usize * 4];
     let mut values = Vec::with_capacity(rows * dimension as usize);
     for _ in 0..rows {
-        let mut header = [0; 4];
-        reader.read_exact(&mut header)?;
-        if u32::from_le_bytes(header) != dimension {
-            vortex_bail!("fvecs record dimension changed");
+        if matches!(format, BaseFormat::Fvecs) {
+            let mut header = [0; 4];
+            reader.read_exact(&mut header)?;
+            if u32::from_le_bytes(header) != dimension {
+                vortex_bail!("fvecs record dimension changed");
+            }
         }
         reader.read_exact(&mut record)?;
         for component in record.chunks_exact(4) {
@@ -122,7 +169,12 @@ fn read_vectors(reader: &mut impl Read, rows: usize, dimension: u32) -> VortexRe
     Ok(values)
 }
 
-fn open_vectors(path: &Path, rows: u32, dimension: u32) -> VortexResult<fs::File> {
+fn open_vectors(
+    path: &Path,
+    rows: u32,
+    dimension: u32,
+    format: BaseFormat,
+) -> VortexResult<fs::File> {
     let file = unix_fs::open(
         path,
         unix_fs::OFlags::RDONLY
@@ -134,8 +186,15 @@ fn open_vectors(path: &Path, rows: u32, dimension: u32) -> VortexResult<fs::File
     .map_err(IoError::from)?;
     let file = fs::File::from(file);
     let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() != u64::from(rows) * (4 + u64::from(dimension) * 4) {
-        vortex_bail!("Fixture requires the complete regular fvecs file, not a subset");
+    let header_bytes = if matches!(format, BaseFormat::Fvecs) {
+        4
+    } else {
+        0
+    };
+    if !metadata.is_file()
+        || metadata.len() != u64::from(rows) * (header_bytes + u64::from(dimension) * 4)
+    {
+        vortex_bail!("Fixture requires the complete regular vector file, not a subset");
     }
     Ok(file)
 }
@@ -146,6 +205,7 @@ struct Reference {
     snapshot: Snapshot,
     dtype: DType,
     generation: vortex_index::store::LocalGeneration,
+    limits: SpFreshLimits,
 }
 
 fn main() -> VortexResult<()> {
@@ -160,15 +220,32 @@ fn main() -> VortexResult<()> {
         || !config.output_dir.is_absolute()
         || !(64..=1_000_000).contains(&config.rows)
         || !(1..=4096).contains(&dimension)
-        || u64::from(config.rows) * u64::from(dimension) * 4 > INPUT_LIMIT
-        || config.options.format_version != 1
+        || config.rows > config.limits.build.max_rows
+        || u64::from(config.rows) * u64::from(dimension) * 4 > config.limits.build.max_vector_bytes
+        || config.options.format_version
+            != if config.options.rabitq_official.is_some() {
+                3
+            } else if config.options.rabitq.is_some() {
+                2
+            } else {
+                1
+            }
         || !(32..config.rows).contains(&config.options.head_count)
         || !(1..=4096).contains(&config.options.posting_page_limit)
         || !(1..=8).contains(&config.options.replicas)
+        || config.unquantized_twin.as_ref().is_some_and(|path| {
+            !path.is_absolute()
+                || (config.options.rabitq.is_none() && config.options.rabitq_official.is_none())
+        })
     {
         vortex_bail!("Invalid bounded fixture configuration");
     }
-    let file = open_vectors(&config.base, config.rows, dimension)?;
+    let file = open_vectors(&config.base, config.rows, dimension, config.base_format)?;
+    let source_limit = usize::try_from(config.limits.build.max_vector_bytes)?;
+    let store_limits = LocalStoreLimits {
+        max_artifact_bytes: usize::try_from(config.limits.build.max_native_artifact_bytes)?,
+        max_manifest_bytes: STORE_LIMITS.max_manifest_bytes,
+    };
     fs::DirBuilder::new()
         .mode(0o700)
         .create(&config.output_dir)?;
@@ -188,7 +265,7 @@ fn main() -> VortexResult<()> {
             let mut remaining = count as usize;
             while remaining > 0 {
                 let count = remaining.min(16_384);
-                let values = read_vectors(&mut reader, count, dimension)?;
+                let values = read_input_vectors(&mut reader, count, dimension, config.base_format)?;
                 writer.push(array(start, count, dimension, values)?).await?;
                 start += count as u64;
                 remaining -= count;
@@ -223,7 +300,7 @@ fn main() -> VortexResult<()> {
             LocalFileSource::open(
                 snapshot.clone(),
                 dtype.clone(),
-                SOURCE_LIMIT,
+                source_limit,
                 session.clone(),
             )
             .await?,
@@ -235,15 +312,12 @@ fn main() -> VortexResult<()> {
         let builder = SpFreshIndexBuilder::try_new(
             scratch.path().to_owned(),
             session.clone(),
-            SpFreshBuildLimits {
-                max_vector_bytes: INPUT_LIMIT,
-                ..SpFreshBuildLimits::default()
-            },
+            config.limits.build,
         )?;
         let store = Arc::new(LocalIndexStore::create(
             &config.output_dir,
             "generation-1",
-            STORE_LIMITS,
+            store_limits,
         )?);
         let start = Instant::now();
         let metadata = builder
@@ -254,7 +328,7 @@ fn main() -> VortexResult<()> {
                         name: "embedding".into(),
                         generation: "generation-1".into(),
                         backend: SPFRESH_ID.into(),
-                        backend_version: 1,
+                        backend_version: config.options.format_version,
                         snapshot: snapshot.clone(),
                         fields: vec!["embedding".into()],
                         covered_files: snapshot.files.iter().map(|file| file.id).collect(),
@@ -270,17 +344,68 @@ fn main() -> VortexResult<()> {
             .await?;
         let generation = store.seal(&metadata)?;
         let (reopened, metadata) =
-            LocalIndexStore::open(&config.output_dir, &generation, &snapshot, STORE_LIMITS)?;
-        let provider =
-            SpFreshProvider::try_new(scratch.path().to_owned(), SpFreshLimits::default())?;
+            LocalIndexStore::open(&config.output_dir, &generation, &snapshot, store_limits)?;
+        let provider = SpFreshProvider::try_new(scratch.path().to_owned(), config.limits.provider)?;
         drop(provider.open(&metadata, Arc::new(reopened)).await?);
         let build_ms = start.elapsed().as_secs_f64() * 1000.0;
-        drop(LocalFileSource::open(snapshot.clone(), dtype.clone(), SOURCE_LIMIT, session).await?);
+        drop(LocalFileSource::open(snapshot.clone(), dtype.clone(), source_limit, session).await?);
+        if let Some(twin_root) = &config.unquantized_twin {
+            fs::DirBuilder::new().mode(0o700).create(twin_root)?;
+            let twin_store = LocalIndexStore::create(twin_root, "generation-1", store_limits)?;
+            let rows = snapshot
+                .files
+                .iter()
+                .flat_map(|file| {
+                    (0..file.row_count).map(move |row_offset| RowAddress {
+                        file_id: file.id,
+                        row_offset,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let twin_metadata = import_bundle(
+                IndexMetadata {
+                    backend_version: 1,
+                    artifacts: vec![],
+                    ..metadata.clone()
+                },
+                &twin_store,
+                &config
+                    .output_dir
+                    .join("generation-1/artifacts/spfresh/native"),
+                SpFreshBundle {
+                    dimension,
+                    rows: config.rows,
+                    posting_page_limit: config.options.posting_page_limit,
+                },
+                &rows,
+            )
+            .await?;
+            let twin_generation = twin_store.seal(&twin_metadata)?;
+            let (twin_reopened, twin_metadata) =
+                LocalIndexStore::open(twin_root, &twin_generation, &snapshot, store_limits)?;
+            drop(
+                provider
+                    .open(&twin_metadata, Arc::new(twin_reopened))
+                    .await?,
+            );
+            fs::write(
+                twin_root.join("index.json"),
+                serde_json::to_vec(&Reference {
+                    format_version: 1,
+                    snapshot: snapshot.clone(),
+                    dtype: dtype.clone(),
+                    generation: twin_generation,
+                    limits: config.limits.provider,
+                })
+                .map_err(|err| vortex_err!("Twin reference: {err}"))?,
+            )?;
+        }
         let reference = Reference {
             format_version: 1,
             snapshot,
             dtype,
             generation,
+            limits: config.limits.provider,
         };
         let mut output = fs::OpenOptions::new()
             .write(true)
@@ -288,12 +413,16 @@ fn main() -> VortexResult<()> {
             .open(&reference_path)?;
         output.write_all(&serde_json::to_vec(&reference).map_err(|err| vortex_err!("{err}"))?)?;
         output.sync_all()?;
-        fs::write(config.output_dir.join("build.json"), serde_json::to_vec_pretty(&serde_json::json!({
-            "format_version": 1, "rows": config.rows, "dimension": dimension,
-            "build_ms": build_ms, "max_vector_bytes": INPUT_LIMIT,
-            "max_native_artifact_bytes": SpFreshBuildLimits::default().max_native_artifact_bytes,
-            "options": config.options, "reference": reference_path,
-        })).map_err(|err| vortex_err!("{err}"))?)?;
+        fs::write(
+            config.output_dir.join("build.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "format_version": 1, "rows": config.rows, "dimension": dimension,
+                "build_ms": build_ms, "max_vector_bytes": config.limits.build.max_vector_bytes,
+                "max_native_artifact_bytes": config.limits.build.max_native_artifact_bytes,
+                "options": config.options, "reference": reference_path,
+            }))
+            .map_err(|err| vortex_err!("{err}"))?,
+        )?;
         println!(
             "Built {} rows x {} in {:.2} ms: {}",
             config.rows,
@@ -345,10 +474,10 @@ mod tests {
         let path = root.path().join("base.fvecs");
         let bytes = [1u32.to_le_bytes(), 2.0f32.to_le_bytes()].concat();
         fs::write(&path, &bytes)?;
-        let mut file = open_vectors(&path, 1, 1)?;
+        let mut file = open_vectors(&path, 1, 1, BaseFormat::Fvecs)?;
         assert_eq!(read_vectors(&mut file, 1, 1)?, [2.0]);
-        assert!(open_vectors(&path, 2, 1).is_err());
-        assert!(open_vectors(root.path(), 1, 1).is_err());
+        assert!(open_vectors(&path, 2, 1, BaseFormat::Fvecs).is_err());
+        assert!(open_vectors(root.path(), 1, 1, BaseFormat::Fvecs).is_err());
         Ok(())
     }
 
@@ -362,7 +491,39 @@ mod tests {
             unix_fs::Mode::RUSR | unix_fs::Mode::WUSR,
         )
         .map_err(IoError::from)?;
-        assert!(open_vectors(&path, 1, 1).is_err());
+        assert!(open_vectors(&path, 1, 1, BaseFormat::Fvecs).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_flat_float32_input_preserves_bits_and_rejects_truncation() -> VortexResult<()> {
+        let values = [0.0f32, -0.0, 1.25, -300.5];
+        let bytes = values
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let actual = read_input_vectors(&mut Cursor::new(&bytes), 2, 2, BaseFormat::Float32)?;
+        assert_eq!(
+            actual.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            values.map(f32::to_bits)
+        );
+        assert!(
+            read_input_vectors(&mut Cursor::new(&bytes[..15]), 2, 2, BaseFormat::Float32).is_err()
+        );
+        assert!(
+            read_input_vectors(
+                &mut Cursor::new(f32::NAN.to_le_bytes()),
+                1,
+                1,
+                BaseFormat::Float32
+            )
+            .is_err()
+        );
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("base.f32");
+        fs::write(&path, &bytes)?;
+        drop(open_vectors(&path, 2, 2, BaseFormat::Float32)?);
+        assert!(open_vectors(&path, 2, 2, BaseFormat::Fvecs).is_err());
         Ok(())
     }
 }

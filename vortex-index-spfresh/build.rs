@@ -100,9 +100,83 @@ fn main() -> Result<(), Box<dyn Error>> {
     for library in ["stdc++", "gomp", "zstd", "rt"] {
         println!("cargo:rustc-link-lib={library}");
     }
+    #[cfg(feature = "rabitq-official")]
+    official_rabitq()?;
     println!(
         "cargo:rustc-env=VORTEX_SPFRESH_FIXTURE={}",
         build.join("spfresh_fixture").display()
     );
+    Ok(())
+}
+
+#[cfg(feature = "rabitq-official")]
+fn official_rabitq() -> Result<(), Box<dyn Error>> {
+    println!("cargo:rerun-if-env-changed=VORTEX_RABITQ_NATIVE");
+    let build = PathBuf::from(env::var("VORTEX_RABITQ_NATIVE").map_err(|_| {
+        "run bash vortex-index-spfresh/native/build-rabitq.sh, then set VORTEX_RABITQ_NATIVE to its build directory"
+    })?);
+    if fs::read_to_string(build.join("revision.txt"))?.trim()
+        != "dabfdb8c200a6f155df4edd0b9c825e6728b14a1"
+    {
+        return Err("Official RaBitQ source revision mismatch".into());
+    }
+    let source = PathBuf::from(fs::read_to_string(build.join("source.txt"))?.trim());
+    for (args, expected) in [
+        (
+            vec!["rev-parse", "HEAD"],
+            b"dabfdb8c200a6f155df4edd0b9c825e6728b14a1".as_slice(),
+        ),
+        (
+            vec!["status", "--porcelain", "--untracked-files=all"],
+            b"".as_slice(),
+        ),
+    ] {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&source)
+            .args(args)
+            .output()?;
+        if !output.status.success() || output.stdout.trim_ascii() != expected {
+            return Err("Official RaBitQ source is not the clean qualified revision".into());
+        }
+    }
+    let cache = fs::read_to_string(build.join("CMakeCache.txt"))?;
+    for line in [
+        "RABITQ_USE_OPENMP:BOOL=OFF",
+        "RABITQ_BUILD_FASTSCAN:BOOL=ON",
+        "RABITQ_ENABLE_NATIVE_OPTIMIZATION:BOOL=OFF",
+        "CMAKE_BUILD_TYPE:STRING=Release",
+    ] {
+        if !cache.lines().any(|entry| entry == line) {
+            return Err(format!("Unsupported RaBitQ build configuration: {line}").into());
+        }
+    }
+    println!(
+        "cargo:rerun-if-changed={}",
+        source.join("include").display()
+    );
+    for name in [
+        "revision.txt",
+        "source.txt",
+        "CMakeCache.txt",
+        "librabitq_core.a",
+        "librabitq_fastscan.a",
+    ] {
+        println!("cargo:rerun-if-changed={}", build.join(name).display());
+    }
+    cc::Build::new()
+        .cpp(true)
+        .std("c++17")
+        .pic(true)
+        .warnings(false)
+        .define("RABITQ_USE_OPENMP", "0")
+        .define("EIGEN_MAX_ALIGN_BYTES", "64")
+        .define("EIGEN_MAX_STATIC_ALIGN_BYTES", "64")
+        .include(source.join("include"))
+        .file("native/rabitq.cpp")
+        .compile("vortex_rabitq_bridge");
+    println!("cargo:rustc-link-search=native={}", build.display());
+    println!("cargo:rustc-link-lib=static=rabitq_fastscan");
+    println!("cargo:rustc-link-lib=static=rabitq_core");
     Ok(())
 }

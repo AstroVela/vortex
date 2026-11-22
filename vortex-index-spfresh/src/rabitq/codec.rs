@@ -60,10 +60,12 @@ impl DistanceEstimate {
 /// Prepared full precision query in the quantizer's rotated coordinate system.
 #[derive(Debug)]
 pub struct RaBitQQuery {
-    tables: Vec<[f64; 16]>,
+    tables: Vec<[[f64; 16]; 2]>,
     dimension: usize,
     norm_squared: f64,
-    bound: RaBitQErrorBound,
+    norm: f64,
+    bound_factor: f64,
+    rounding_slack: f64,
 }
 
 impl RaBitQ {
@@ -175,25 +177,28 @@ impl RaBitQ {
         let (rotated, norm_squared) = self.rotate(query)?;
         let dimension = rotated.len();
         let normalization = (dimension as f64).sqrt();
-        let tables = (0..dimension.div_ceil(8) * 2)
-            .map(|nibble| {
-                let values: [f64; 4] = std::array::from_fn(|bit| {
-                    rotated.get(nibble * 4 + bit).copied().unwrap_or(0.0) / normalization
-                });
-                let mut table = [0.0; 16];
-                table[0] = -values.iter().sum::<f64>();
-                for mask in 1usize..16 {
-                    let bit = mask.trailing_zeros() as usize;
-                    table[mask] = table[mask & (mask - 1)] + 2.0 * values[bit];
-                }
-                table
-            })
+        let table = |nibble: usize| {
+            let values: [f64; 4] = std::array::from_fn(|bit| {
+                rotated.get(nibble * 4 + bit).copied().unwrap_or(0.0) / normalization
+            });
+            let mut table = [0.0; 16];
+            table[0] = -values.iter().sum::<f64>();
+            for mask in 1usize..16 {
+                let bit = mask.trailing_zeros() as usize;
+                table[mask] = table[mask & (mask - 1)] + 2.0 * values[bit];
+            }
+            table
+        };
+        let tables = (0..dimension.div_ceil(8))
+            .map(|byte| std::array::from_fn(|half| table(byte * 2 + half)))
             .collect();
         Ok(RaBitQQuery {
             tables,
             dimension,
             norm_squared,
-            bound,
+            norm: norm_squared.sqrt(),
+            bound_factor: bound.factor(dimension),
+            rounding_slack: 128.0 * (dimension as f64).powi(2) * f64::EPSILON,
         })
     }
 }
@@ -201,33 +206,73 @@ impl RaBitQ {
 impl RaBitQQuery {
     /// Estimate distance without reading the original vector. Codes must have
     /// been produced by the same quantizer; mixing generations is unsupported.
+    #[inline]
     pub fn estimate(&self, code: &EncodedVector) -> VortexResult<DistanceEstimate> {
-        if code.bits.len() != self.dimension.div_ceil(8) {
+        self.estimate_parts(&code.bits, code.norm_squared, code.scale, code.residual)
+    }
+
+    #[inline]
+    pub(super) fn estimate_parts(
+        &self,
+        bits: &[u8],
+        norm_squared: f64,
+        scale: f64,
+        residual: f64,
+    ) -> VortexResult<DistanceEstimate> {
+        if bits.len() != self.dimension.div_ceil(8) {
             vortex_bail!("RaBitQ code dimension mismatch");
         }
-        let dot = code
-            .bits
+        let dot = bits
             .iter()
-            .zip(self.tables.chunks_exact(2))
+            .zip(&self.tables)
             .map(|(byte, tables)| {
                 tables[0][usize::from(byte & 15)] + tables[1][usize::from(byte >> 4)]
             })
             .sum::<f64>();
-        let estimate = code.norm_squared + self.norm_squared - 2.0 * code.scale * dot;
+        Ok(self.finish(dot, norm_squared, scale, residual))
+    }
+
+    #[inline]
+    #[cfg(all(unix, any(feature = "native", test)))]
+    pub(super) fn estimate_four(
+        &self,
+        bits: [&[u8]; 4],
+        corrections: [(f64, f64, f64); 4],
+    ) -> VortexResult<[DistanceEstimate; 4]> {
+        if bits.iter().any(|bits| bits.len() != self.tables.len()) {
+            vortex_bail!("RaBitQ code dimension mismatch");
+        }
+        let mut dots = [-0.0; 4];
+        for ((((a, b), c), d), tables) in bits[0]
+            .iter()
+            .zip(bits[1])
+            .zip(bits[2])
+            .zip(bits[3])
+            .zip(&self.tables)
+        {
+            let bytes = [*a, *b, *c, *d];
+            for lane in 0..4 {
+                dots[lane] += tables[0][usize::from(bytes[lane] & 15)]
+                    + tables[1][usize::from(bytes[lane] >> 4)];
+            }
+        }
+        Ok(std::array::from_fn(|lane| {
+            let (norm_squared, scale, residual) = corrections[lane];
+            self.finish(dots[lane], norm_squared, scale, residual)
+        }))
+    }
+
+    #[inline]
+    fn finish(&self, dot: f64, norm_squared: f64, scale: f64, residual: f64) -> DistanceEstimate {
+        let estimate = norm_squared + self.norm_squared - 2.0 * scale * dot;
         // The error vector x - ||x|| z/alpha has norm ||x||sqrt(1-alpha²)/alpha.
         // Its direction is uniform in x's orthogonal complement under Haar rotation.
-        let error =
-            2.0 * code.residual * self.norm_squared.sqrt() * self.bound.factor(self.dimension);
-        let slack = 128.0
-            * (self.dimension as f64).powi(2)
-            * f64::EPSILON
-            * (code.norm_squared
-                + self.norm_squared
-                + 2.0 * code.scale * self.norm_squared.sqrt()
-                + 1.0);
-        Ok(DistanceEstimate {
+        let error = 2.0 * residual * self.norm * self.bound_factor;
+        let slack = self.rounding_slack
+            * (norm_squared + self.norm_squared + 2.0 * scale * self.norm + 1.0);
+        DistanceEstimate {
             estimate,
             error: error + slack,
-        })
+        }
     }
 }

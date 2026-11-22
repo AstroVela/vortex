@@ -13,28 +13,85 @@ use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
+use hashbrown::HashMap;
+use hashbrown::hash_map::Entry;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 
-use super::EncodedVector;
+use super::DistanceEstimate;
 use super::RaBitQ;
+use super::RaBitQQuery;
+use super::distance::ExactQuery;
 use crate::SpFreshBundle;
 
 #[cfg(feature = "native")]
 pub(crate) const SIDECAR: &str = "spfresh/rabitq.bin";
 const MAGIC: &[u8; 8] = b"VXSRBQ01";
 const HEAD: u64 = 1 << 63;
+const READ_CHUNK_BYTES: usize = 16 * 1024;
+const MAX_READ_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug)]
 pub(crate) struct QuantizedIndex {
     pub(super) quantizer: RaBitQ,
-    pub(super) codes: Vec<EncodedVector>,
+    pub(super) codes: QuantizedCodes,
     pub(super) head_ids: Vec<u32>,
     pub(super) postings: Vec<Vec<u32>>,
     locations: Vec<u64>,
     vectors: File,
     original_postings: File,
+}
+
+#[derive(Debug)]
+pub(super) struct QuantizedCodes {
+    data: Vec<u8>,
+    stride: usize,
+    positions: Vec<u32>,
+}
+
+impl QuantizedCodes {
+    pub(super) fn len(&self) -> usize {
+        self.positions.len()
+    }
+
+    #[inline]
+    fn corrections(record: &[u8]) -> (f64, f64, f64) {
+        let mut word = [0; 8];
+        let mut read = |offset| {
+            word.copy_from_slice(&record[offset..offset + 8]);
+            f64::from_le_bytes(word)
+        };
+        (read(0), read(8), read(16))
+    }
+
+    #[inline]
+    pub(super) fn estimate(
+        &self,
+        query: &RaBitQQuery,
+        index: usize,
+    ) -> VortexResult<DistanceEstimate> {
+        let position = self.positions[index] as usize;
+        let record = &self.data[position * self.stride..(position + 1) * self.stride];
+        let (norm_squared, scale, residual) = Self::corrections(record);
+        query.estimate_parts(&record[24..], norm_squared, scale, residual)
+    }
+
+    #[inline]
+    pub(super) fn estimate_four(
+        &self,
+        query: &RaBitQQuery,
+        ids: [u32; 4],
+    ) -> VortexResult<[DistanceEstimate; 4]> {
+        let records = ids.map(|id| {
+            let position = self.positions[id as usize] as usize;
+            &self.data[position * self.stride..(position + 1) * self.stride]
+        });
+        query.estimate_four(
+            records.map(|record| &record[24..]),
+            records.map(Self::corrections),
+        )
+    }
 }
 
 fn bytes<const N: usize>(input: &mut impl Read) -> VortexResult<[u8; N]> {
@@ -69,26 +126,25 @@ fn original(
     };
     let mut buffer = vec![0; dimension * 4];
     file.read_exact_at(&mut buffer, location & !HEAD)?;
-    buffer
-        .chunks_exact(4)
-        .map(|value| {
-            let value = f32::from_le_bytes([value[0], value[1], value[2], value[3]]);
-            if !value.is_finite() {
-                vortex_bail!("Non-finite RaBitQ original vector");
-            }
-            Ok(value)
-        })
-        .collect()
+    let mut values = Vec::with_capacity(dimension);
+    for value in buffer.chunks_exact(4) {
+        let value = f32::from_le_bytes([value[0], value[1], value[2], value[3]]);
+        if !value.is_finite() {
+            vortex_bail!("Non-finite RaBitQ original vector");
+        }
+        values.push(value);
+    }
+    Ok(values)
 }
 
-struct Routing {
-    head_ids: Vec<u32>,
-    postings: Vec<Vec<u32>>,
-    locations: Vec<u64>,
+pub(crate) struct Routing {
+    pub(crate) head_ids: Vec<u32>,
+    pub(crate) postings: Vec<Vec<u32>>,
+    pub(crate) locations: Vec<u64>,
 }
 
 // Parse only bounded routing records. Called after full native validation in production.
-fn routing(root: &Path, bundle: SpFreshBundle) -> VortexResult<Routing> {
+pub(crate) fn routing(root: &Path, bundle: SpFreshBundle) -> VortexResult<Routing> {
     bundle.validate()?;
     let mut vectors = BufReader::new(File::open(root.join("vectors.bin"))?);
     let heads = u32_at(&mut vectors)?;
@@ -332,12 +388,18 @@ impl QuantizedIndex {
         {
             vortex_bail!("RaBitQ routing does not match original native files");
         }
-        let mut codes = Vec::with_capacity(bundle.rows as usize);
-        for _ in 0..bundle.rows {
-            let norm_squared = f64_at(&mut input)?;
-            let scale = f64_at(&mut input)?;
-            let residual = f64_at(&mut input)?;
-            if norm_squared < 0.0
+        let stride = 24 + usize::try_from(dim.div_ceil(8))?;
+        let code_bytes = (bundle.rows as usize)
+            .checked_mul(stride)
+            .ok_or_else(|| vortex_err!("RaBitQ code allocation overflow"))?;
+        let mut code_data = vec![0; code_bytes];
+        input.read_exact(&mut code_data)?;
+        for record in code_data.chunks_exact(stride) {
+            let (norm_squared, scale, residual) = QuantizedCodes::corrections(record);
+            if !norm_squared.is_finite()
+                || !scale.is_finite()
+                || !residual.is_finite()
+                || norm_squared < 0.0
                 || scale < 0.0
                 || residual < 0.0
                 || norm_squared > 4.0 * dim as f64 * f64::from(f32::MAX).powi(2)
@@ -348,17 +410,23 @@ impl QuantizedIndex {
             {
                 vortex_bail!("Invalid RaBitQ correction factors");
             }
-            let mut bits = vec![0; (bundle.dimension as usize).div_ceil(8)];
-            input.read_exact(&mut bits)?;
+            let bits = &record[24..];
             if dim % 8 != 0 && bits[bits.len() - 1] >> (dim % 8) != 0 {
                 vortex_bail!("Invalid RaBitQ code padding");
             }
-            codes.push(EncodedVector {
-                bits,
-                norm_squared,
-                scale,
-                residual,
-            });
+        }
+        // Keep each posting's codes together; native IDs retain their original mapping.
+        let mut positions = vec![u32::MAX; bundle.rows as usize];
+        let mut packed_codes = Vec::with_capacity(code_bytes);
+        for id in head_ids.iter().chain(postings.iter().flatten()) {
+            let index = *id as usize;
+            if positions[index] == u32::MAX {
+                positions[index] = u32::try_from(packed_codes.len() / stride)?;
+                packed_codes.extend_from_slice(&code_data[index * stride..(index + 1) * stride]);
+            }
+        }
+        if packed_codes.len() != code_bytes {
+            vortex_bail!("Incomplete RaBitQ packed code coverage");
         }
         Ok(Self {
             quantizer: RaBitQ {
@@ -366,7 +434,11 @@ impl QuantizedIndex {
                 reflectors,
                 signs,
             },
-            codes,
+            codes: QuantizedCodes {
+                data: packed_codes,
+                stride,
+                positions,
+            },
             head_ids,
             postings,
             locations,
@@ -375,16 +447,128 @@ impl QuantizedIndex {
         })
     }
 
-    pub(super) fn read_vector(&self, id: u32) -> VortexResult<Vec<f32>> {
-        let location = self
+    pub(super) fn original_reader(
+        &self,
+        max_cache_bytes: usize,
+    ) -> VortexResult<OriginalReader<'_>> {
+        let lengths = [
+            self.original_postings.metadata()?.len(),
+            self.vectors.metadata()?.len(),
+        ];
+        if lengths.iter().any(|length| !length.is_multiple_of(4)) {
+            vortex_bail!("Unaligned RaBitQ original file length");
+        }
+        Ok(OriginalReader {
+            index: self,
+            lengths,
+            max_chunks: max_cache_bytes.min(MAX_READ_CACHE_BYTES) / READ_CHUNK_BYTES,
+            chunks: HashMap::new(),
+            raw: vec![0; READ_CHUNK_BYTES],
+            fallback: vec![0.0; self.quantizer.center.len()],
+            read_calls: 0,
+            read_bytes: 0,
+            cached_bytes: 0,
+        })
+    }
+}
+
+pub(super) struct OriginalReader<'a> {
+    index: &'a QuantizedIndex,
+    lengths: [u64; 2],
+    max_chunks: usize,
+    chunks: HashMap<u64, Vec<f32>>,
+    raw: Vec<u8>,
+    fallback: Vec<f32>,
+    pub read_calls: usize,
+    pub read_bytes: usize,
+    pub cached_bytes: usize,
+}
+
+impl OriginalReader<'_> {
+    fn read_vector(&mut self, id: u32) -> VortexResult<&[f32]> {
+        let location = *self
+            .index
             .locations
             .get(id as usize)
             .ok_or_else(|| vortex_err!("RaBitQ ID outside row map"))?;
-        original(
-            &self.vectors,
-            &self.original_postings,
-            *location,
-            self.quantizer.center.len(),
-        )
+        let kind = usize::from(location & HEAD != 0);
+        let file = if kind == 0 {
+            &self.index.original_postings
+        } else {
+            &self.index.vectors
+        };
+        let offset = location & !HEAD;
+        let bytes = self.fallback.len() * 4;
+        let end = offset
+            .checked_add(u64::try_from(bytes)?)
+            .ok_or_else(|| vortex_err!("RaBitQ original extent overflow"))?;
+        if !offset.is_multiple_of(4) || end > self.lengths[kind] {
+            vortex_bail!("Truncated or unaligned RaBitQ original vector");
+        }
+        let chunk_start = offset & !(u64::try_from(READ_CHUNK_BYTES)? - 1);
+        let within = usize::try_from(offset - chunk_start)?;
+        let key = (location & HEAD) | chunk_start;
+        if within + bytes > READ_CHUNK_BYTES
+            || (self.chunks.len() >= self.max_chunks && !self.chunks.contains_key(&key))
+        {
+            file.read_exact_at(&mut self.raw[..bytes], offset)?;
+            self.read_calls += 1;
+            self.read_bytes += bytes;
+            for (value, raw) in self
+                .fallback
+                .iter_mut()
+                .zip(self.raw[..bytes].chunks_exact(4))
+            {
+                *value = f32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+            }
+            return Ok(&self.fallback);
+        }
+        let chunk = match self.chunks.entry(key) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let size = usize::try_from(
+                    (self.lengths[kind] - chunk_start).min(u64::try_from(READ_CHUNK_BYTES)?),
+                )?;
+                file.read_exact_at(&mut self.raw[..size], chunk_start)?;
+                self.read_calls += 1;
+                self.read_bytes += size;
+                let values = self.raw[..size]
+                    .chunks_exact(4)
+                    .map(|raw| f32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
+                    .collect::<Vec<_>>();
+                self.cached_bytes += values.len() * 4;
+                entry.insert(values)
+            }
+        };
+        chunk
+            .get(within / 4..(within + bytes) / 4)
+            .ok_or_else(|| vortex_err!("RaBitQ original outside cached extent"))
+    }
+
+    pub(super) fn exact_score(
+        &mut self,
+        id: u32,
+        query: &ExactQuery<'_>,
+    ) -> VortexResult<(f32, bool)> {
+        query.score(self.read_vector(id)?)
+    }
+
+    #[cfg(test)]
+    pub(super) fn exact_distance(&mut self, id: u32, query: &[f32]) -> VortexResult<f64> {
+        if query.len() != self.fallback.len() {
+            vortex_bail!("Invalid RaBitQ original distance shape");
+        }
+        let vector = self.read_vector(id)?;
+        if vector.iter().any(|value| !value.is_finite()) {
+            vortex_bail!("Non-finite RaBitQ original vector");
+        }
+        Ok(vector
+            .iter()
+            .zip(query)
+            .map(|(left, right)| {
+                let delta = f64::from(*left) - f64::from(*right);
+                delta * delta
+            })
+            .sum())
     }
 }
