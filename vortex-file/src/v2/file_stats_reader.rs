@@ -163,7 +163,6 @@ impl LayoutReader for FileStatsLayoutReader {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::LazyLock;
 
     use vortex_array::ArrayContext;
     use vortex_array::IntoArray as _;
@@ -204,11 +203,11 @@ mod tests {
 
     use super::*;
 
-    static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+    fn test_session() -> VortexSession {
         vortex_array::array_session()
             .with::<LayoutSession>()
             .with::<RuntimeSession>()
-    });
+    }
 
     fn test_file_stats(min: i32, max: i32) -> FileStatistics {
         let mut stats = StatsSet::default();
@@ -235,7 +234,7 @@ mod tests {
     #[test]
     fn pruning_when_filter_out_of_range() -> VortexResult<()> {
         block_on(|handle| async {
-            let session = SESSION.clone().with_handle(handle);
+            let session = test_session().with_handle(handle);
             let ctx = ArrayContext::empty();
             let segments = Arc::new(TestSegments::default());
             let (ptr, eof) = SequenceId::root().split();
@@ -256,10 +255,10 @@ mod tests {
                 )
                 .await?;
 
-            let child = layout.new_reader("".into(), segments, &SESSION, &Default::default())?;
+            let child = layout.new_reader("".into(), segments, &session, &Default::default())?;
 
             let reader =
-                FileStatsLayoutReader::new(child, test_file_stats(0, 100), SESSION.clone());
+                FileStatsLayoutReader::new(child, test_file_stats(0, 100), session.clone());
 
             // col > 200 should be prunable since max is 100.
             let expr = gt(get_item("col", root()), lit(200i32)).bind(reader.dtype())?;
@@ -274,7 +273,7 @@ mod tests {
     #[test]
     fn no_pruning_when_filter_in_range() -> VortexResult<()> {
         block_on(|handle| async {
-            let session = SESSION.clone().with_handle(handle);
+            let session = test_session().with_handle(handle);
             let ctx = ArrayContext::empty();
             let segments = Arc::new(TestSegments::default());
             let (ptr, eof) = SequenceId::root().split();
@@ -295,10 +294,10 @@ mod tests {
                 )
                 .await?;
 
-            let child = layout.new_reader("".into(), segments, &SESSION, &Default::default())?;
+            let child = layout.new_reader("".into(), segments, &session, &Default::default())?;
 
             let reader =
-                FileStatsLayoutReader::new(child, test_file_stats(0, 100), SESSION.clone());
+                FileStatsLayoutReader::new(child, test_file_stats(0, 100), session.clone());
 
             // col > 50 should NOT be prunable since max is 100 (some rows could match).
             let expr = gt(get_item("col", root()), lit(50i32)).bind(reader.dtype())?;
@@ -314,7 +313,7 @@ mod tests {
     #[test]
     fn no_pruning_for_computed_expression_stats() -> VortexResult<()> {
         block_on(|handle| async {
-            let session = SESSION.clone().with_handle(handle);
+            let session = test_session().with_handle(handle);
             let ctx = ArrayContext::empty();
             let segments = Arc::new(TestSegments::default());
             let (ptr, eof) = SequenceId::root().split();
@@ -334,9 +333,9 @@ mod tests {
                 )
                 .await?;
 
-            let child = layout.new_reader("".into(), segments, &SESSION, &Default::default())?;
+            let child = layout.new_reader("".into(), segments, &session, &Default::default())?;
             let reader =
-                FileStatsLayoutReader::new(child, test_file_stats(0, 100), SESSION.clone());
+                FileStatsLayoutReader::new(child, test_file_stats(0, 100), session.clone());
 
             let expr = gt(checked_add(get_item("col", root()), lit(5i32)), lit(102i32))
                 .bind(reader.dtype())?;
@@ -355,7 +354,7 @@ mod tests {
     #[test]
     fn is_null_pruning_on_nullable_timestamp_column() -> VortexResult<()> {
         block_on(|handle| async {
-            let session = SESSION.clone().with_handle(handle);
+            let session = test_session().with_handle(handle);
             let ctx = ArrayContext::empty();
             let segments = Arc::new(TestSegments::default());
             let (ptr, eof) = SequenceId::root().split();
@@ -384,14 +383,14 @@ mod tests {
                 )
                 .await?;
 
-            let child = layout.new_reader("".into(), segments, &SESSION, &Default::default())?;
+            let child = layout.new_reader("".into(), segments, &session, &Default::default())?;
 
             // File-level stats: 1 null in deleted_at.
             let mut stats = StatsSet::default();
             stats.set(Stat::NullCount, Precision::exact(ScalarValue::from(1u64)));
             let file_stats = FileStatistics::new(Arc::from([stats]), Arc::from([ts_dtype]));
 
-            let reader = FileStatsLayoutReader::new(child, file_stats, SESSION.clone());
+            let reader = FileStatsLayoutReader::new(child, file_stats, session.clone());
 
             // `is_null(deleted_at)` — should NOT panic or error due to dtype mismatch.
             let expr = is_null(get_item("deleted_at", root())).bind(reader.dtype())?;
@@ -407,7 +406,7 @@ mod tests {
     #[test]
     fn pruning_is_not_null_when_file_is_all_null() -> VortexResult<()> {
         block_on(|handle| async {
-            let session = SESSION.clone().with_handle(handle);
+            let session = test_session().with_handle(handle);
             let ctx = ArrayContext::empty();
             let segments = Arc::new(TestSegments::default());
             let (ptr, eof) = SequenceId::root().split();
@@ -433,10 +432,10 @@ mod tests {
                 )
                 .await?;
 
-            let child = layout.new_reader("".into(), segments, &SESSION, &Default::default())?;
+            let child = layout.new_reader("".into(), segments, &session, &Default::default())?;
 
             let reader =
-                FileStatsLayoutReader::new(child, test_file_null_count_stats(5), SESSION.clone());
+                FileStatsLayoutReader::new(child, test_file_null_count_stats(5), session.clone());
 
             let expr = is_not_null(get_item("col", root())).bind(reader.dtype())?;
             let mask = Mask::new_true(5);
