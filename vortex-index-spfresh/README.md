@@ -516,3 +516,17 @@ code size, error intervals, zero residuals, non-byte-aligned dimensions, origina
 read counts, filters, ties, replica deduplication, truncated/replaced files and
 sidecar corruption. The native suite additionally covers head-only workspace
 lifetime and version-2 build/seal/reopen/filter/batch searches against FlatIndex.
+
+### Native thread-pool shutdown
+
+Closing a native handle also closes SPFresh's BKT thread pools while the bridge
+holds its shared native mutex. Shutdown must wake every idle worker before
+joining it, or index build validation and queries can stop together. The pinned
+static patch uses an atomic abort flag and publishes stop plus notification
+under the queue mutex, then releases it before joining workers.
+
+`spfresh_thread_pool_tests` repeatedly starts and closes idle pools using the real
+SPFresh helper. CTest bounds this regression at 30 seconds; CI also runs its
+100-iteration form under strict Helgrind. The preceding code reports a stop-flag
+data race and can hang with the closer joining a worker still on its condition
+variable. The native ABI, artifact format and search budgets are unchanged.
