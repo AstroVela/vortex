@@ -375,6 +375,12 @@ The existing unfiltered C ABI remains available; the additive
 `vortex_spfresh_search_filtered` accepts a bitmap of exactly ceil(rows / 8) bytes,
 with unused high bits zero, or null/zero for no restriction.
 
+Masked searches retain all valid postings selected by the existing head budget.
+They do not apply the nearest unfiltered head's distance cutoff: that head can
+be excluded while eligible rows lie farther away. Unrestricted searches retain
+the existing cutoff. The same `internal_results`, `max_check` and page limits
+still bound the search; masked queries may visit more postings within them.
+
 Filtering restricts candidates in the postings reached by ANN. Selective filters
 can still return fewer than k hits or miss nearer matching rows in unvisited
 postings; qualify recall and increase `internal_results`/`max_check` as needed.
@@ -385,7 +391,9 @@ require new static generations; no LIRE update path is added.
 The native patch changed, so build in a **new** native directory before enabling
 `native`. Tests in `workspace_tests.cpp` cover mapped/copying paths, rejected
 nearest neighbors, empty/singleton masks, malformed bitmap lengths and workspace
-reuse. The Rust native tests build and reopen a real Tantivy attribute generation,
+reuse. A near-head regression also excludes all head rows and allows only farther
+posting rows, checking the exact top four across 64 queries with 64 head probes.
+The Rust native tests build and reopen a real Tantivy attribute generation,
 then exercise Tantivy -> row filter -> native search across multiple files whose
 Tantivy document order differs from SPFresh's native ID order.
 

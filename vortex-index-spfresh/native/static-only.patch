@@ -465,7 +465,7 @@ index e1ef2cf..ee338eb 100644
                  LOG(Helper::LogLevel::LL_Info, "Using AVX512 InstructionSet!\n");
              else if (HW_AVX2)
 diff --git a/AnnService/src/Core/SPANN/SPANNIndex.cpp b/AnnService/src/Core/SPANN/SPANNIndex.cpp
-index 76f835a..c450402 100644
+index 76f835a..51bcc6d 100644
 --- a/AnnService/src/Core/SPANN/SPANNIndex.cpp
 +++ b/AnnService/src/Core/SPANN/SPANNIndex.cpp
 @@ -4,7 +4,9 @@
@@ -572,7 +572,7 @@ index 76f835a..c450402 100644
  
              m_index->SearchIndex(*p_queryResults);
  
-@@ -330,6 +356,15 @@ namespace SPTAG
+@@ -330,10 +356,25 @@ namespace SPTAG
                      m_workspace.reset(new ExtraWorkSpace());
                      m_workspace->Initialize(m_options.m_maxCheck, m_options.m_hashExp, m_options.m_searchInternalResultNum, min(m_options.m_postingPageLimit, m_options.m_searchPostingPageLimit + 1) << PageSizeEx, m_options.m_enableDataCompression);
                  }
@@ -588,7 +588,17 @@ index 76f835a..c450402 100644
                  m_workspace->m_deduper.clear();
                  m_workspace->m_postingIDs.clear();
  
-@@ -354,6 +389,17 @@ namespace SPTAG
+                 float limitDist = p_queryResults->GetResult(0)->Dist * m_options.m_maxDistRatio;
++#ifdef SPTAG_STATIC_ONLY
++                // Excluded heads do not bound the distance of eligible rows.
++                if (allowed != nullptr) {
++                    limitDist = std::numeric_limits<float>::infinity();
++                }
++#endif
+                 for (int i = 0; i < p_queryResults->GetResultNum(); ++i)
+                 {
+                     auto res = p_queryResults->GetResult(i);
+@@ -354,6 +395,17 @@ namespace SPTAG
                      m_workspace->m_postingIDs.emplace_back(postingID);
                  }
  
@@ -606,7 +616,7 @@ index 76f835a..c450402 100644
                  if (m_vectorTranslateMap.get() != nullptr) p_queryResults->Reverse();
                  m_extraSearcher->SearchIndex(m_workspace.get(), *p_queryResults, m_index, nullptr);
                  p_queryResults->SortResult();
-@@ -361,7 +407,6 @@ namespace SPTAG
+@@ -361,7 +413,6 @@ namespace SPTAG
  
              if (p_query.GetResultNum() < m_options.m_searchInternalResultNum) {
                  std::copy(p_queryResults->GetResults(), p_queryResults->GetResults() + p_query.GetResultNum(), p_query.GetResults());
@@ -614,7 +624,7 @@ index 76f835a..c450402 100644
              }
  
              if (p_query.WithMeta() && nullptr != m_pMetadata)
-@@ -845,6 +890,7 @@ namespace SPTAG
+@@ -845,6 +896,7 @@ namespace SPTAG
                  m_index->SetParameter("HashTableExponent", std::to_string(m_options.m_hashExp));
                  m_index->UpdateIndex();
  
@@ -622,7 +632,7 @@ index 76f835a..c450402 100644
                  if (m_options.m_useKV)
                  {
                      if (m_options.m_inPlace) {
-@@ -863,7 +909,9 @@ namespace SPTAG
+@@ -863,7 +915,9 @@ namespace SPTAG
                          m_extraSearcher.reset(new ExtraDynamicSearcher<T>(m_options.m_spdkMappingPath.c_str(), m_options.m_dim, m_options.m_postingPageLimit, m_options.m_useDirectIO, m_options.m_latencyLimit, m_options.m_mergeThreshold, true, m_options.m_spdkBatchSize));
                      }  
                  }
@@ -633,7 +643,7 @@ index 76f835a..c450402 100644
                      if (m_pQuantizer) {
                          m_extraSearcher.reset(new ExtraStaticSearcher<std::uint8_t>());
                      }
-@@ -1134,5 +1182,3 @@ template class SPTAG::SPANN::Index<Type>; \
+@@ -1134,5 +1188,3 @@ template class SPTAG::SPANN::Index<Type>; \
  
  #include "inc/Core/DefinitionList.h"
  #undef DefineVectorValueType
