@@ -61,6 +61,7 @@ use crate::IndexSource;
 use crate::RowAddress;
 use crate::Snapshot;
 use crate::SourceBatch;
+use crate::SourceFile;
 use crate::checksum::sha256;
 
 /// SHA-256 identity of the complete encoded file, including footer and metadata.
@@ -122,7 +123,7 @@ impl LocalFileSource {
             .handle()
             .spawn_blocking(move || {
                 let mut remaining = max_pinned_bytes;
-                let mut buffers = BTreeMap::new();
+                let mut files = BTreeMap::new();
                 for entry in &snapshot.files {
                     // Inspect the opened descriptor, but do not wait for a FIFO writer.
                     #[cfg(unix)]
@@ -155,9 +156,16 @@ impl LocalFileSource {
                         vortex_bail!("Source {} exceeds the pinned byte budget", entry.id);
                     }
                     remaining -= bytes.len();
-                    buffers.insert(entry.id, ByteBuffer::from(bytes));
+                    let opened =
+                        Self::verify_file(entry, ByteBuffer::from(bytes), &dtype, &session)?;
+                    files.insert(entry.id, opened);
                 }
-                Self::from_buffers(snapshot, dtype, buffers, max_pinned_bytes, session)
+                Ok(Self {
+                    snapshot: Arc::new(snapshot),
+                    dtype,
+                    files,
+                    pinned_bytes: max_pinned_bytes - remaining,
+                })
             })
             .await
     }
@@ -219,16 +227,7 @@ impl LocalFileSource {
                 vortex_bail!("Source {} exceeds the pinned byte budget", entry.id);
             }
             remaining -= bytes.len();
-            if file_version(&bytes) != entry.version {
-                vortex_bail!("Source file {} content version mismatch", entry.id);
-            }
-            let opened = session
-                .open_options()
-                .with_fallback_dtype(dtype.clone())
-                .open_buffer(bytes)?;
-            if opened.dtype() != &dtype || opened.row_count() != entry.row_count {
-                vortex_bail!("Source file {} schema or row count mismatch", entry.id);
-            }
+            let opened = Self::verify_file(entry, bytes, &dtype, &session)?;
             files.insert(entry.id, opened);
         }
         Ok(Self {
@@ -237,6 +236,25 @@ impl LocalFileSource {
             files,
             pinned_bytes: max_pinned_bytes - remaining,
         })
+    }
+
+    fn verify_file(
+        entry: &SourceFile,
+        bytes: ByteBuffer,
+        dtype: &DType,
+        session: &VortexSession,
+    ) -> VortexResult<VortexFile> {
+        if file_version(&bytes) != entry.version {
+            vortex_bail!("Source file {} content version mismatch", entry.id);
+        }
+        let opened = session
+            .open_options()
+            .with_fallback_dtype(dtype.clone())
+            .open_buffer(bytes)?;
+        if opened.dtype() != dtype || opened.row_count() != entry.row_count {
+            vortex_bail!("Source file {} schema or row count mismatch", entry.id);
+        }
+        Ok(opened)
     }
 
     /// The verified, unprojected dtype shared by all files.
