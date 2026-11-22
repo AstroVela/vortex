@@ -208,6 +208,7 @@ impl Fixture {
 mod persistence;
 
 mod buffers;
+mod verified;
 
 fn assert_error<T>(result: VortexResult<T>, message: &str) -> VortexResult<()> {
     let err = result
@@ -628,6 +629,26 @@ fn test_open_regression_verifies_file_before_reading_next() -> VortexResult<()> 
         assert_error(
             fixture.open().await,
             "Source file 10 content version mismatch",
+        )?;
+        Ok(())
+    })
+}
+
+#[test]
+fn test_open_regression_checks_dtype_before_reading_next() -> VortexResult<()> {
+    block_on(|handle| async move {
+        let mut fixture = Fixture::new(handle).await?;
+        fixture.snapshot.files[0] = write_file(
+            &fixture.session,
+            fixture.dir.path(),
+            10,
+            Buffer::from(vec![1_i32, 2, 3, 4, 5]).into_array(),
+        )
+        .await?;
+        fs::remove_file(&fixture.snapshot.files[1].uri)?;
+        assert_error(
+            fixture.open().await,
+            "Source file 10 schema or row count mismatch",
         )?;
         Ok(())
     })
