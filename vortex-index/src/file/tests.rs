@@ -207,6 +207,8 @@ impl Fixture {
 #[cfg(all(unix, feature = "local-store"))]
 mod persistence;
 
+mod buffers;
+
 fn assert_error<T>(result: VortexResult<T>, message: &str) -> VortexResult<()> {
     let err = result
         .err()
@@ -612,6 +614,20 @@ fn test_open_rejects_stale_descriptors_and_unsupported_locations() -> VortexResu
         assert_error(
             LocalFileSource::open(fixture.snapshot, wrong_dtype, BUDGET, fixture.session).await,
             "non-nullable struct",
+        )?;
+        Ok(())
+    })
+}
+
+#[test]
+fn test_open_regression_verifies_file_before_reading_next() -> VortexResult<()> {
+    block_on(|handle| async move {
+        let mut fixture = Fixture::new(handle).await?;
+        fixture.snapshot.files[0].version = file_version(b"other expected contents");
+        fs::remove_file(&fixture.snapshot.files[1].uri)?;
+        assert_error(
+            fixture.open().await,
+            "Source file 10 content version mismatch",
         )?;
         Ok(())
     })
