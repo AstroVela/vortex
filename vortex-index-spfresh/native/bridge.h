@@ -52,6 +52,15 @@ int vortex_spfresh_search_filtered(void *handle,
                                    int32_t *ids,
                                    float *distances,
                                    char *error);
+// BKT navigation only: returns head ordinals, with -1 for unused slots.
+// Does not read posting payloads or apply visibility (heads are routing centroids).
+int vortex_spfresh_search_heads(void *handle,
+                                const float *query,
+                                uint32_t dimension,
+                                uint32_t max_check,
+                                uint32_t probes,
+                                int32_t *heads,
+                                char *error);
 void vortex_spfresh_close(void *handle);
 #ifdef __cplusplus
 }

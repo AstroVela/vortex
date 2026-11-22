@@ -30,6 +30,7 @@ use vortex_index::VectorSpec;
 
 use crate::SPFRESH_FORMAT_VERSION;
 use crate::SPFRESH_ID;
+use crate::SPFRESH_RABITQ_FORMAT_VERSION;
 use crate::SPFRESH_REVISION;
 use crate::SpFreshBundle;
 use crate::SpFreshIndexBuilder;
@@ -40,6 +41,9 @@ use crate::bundle::ROWS;
 use crate::bundle::validate_metadata;
 use crate::bundle::validate_rows;
 use crate::ffi::Native;
+use crate::rabitq::QuantizedIndex;
+use crate::rabitq::RaBitQErrorBound;
+use crate::rabitq::SIDECAR;
 use crate::validate;
 
 /// Explicit bounds on local copies, mapping and query work, not a total RSS limit.
@@ -116,7 +120,10 @@ impl IndexProvider for SpFreshProvider {
         SPFRESH_ID
     }
     fn supports_version(&self, version: u32) -> bool {
-        version == SPFRESH_FORMAT_VERSION
+        matches!(
+            version,
+            SPFRESH_FORMAT_VERSION | SPFRESH_RABITQ_FORMAT_VERSION
+        )
     }
 
     fn local_materialization_limit(&self) -> Option<u64> {
@@ -147,7 +154,9 @@ impl IndexProvider for SpFreshProvider {
         let descriptor: Descriptor =
             serde_json::from_slice(&fs::read(lease.path().join(DESCRIPTOR))?)
                 .map_err(|err| vortex_err!("SPFresh descriptor: {err}"))?;
-        if descriptor.format_version != SPFRESH_FORMAT_VERSION
+        if descriptor.format_version != metadata.backend_version
+            || descriptor.rabitq.is_some()
+                != (metadata.backend_version == SPFRESH_RABITQ_FORMAT_VERSION)
             || descriptor.revision != SPFRESH_REVISION
             || descriptor.value_type != "float32"
             || descriptor.metric != "squared_l2"
@@ -166,11 +175,16 @@ impl IndexProvider for SpFreshProvider {
         validate_rows(metadata, bundle, &rows)?;
         let root = lease.path().join("spfresh/native");
         validate::native_files(&root, bundle)?;
+        let quantized = descriptor
+            .rabitq
+            .map(|_| QuantizedIndex::open(&root, &lease.path().join(SIDECAR), bundle))
+            .transpose()?;
         let native = Native::open(&root, bundle)?;
         let dimension = NonZeroUsize::new(bundle.dimension as usize)
             .ok_or_else(|| vortex_err!("Zero SPFresh dimension"))?;
         Ok(Arc::new(SpFreshIndex {
             native,
+            quantized,
             _lease: lease,
             metadata: metadata.clone(),
             bundle,
@@ -190,6 +204,9 @@ fn validate_inventory(metadata: &IndexMetadata, limits: SpFreshLimits) -> Vortex
         .map(|name| format!("spfresh/native/{name}"))
         .collect::<Vec<_>>();
     expected.extend([DESCRIPTOR.to_owned(), ROWS.to_owned()]);
+    if metadata.backend_version == SPFRESH_RABITQ_FORMAT_VERSION {
+        expected.push(SIDECAR.to_owned());
+    }
     expected.sort_unstable();
     let mut actual = metadata
         .artifacts
@@ -224,6 +241,7 @@ fn validate_inventory(metadata: &IndexMetadata, limits: SpFreshLimits) -> Vortex
 struct SpFreshIndex {
     // Rust drops fields in declaration order: close native IO before releasing files.
     native: Native,
+    quantized: Option<QuantizedIndex>,
     _lease: Box<dyn LocalArtifactLease>,
     metadata: IndexMetadata,
     bundle: SpFreshBundle,
@@ -238,6 +256,8 @@ struct QueryOptions {
     max_check: u32,
     internal_results: u32,
     search_pages: u32,
+    #[serde(default)]
+    rabitq: Option<RaBitQErrorBound>,
 }
 
 impl SpFreshIndex {
@@ -263,6 +283,7 @@ impl SpFreshIndex {
                 max_check: 4096,
                 internal_results: k.max(64),
                 search_pages: self.bundle.posting_page_limit,
+                rabitq: None,
             }
         } else {
             if options.backend_options.len() > 4096 {
@@ -279,11 +300,17 @@ impl SpFreshIndex {
         {
             vortex_bail!("Invalid SPFresh native query options");
         }
+        if native.rabitq.is_some() && self.quantized.is_none() {
+            vortex_bail!("RaBitQ query options require a quantized generation");
+        }
+        native.rabitq.unwrap_or_default().validate()?;
         // Posting reads are truncated by the bundle page limit when the index is
         // opened; search_pages must equal that limit (validated above), so each
         // native page buffer holds exactly posting_page_limit pages.
         let pages = u64::from(self.bundle.posting_page_limit);
-        if pages * u64::from(native.internal_results) * 4096 > self.limits.max_posting_buffer_bytes
+        if self.quantized.is_none()
+            && pages * u64::from(native.internal_results) * 4096
+                > self.limits.max_posting_buffer_bytes
         {
             vortex_bail!("SPFresh query exceeds posting buffer budget");
         }
@@ -305,6 +332,33 @@ impl SpFreshIndex {
         options: QueryOptions,
         filter: &RowFilter,
     ) -> VortexResult<Vec<Vec<SearchHit>>> {
+        if let Some(quantized) = &self.quantized {
+            return queries
+                .chunks_exact(self.spec.dimension.get())
+                .map(|query| {
+                    let heads = self.native.search_heads(
+                        query,
+                        options.max_check,
+                        options.internal_results,
+                    )?;
+                    let (hits, stats) = quantized.search(
+                        query,
+                        &heads,
+                        &self.rows,
+                        filter,
+                        k as usize,
+                        options.rabitq.unwrap_or_default(),
+                    )?;
+                    tracing::debug!(
+                        scanned_vectors = stats.scanned,
+                        reranked_vectors = stats.reranked,
+                        original_vector_bytes = stats.original_bytes,
+                        "SPFresh RaBitQ refinement"
+                    );
+                    Ok(hits)
+                })
+                .collect();
+        }
         // Convert once per batch, using the validated native-ID -> row dictionary.
         let allowed = filter.is_restricted().then(|| {
             let mut mask = vec![0u8; self.rows.len().div_ceil(8)];
