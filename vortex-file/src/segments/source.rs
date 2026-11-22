@@ -387,7 +387,11 @@ impl SegmentSource for BufferSegmentSource {
             .boxed();
         }
 
-        let slice = self.buffer.slice(start..end).aligned(spec.alignment);
+        // The segment's required alignment can differ from the file buffer's.
+        let slice = self
+            .buffer
+            .slice_unaligned(start..end)
+            .aligned(spec.alignment);
         future::ready(Ok(BufferHandle::new_host(slice))).boxed()
     }
 }
