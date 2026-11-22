@@ -203,6 +203,10 @@ void duckdb_copy_function_copy_to_sink(const void *bind_data,
 extern void duckdb_copy_function_copy_to_finalize(void *global_data, duckdb_vx_error *error_out);
 
 #if (defined(VORTEX_INDEX) && defined(VORTEX_INDEX_UNIX))
+extern bool vortex_index_provider_registered(const char *backend);
+#endif
+
+#if (defined(VORTEX_INDEX) && defined(VORTEX_INDEX_UNIX))
 extern void *vortex_index_cache_budget_new(void);
 #endif
 

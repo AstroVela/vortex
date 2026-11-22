@@ -32,6 +32,11 @@ test checks neighboring data and concurrent increments. SIMD intrinsics have
 per-function ISA targets; dispatch checks CPU and OS
 support without applying AVX flags to baseline code. No SPDK memory shim,
 RocksDB, TBB, Boost or git submodules are needed.
+K-means starts with zero cluster counts and clears center accumulators before
+each initialization attempt. It saves the first sampled centers before
+comparing later batch scores, which sum the sample's distances. Native CI
+checks construction and querying with Memcheck, including workspace reuse and
+concurrent handle lifetimes.
 The upstream MIT notice is in `native/SPFresh.LICENSE`.
 
 Core archives are PIC and a shared bridge is actually linked with no unresolved
