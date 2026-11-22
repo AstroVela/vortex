@@ -53,7 +53,6 @@ use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 use vortex_file::OpenOptionsSessionExt;
 use vortex_file::VortexFile;
-use vortex_file::VortexOpenOptions;
 use vortex_io::session::RuntimeSessionExt;
 use vortex_scan::strict_sorted_buffer::StrictSortedBuffer;
 use vortex_session::VortexSession;
@@ -103,14 +102,15 @@ impl VerifiedFile {
         max_pinned_bytes: usize,
         session: VortexSession,
     ) -> VortexResult<Self> {
-        Self::open(entry, bytes, max_pinned_bytes, session.open_options())
+        Self::open(entry, bytes, max_pinned_bytes, &session, None)
     }
 
     fn open(
         entry: SourceFile,
         bytes: ByteBuffer,
         max_pinned_bytes: usize,
-        options: VortexOpenOptions,
+        session: &VortexSession,
+        expected_dtype: Option<&DType>,
     ) -> VortexResult<Self> {
         validate_file(&entry)?;
         if bytes.len() > max_pinned_bytes {
@@ -120,8 +120,15 @@ impl VerifiedFile {
             vortex_bail!("Source file {} content version mismatch", entry.id);
         }
         let pinned_bytes = bytes.len();
+        let options = session.open_options();
+        let options = match expected_dtype {
+            Some(dtype) => options.with_fallback_dtype(dtype.clone()),
+            None => options,
+        };
         let file = options.open_buffer(bytes)?;
-        if file.row_count() != entry.row_count {
+        if file.row_count() != entry.row_count
+            || expected_dtype.is_some_and(|dtype| file.dtype() != dtype)
+        {
             vortex_bail!("Source file {} schema or row count mismatch", entry.id);
         }
         Ok(Self {
@@ -201,7 +208,7 @@ impl LocalFileSource {
             .handle()
             .spawn_blocking(move || {
                 let mut remaining = max_pinned_bytes;
-                let mut buffers = BTreeMap::new();
+                let mut files = BTreeMap::new();
                 for entry in &snapshot.files {
                     // Inspect the opened descriptor, but do not wait for a FIFO writer.
                     #[cfg(unix)]
@@ -230,13 +237,22 @@ impl LocalFileSource {
                     // Bound the read too: the file can grow after the metadata check.
                     file.take((remaining as u64).saturating_add(1))
                         .read_to_end(&mut bytes)?;
-                    if bytes.len() > remaining {
-                        vortex_bail!("Source {} exceeds the pinned byte budget", entry.id);
-                    }
-                    remaining -= bytes.len();
-                    buffers.insert(entry.id, ByteBuffer::from(bytes));
+                    let verified = VerifiedFile::open(
+                        entry.clone(),
+                        ByteBuffer::from(bytes),
+                        remaining,
+                        &session,
+                        Some(&dtype),
+                    )?;
+                    remaining -= verified.pinned_bytes;
+                    files.insert(entry.id, verified.file);
                 }
-                Self::from_buffers(snapshot, dtype, buffers, max_pinned_bytes, session)
+                Ok(Self {
+                    snapshot: Arc::new(snapshot),
+                    dtype,
+                    files,
+                    pinned_bytes: max_pinned_bytes - remaining,
+                })
             })
             .await
     }
@@ -284,16 +300,17 @@ impl LocalFileSource {
             let bytes = buffers
                 .remove(&entry.id)
                 .ok_or_else(|| vortex_err!("Missing source buffer: {}", entry.id))?;
-            let file = VerifiedFile::open(
-                entry.clone(),
-                bytes,
-                remaining,
-                session.open_options().with_fallback_dtype(dtype.clone()),
-            )?;
-            remaining -= file.pinned_bytes;
-            files.insert(entry.id, file);
+            let verified =
+                VerifiedFile::open(entry.clone(), bytes, remaining, &session, Some(&dtype))?;
+            remaining -= verified.pinned_bytes;
+            files.insert(entry.id, verified.file);
         }
-        Self::assemble(snapshot, dtype, files, max_pinned_bytes)
+        Ok(Self {
+            snapshot: Arc::new(snapshot),
+            dtype,
+            files,
+            pinned_bytes: max_pinned_bytes - remaining,
+        })
     }
 
     /// Bind already verified files to an exact snapshot without rehashing or reopening.
@@ -305,19 +322,10 @@ impl LocalFileSource {
     pub fn from_verified(
         snapshot: Snapshot,
         dtype: DType,
-        files: BTreeMap<u64, VerifiedFile>,
-        max_pinned_bytes: usize,
-    ) -> VortexResult<Self> {
-        Self::validate(&snapshot, &dtype)?;
-        Self::assemble(snapshot, dtype, files, max_pinned_bytes)
-    }
-
-    fn assemble(
-        snapshot: Snapshot,
-        dtype: DType,
         mut verified: BTreeMap<u64, VerifiedFile>,
         max_pinned_bytes: usize,
     ) -> VortexResult<Self> {
+        Self::validate(&snapshot, &dtype)?;
         if verified.len() != snapshot.files.len() {
             vortex_bail!("Verified file inventory must match every snapshot file");
         }

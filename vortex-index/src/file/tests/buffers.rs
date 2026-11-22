@@ -11,8 +11,11 @@ use vortex_array::assert_arrays_eq;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::StructFields;
+use vortex_buffer::Alignment;
 use vortex_buffer::ByteBuffer;
 use vortex_error::VortexResult;
+use vortex_io::runtime::BlockingRuntime;
+use vortex_io::runtime::single::SingleThreadRuntime;
 use vortex_io::runtime::single::block_on;
 
 use super::BUDGET;
@@ -32,6 +35,53 @@ fn buffers(fixture: &Fixture) -> VortexResult<BTreeMap<u64, ByteBuffer>> {
         .iter()
         .map(|file| Ok((file.id, ByteBuffer::from(fs::read(&file.uri)?))))
         .collect()
+}
+
+#[test]
+fn test_from_buffers_regression_reads_aligned_input() -> VortexResult<()> {
+    block_on(|handle| async move {
+        let fixture = Fixture::new(handle).await?;
+        let mut bytes = buffers(&fixture)?;
+        for buffer in bytes.values_mut() {
+            *buffer = ByteBuffer::copy_from_aligned(buffer.as_slice(), Alignment::new(64));
+        }
+        let source = LocalFileSource::from_buffers(
+            fixture.snapshot,
+            fixture.dtype,
+            bytes,
+            BUDGET,
+            fixture.session.clone(),
+        )?;
+        let selected = [row(10, 1)];
+        let taken = source
+            .take(&selected, &fields(&["id", "embedding", "note"]))
+            .await?;
+        assert_eq!(taken.rows, selected);
+        assert_arrays_eq!(
+            taken.data,
+            data(&[11])?.into_array(),
+            &mut fixture.session.create_execution_ctx()
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn test_from_buffers_regression_inside_futures_executor() -> VortexResult<()> {
+    let runtime = SingleThreadRuntime::default();
+    let fixture = runtime.block_on(Fixture::new(runtime.handle()))?;
+    let bytes = buffers(&fixture)?;
+    let source = futures::executor::block_on(async {
+        LocalFileSource::from_buffers(
+            fixture.snapshot.clone(),
+            fixture.dtype.clone(),
+            bytes,
+            BUDGET,
+            fixture.session.clone(),
+        )
+    })?;
+    assert_eq!(source.snapshot(), &fixture.snapshot);
+    Ok(())
 }
 
 #[rstest::rstest]
