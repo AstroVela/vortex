@@ -355,6 +355,45 @@ extern "C" int vortex_spfresh_search_filtered(void *opaque,
     });
 }
 
+extern "C" int vortex_spfresh_search_heads(void *opaque,
+                                           const float *query,
+                                           uint32_t dimension,
+                                           uint32_t max_check,
+                                           uint32_t probes,
+                                           int32_t *heads,
+                                           char *error) {
+    return boundary(error, [&] {
+        if (opaque == nullptr || query == nullptr || heads == nullptr) {
+            throw std::runtime_error("Null SPFresh head search buffer");
+        }
+        auto &handle = *static_cast<Handle *>(opaque);
+        if (dimension != handle.dimension || probes == 0 || probes > 4096 || max_check < probes ||
+            max_check > 1048576) {
+            throw std::runtime_error("Invalid SPFresh head search options");
+        }
+        for (uint32_t component = 0; component < dimension; ++component) {
+            if (!std::isfinite(query[component])) {
+                throw std::runtime_error("Non-finite SPFresh head query");
+            }
+        }
+        SearchWorkspaces workspaces(handle, max_check, probes);
+        check(handle.index.SetParameter("MaxCheck", std::to_string(max_check).c_str(), "BuildHead"),
+              "MaxCheck");
+        const auto memory = handle.index.GetMemoryIndex();
+        SPTAG::QueryResult result(query, static_cast<int>(probes), false);
+        check(memory->SearchIndex(result), "Search head index");
+        for (uint32_t rank = 0; rank < probes; ++rank) {
+            const auto &hit = *result.GetResult(static_cast<int>(rank));
+            if (hit.VID < -1 || hit.VID >= memory->GetNumSamples() ||
+                (hit.VID >= 0 && (!std::isfinite(hit.Dist) || hit.Dist < 0))) {
+                throw std::runtime_error("Invalid SPFresh head result");
+            }
+            heads[rank] = hit.VID;
+        }
+        workspaces.retain();
+    });
+}
+
 extern "C" void vortex_spfresh_close(void *opaque) {
     std::lock_guard<std::mutex> lock(native_mutex);
     Workspaces workspaces;

@@ -16,16 +16,21 @@ counts and a shared schema. Use `file::file_version` and
 `file::schema_fingerprint` to prepare those identities. The catalog must supply
 trusted expected identities; opening never adopts the files' current versions.
 
-Paths must be absolute native filesystem paths, not URLs. Every row is visible;
-deletion masks and table transactions are not implemented. Projected `scan`
-preserves physical addresses, and `take` groups selections per file before
-restoring request order and duplicate rows. Empty projections are supported.
+`LocalFileSource::open` requires absolute native filesystem paths and copies the
+encoded file contents into memory. `LocalFileSource::from_buffers` accepts URI
+strings as opaque physical identities and retains the supplied immutable buffers
+directly.
 
-The source copies and pins **all encoded file bytes in memory** at open time,
-subject to an explicit total byte budget. This prevents subsequent replacement,
-deletion or in-place writes from changing a read. The budget is not a total RSS
-limit: decoding and result arrays use additional memory. This adapter is for
-bounded integration tests and local prototypes, not out-of-core workloads.
+The adapter exposes every physical row from a frozen collection without deletion
+masks or table transactions. Projected `scan` preserves physical addresses, and
+`take` groups selections per file before restoring request order and duplicate
+rows. Empty projections are supported.
+
+Both constructors pin **all encoded file bytes in memory** under an explicit
+total byte budget. Subsequent scans use the pinned bytes even if the files are
+replaced, deleted, or modified in place. Decoding and result arrays require
+additional memory. The adapter is intended for bounded integration tests and
+local prototypes.
 
 ```sh
 cargo test -p vortex-index --features file
